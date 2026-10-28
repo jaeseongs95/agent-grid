@@ -144,3 +144,23 @@ test('list paging, errors and keyboard selection stay inside the popup; an owned
   await expect(page.locator('#catalog-list-status')).toContainText('검색 결과가 없습니다');
   await expect(page.locator('#catalog-resume')).toBeDisabled();
 });
+
+test('Korean search composition keeps candidate keys inside the IME until committed', async ({ page }) => {
+  await mockNative(page);
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-messages')).toContainText('ALPHA ONLY');
+  const search = page.locator('#catalog-search');
+  await search.evaluate((element: HTMLInputElement) => {
+    element.focus(); element.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+    element.value = '한글 검색';
+    element.dispatchEvent(new InputEvent('input', { bubbles: true, data: '한글 검색', isComposing: true, inputType: 'insertCompositionText' }));
+    for (const key of ['ArrowDown', 'Enter', 'Escape']) element.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key, isComposing: true }));
+  });
+  await expect(page.locator('#catalog-dialog')).toBeVisible();
+  await expect(page.locator('#catalog-session-title')).toHaveText(alpha.title);
+  expect(await page.evaluate(() => (window as any).fixture.created)).toBe(0);
+  expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'catalog_list').length)).toBe(1);
+  await search.evaluate(element => element.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '한글 검색' })));
+  await expect.poll(() => page.evaluate(() => (window as any).fixture.calls.some((call: any) => call.args.request?.query === '한글 검색'))).toBe(true);
+  await expect(page.locator('#catalog-dialog')).toBeVisible();
+});

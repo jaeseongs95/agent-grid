@@ -169,13 +169,17 @@ export function createSessionBrowser(host: BrowserHost) {
   }
   $('#catalog-close').onclick = () => dialog.close();
   dialog.addEventListener('close', () => { clearTimeout(timer); listVersion++; previewVersion++; openAttempt++; opening = false; queue.cancel(); clearSelection(); });
-  search.oninput = () => querySoon(250); projectSelect.onchange = () => querySoon();
+  search.addEventListener('compositionstart', () => clearTimeout(timer));
+  search.oninput = event => { if (!(event as InputEvent).isComposing) querySoon(250); };
+  search.addEventListener('compositionend', () => querySoon(250));
+  projectSelect.onchange = () => querySoon();
   $('#catalog-refresh').onclick = () => querySoon();
   $('#catalog-more').onclick = () => { if (listCursor && !listLoading) { listLoading = true; renderRows(); loadList(listVersion, listCursor); } };
   $('#catalog-preview-more').onclick = () => { if (selected && previewCursor && !previewLoading) loadPreview(selected, previewVersion, previewCursor); };
   $('#catalog-new').onclick = () => { const cwd = projectSelect.value || selected?.cwd; dialog.close(); host.newSession(cwd); };
   $('#catalog-resume').onclick = () => void resume();
   dialog.addEventListener('keydown', event => {
+    if (event.isComposing || event.keyCode === 229) return;
     if (event.key === 'Escape') { event.preventDefault(); dialog.close(); return; }
     if (event.altKey || event.ctrlKey || event.metaKey || opening) return;
     const target = event.target as HTMLElement;
