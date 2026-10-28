@@ -247,7 +247,11 @@ impl Engine {
         self.launch(session, command, None, request.cols, request.rows)
     }
 
-    fn launch(&self, session: Arc<Session>, command: CommandBuilder, adapter: Option<CodexSession>, cols: u16, rows: u16) -> Result<SessionInfo, String> {
+    fn launch(&self, session: Arc<Session>, mut command: CommandBuilder, adapter: Option<CodexSession>, cols: u16, rows: u16) -> Result<SessionInfo, String> {
+        // This PTY is rendered by xterm, even if the GUI's parent inherited
+        // TERM=dumb. Scope capability declarations to this child environment.
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
         let mut guard = LaunchGuard { session: session.clone(), armed: true };
         let launch = || -> Result<_, String> {
             if session.stop_requested.load(Ordering::Acquire) { return Err("session was stopped before launch".into()); }

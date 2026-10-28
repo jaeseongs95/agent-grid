@@ -96,6 +96,10 @@ impl Harness {
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
         let mut command = shell(script)?;
         command.cwd(&cwd);
+        // Regression input: a GUI/CI parent can advertise a dumb terminal.
+        // Engine must declare the capabilities of its actual PTY renderer.
+        command.env("TERM", "dumb");
+        command.env("COLORTERM", "");
         let info = self.engine.start_fixture(StartRequest { cwd: cwd.to_string_lossy().into_owned(), title: "Headless PTY fixture".into(), thread_id: None, cols: 100, rows: 30 }, command)?;
         self.sessions_started.fetch_add(1, Ordering::Relaxed);
         Ok(info)
@@ -159,7 +163,7 @@ impl Harness {
         // Windows PowerShell's default CP437 consumer demonstrably replaces
         // Korean/emoji with '?'. Give this fixture an explicit UTF-8 contract;
         // the actual vendor TUI owns its own terminal mode/encoding setup.
-        let script = if cfg!(windows) { "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::WriteLine('input-ready; encodings=' + [Console]::InputEncoding.CodePage + '/' + [Console]::OutputEncoding.CodePage); $line = [Console]::ReadLine(); [Console]::WriteLine('received:' + $line)" } else { "printf 'input-ready\\n'; read line; printf 'received:%s\\n' \"$line\"" };
+        let script = if cfg!(windows) { "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::WriteLine('input-ready; encodings=' + [Console]::InputEncoding.CodePage + '/' + [Console]::OutputEncoding.CodePage + ';term=' + $env:TERM + ';color=' + $env:COLORTERM); $line = [Console]::ReadLine(); [Console]::WriteLine('received:' + $line)" } else { "printf 'input-ready;term=%s;color=%s\\n' \"$TERM\" \"$COLORTERM\"; read line; printf 'received:%s\\n' \"$line\"" };
         let session = self.start(script)?;
         self.wait_output(&session, "input-ready", Duration::from_secs(20))?;
         let stale = session.generation + 1;
@@ -167,6 +171,7 @@ impl Harness {
         self.engine.write(&session.id, session.generation, &(marker.clone() + "\r\n"))?;
         self.engine.wait_for_exit(&session.id, session.generation, Duration::from_secs(30))?;
         let output = self.take_output(&session)?;
+        if !output.contains("term=xterm-256color;color=truecolor") { return Err(format!("PTY did not override the fixture's dumb terminal capabilities; pure-fixture output tail={}", fixture_tail(&output))); }
         if !output.contains(&("received:".to_string() + &marker)) { return Err(format!("PTY input did not reach the correct process; expected={marker:?}; pure-fixture output tail={}", fixture_tail(&output))); }
         let slow = self.start(if cfg!(windows) { "Start-Sleep -Seconds 60" } else { "sleep 60" })?;
         self.engine.stop(&slow.id, slow.generation)?;
