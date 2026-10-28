@@ -19,7 +19,8 @@ const report = {
   checks: [], sessions: [], errors: [], cleanup: [],
   limitations: ['Synthetic composition events do not verify a physical Windows IME; Korean PTY echo is checked separately in rendered terminal rows.', 'No model turn, trust approval, or terminal Enter is sent.', 'Screenshots mask all terminal text and observed external records.'],
 };
-const shortError = error => ({ name: error?.name ?? 'Error', message: String(error?.message ?? error).split('\n')[0].slice(0, 400) });
+const shortError = error => ({ name: error?.name ?? 'Error', message: String(error?.message ?? error).split('\n')[0].slice(0, 400), ...(error?.windowProbe ? { windowProbe: error.windowProbe } : {}) });
+const probeDiagnostic = value => String(value ?? '').replace(/\r\n/g, '\n').split('\n').slice(0, 40).join('\n').slice(0, 4096);
 const hash = value => createHash('sha256').update(value).digest('hex');
 let page;
 let browser;
@@ -277,8 +278,22 @@ try {
       }
       const script = fileURLToPath(new URL('./window-probe.ps1', import.meta.url));
       const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-      const { stdout } = await execFileAsync(powershell, ['-NoProfile', '-NonInteractive', '-File', script, '-AppProcessId', processId, '-ExpectedExecutable', executable], { windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 });
-      const window = JSON.parse(stdout.trim());
+      let probeOutput;
+      try {
+        probeOutput = await execFileAsync(powershell, ['-NoProfile', '-NonInteractive', '-File', script, '-AppProcessId', processId, '-ExpectedExecutable', executable], { windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 });
+      } catch (error) {
+        // This child runs only our bounded Win32 probe, never a shell/CLI transcript.
+        // Preserve its diagnostic stream so a visibility timeout and a failed guard
+        // remain distinguishable after shortError removes multiline messages.
+        error.windowProbe = { script: 'tests/window-probe.ps1', code: error.code ?? null, signal: error.signal ?? null, killed: !!error.killed, stdout: probeDiagnostic(error.stdout), stderr: probeDiagnostic(error.stderr), diagnosticLimit: '40 lines / 4096 characters per stream' };
+        throw error;
+      }
+      let window;
+      try { window = JSON.parse(probeOutput.stdout.trim()); }
+      catch (error) {
+        error.windowProbe = { script: 'tests/window-probe.ps1', code: 0, signal: null, killed: false, stdout: probeDiagnostic(probeOutput.stdout), stderr: probeDiagnostic(probeOutput.stderr), diagnosticLimit: '40 lines / 4096 characters per stream' };
+        throw error;
+      }
       assert(window.hidden && window.restored && window.sameHandle && window.processIdentityPreserved, 'Native window did not hide and restore safely');
       const retained = [];
       for (const previous of before) {
