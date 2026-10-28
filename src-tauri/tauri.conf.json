@@ -18,7 +18,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "resources": ["../THIRD_PARTY_NOTICES.md", "../LICENSE"],
+    "resources": { "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md", "../LICENSE": "LICENSE" },
     "icon": ["icons/icon.ico", "icons/icon.png"],
     "shortDescription": "Local coding agent terminal workspace",
     "windows": { "nsis": { "installMode": "currentUser", "displayLanguageSelector": false } }

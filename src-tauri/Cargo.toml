@@ -5,6 +5,16 @@ description = "Independent terminal workspace for local coding agents"
 authors = ["Agent Grid contributors"]
 license = "MIT"
 edition = "2021"
+default-run = "agent-grid"
+
+[[bin]]
+name = "agent-grid"
+path = "src/main.rs"
+
+[[bin]]
+name = "agent-grid-helper"
+path = "src/helper_main.rs"
+test = false
 
 [lib]
 name = "agent_grid_lib"

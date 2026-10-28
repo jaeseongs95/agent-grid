@@ -1,5 +1,5 @@
 //! A child must not create descendants before its owned Job is assigned.
-//! The same executable first waits on an unguessable, local named event. Only
+//! The console helper first waits on an unguessable, local named event. Only
 //! after Job assignment does the parent release the actual vendor/shell launch.
 //! Keep LaunchGate alive until the helper exits so a late-starting helper can
 //! still open the named event. No credentials or user config enter this protocol.
@@ -15,6 +15,13 @@ mod platform {
 
     fn wide(value: &OsStr) -> Vec<u16> { value.encode_wide().chain(Some(0)).collect() }
 
+    fn helper_executable() -> Result<std::path::PathBuf, String> {
+        let application = std::env::current_exe().map_err(|e| format!("locate Agent Grid executable: {e}"))?;
+        let helper = application.parent().ok_or("Agent Grid executable has no parent directory")?.join("agent-grid-helper.exe");
+        if !helper.is_file() { return Err(format!("required console helper is missing: {}", helper.display())); }
+        Ok(helper)
+    }
+
     impl LaunchGate {
         fn new() -> Result<Self, String> {
             let name = OsString::from(format!("Local\\AgentGridLaunch_{}", uuid::Uuid::new_v4().simple()));
@@ -27,7 +34,7 @@ mod platform {
             let gate = Self::new()?;
             let original = command.get_argv().to_vec();
             if original.is_empty() { return Err("owned PTY command has no executable".into()); }
-            let mut argv = vec![std::env::current_exe().map_err(|e| format!("locate owned PTY helper: {e}"))?.into_os_string(), OsString::from("--pty-child"), gate.name.clone(), OsString::from("--")];
+            let mut argv = vec![helper_executable()?.into_os_string(), OsString::from("--pty-child"), gate.name.clone(), OsString::from("--")];
             argv.extend(original);
             *command.get_argv_mut() = argv;
             Ok((command, gate))
@@ -35,7 +42,7 @@ mod platform {
 
         pub fn wrap_std(executable: &OsStr) -> Result<(Command, Self), String> {
             let gate = Self::new()?;
-            let mut command = Command::new(std::env::current_exe().map_err(|e| format!("locate owned process helper: {e}"))?);
+            let mut command = Command::new(helper_executable()?);
             command.arg("--owned-child").arg(&gate.name).arg("--").arg(executable);
             Ok((command, gate))
         }
@@ -62,9 +69,9 @@ mod platform {
             let mut command = Command::new(&args[4]);
             command.args(&args[5..]);
             if mode == "--pty-child" {
-                // The release build is a GUI-subsystem executable. ConPTY gives
-                // it a console association but may leave its standard handles
-                // invalid. Open that exact console, never allocate another one.
+                // The dedicated helper uses the console subsystem in debug and
+                // release, so ConPTY attaches this exact console. Open its
+                // handles explicitly; never allocate a separate console.
                 let input = std::fs::OpenOptions::new().read(true).write(true).open("CONIN$").map_err(|e| format!("open owned console input: {e}"))?;
                 let output = std::fs::OpenOptions::new().read(true).write(true).open("CONOUT$").map_err(|e| format!("open owned console output: {e}"))?;
                 let error = output.try_clone().map_err(|e| e.to_string())?;
