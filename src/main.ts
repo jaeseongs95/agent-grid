@@ -7,6 +7,7 @@ import '@xterm/xterm/css/xterm.css';
 import './style.css';
 import { MAX_WORKSPACE_SESSIONS, acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo } from './model';
 import { createSessionBrowser, type ProjectInfo } from './session-browser';
+import { createExecutableSettings } from './executable-settings';
 
 const native = isTauri();
 const demo = !native && new URLSearchParams(location.search).has('demo');
@@ -45,6 +46,7 @@ $('#app').innerHTML = `
     <div class="side-heading sessions-heading">세션 <span id="side-count">0</span><button id="side-add" class="icon-button" aria-label="새 세션 만들기">+</button></div>
     <nav id="session-list" aria-label="세션 목록"></nav>
     <button id="external-toggle" class="side-link"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button>
+    <button id="codex-settings-open" class="side-link"><span>⚙</span> 실행 파일 설정</button>
     <div class="sidebar-bottom"><span class="connection-dot"></span><span id="connection">연결 확인 중</span><small>Windows · 로컬 실행</small></div>
   </aside>
   <main>
@@ -308,6 +310,8 @@ const sessionBrowser = createSessionBrowser({
 for (const id of ['new-session', 'side-add', 'empty-add']) $(`#${id}`).onclick = () => openCreate();
 $('#catalog-open').onclick = () => void sessionBrowser.open();
 $('#project-import').onclick = () => void sessionBrowser.importProject();
+const executableSettings = createExecutableSettings(call);
+$('#codex-settings-open').onclick = () => void executableSettings.open();
 for (const button of document.querySelectorAll<HTMLElement>('[data-close]')) button.onclick = () => button.closest('dialog')?.close();
 $('#column-options').onclick = event => { const button = (event.target as HTMLElement).closest<HTMLElement>('[data-columns]'); if (button) { columns = Number(button.dataset.columns); maximized = ''; renderGrid(); scheduleSave(); } };
 $('#clear-selection').onclick = () => { selected.clear(); renderAll(); };

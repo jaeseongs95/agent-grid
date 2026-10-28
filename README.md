@@ -25,8 +25,16 @@ Extract the whole portable ZIP and run `agent-grid.exe`. Keep
 `agent-grid-helper.exe` beside it: Windows requires a console process for the
 terminal side while the main application uses a normal desktop window.
 
-Install and sign in to the official Codex CLI first. Its native executable
-must be on `PATH`; alternatively set `AGENT_GRID_CODEX` to its absolute path.
+Install and sign in to the official Codex CLI first. Open **실행파일 설정**
+and select its native `codex.exe`; the app saves that path for future starts
+and history queries. The screen shows the saved path, resolved executable and
+where it came from. Cancelling the chooser keeps the previous setting.
+Changing it leaves running terminals alone.
+
+Choose **자동 찾기** to clear the app's saved override. Resolution then uses
+`AGENT_GRID_CODEX`, if set, followed by the native executable on `PATH`.
+The saved app preference has priority over both. Missing or invalid executables
+are reported explicitly instead of silently using a different program.
 The CLI must support authenticated app-server WebSockets and `--remote`.
 Older CLI versions are not silently downgraded to a different connection mode.
 

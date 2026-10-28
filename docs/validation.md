@@ -23,6 +23,22 @@ Unicode, exact-boundary Unicode and control-only catalog titles while preserving
 the selected thread ID and working directory. Browser mocks do not replace
 the native checks above. Physical Windows IME testing remains separate.
 
+## Executable preferences and resume admission
+
+Executable preferences belong only to Agent Grid's SQLite database. Tests
+cover saved/environment/PATH precedence, PE validation without executing the
+selected file, invalid-save preservation, reset, reopening the database and
+preserving existing workspace metadata. Each request snapshots one executable
+for its server/TUI pair; saving a preference does not restart existing PTYs.
+
+Browser fixtures cover settings cancellation, errors, persistence readback and
+reopening while a chooser is pending. Resume fixtures cover owned error/stopping
+cards, repeated workspace restore, close/reopen during a pending start and retry
+after a rejected start. All resume entry points share the same per-thread
+admission guard. Native executable-selection checks run separately against an
+isolated packaged app through `AGENT_GRID_NATIVE_EXECUTABLE_PICKER=1`; final
+native results and source identifiers belong in the release notes.
+
 ## Earlier core baseline
 
 The results below describe the baseline packaged application at

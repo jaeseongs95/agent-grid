@@ -1,5 +1,6 @@
 // Opt-in test of a root-launched packaged Agent Grid WebView2. Never starts a browser,
-// changes app config, approves a terminal prompt, or sends an Enter key to a terminal.
+// changes global config, approves a terminal prompt, or sends Enter to a terminal.
+// Opt-in executable settings tests change only the fresh isolated fixture database.
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, realpath, stat, writeFile } from 'node:fs/promises';
@@ -53,7 +54,7 @@ async function assertOnlyOurs() {
 
 async function maskedScreenshot(filename) {
   if (!page || page.isClosed() || !safeInitialState) return;
-  await page.screenshot({ path: path.join(outDir, filename), fullPage: true, mask: [page.locator('.terminal-host'), page.locator('.terminal-path'), page.locator('#external-list'), page.locator('#notification-list'), page.locator('#restore-list'), page.locator('#catalog-list'), page.locator('#catalog-selected'), page.locator('#catalog-project'), page.locator('#projects')], maskColor: '#141820' });
+  await page.screenshot({ path: path.join(outDir, filename), fullPage: true, mask: [page.locator('.terminal-host'), page.locator('.terminal-path'), page.locator('#external-list'), page.locator('#notification-list'), page.locator('#restore-list'), page.locator('#catalog-list'), page.locator('#catalog-selected'), page.locator('#catalog-project'), page.locator('#projects'), page.locator('#codex-executable-path'), page.locator('#codex-executable-resolved')], maskColor: '#141820' });
 }
 
 async function nativeCall(command, args = {}) {
@@ -74,6 +75,26 @@ async function projectPicker(mode, cwd) {
     return JSON.parse(stdout.trim());
   } catch (error) {
     error.windowProbe = { script: 'tests/project-picker-probe.ps1', code: error.code ?? null, stdout: probeDiagnostic(error.stdout), stderr: probeDiagnostic(error.stderr) };
+    throw error;
+  }
+}
+
+async function executablePicker(mode, executablePath) {
+  const processId = process.env.AGENT_GRID_NATIVE_PID;
+  const executable = process.env.AGENT_GRID_NATIVE_EXE;
+  assert(processId && executable, 'Executable picker requires the root-launched PID and exact executable');
+  const script = fileURLToPath(new URL('./executable-picker-probe.ps1', import.meta.url));
+  const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const args = ['-NoProfile', '-NonInteractive', '-File', script, '-AppProcessId', processId, '-ExpectedExecutable', executable, '-ExpectedDialogTitle', 'CLI 실행 파일 선택', '-Mode', mode];
+  if (executablePath) args.push('-ExpectedPath', executablePath);
+  await page.locator('#codex-executable-choose').click();
+  try {
+    const { stdout } = await execFileAsync(powershell, args, { windowsHide: true, timeout: 25_000, maxBuffer: 64 * 1024 });
+    const probe = JSON.parse(stdout.trim());
+    assert(probe.exactProcessAndDialogVerified && probe.dialogClosed && !probe.externalProcessesTouched);
+    return probe;
+  } catch (error) {
+    error.windowProbe = { script: 'tests/executable-picker-probe.ps1', code: error.code ?? null, stdout: probeDiagnostic(error.stdout), stderr: probeDiagnostic(error.stderr) };
     throw error;
   }
 }
@@ -249,6 +270,108 @@ try {
     assert.notEqual(report.sessions[0].threadId, report.sessions[1].threadId, 'Two new sessions unexpectedly share a thread UUID');
     return { validFullUuids: true, distinctThreads: true };
   });
+  if (process.env.AGENT_GRID_NATIVE_EXECUTABLE_PICKER === '1') {
+    const workspace = process.env.AGENT_GRID_WORKSPACE_DIR;
+    assert(workspace && path.isAbsolute(workspace), 'Executable picker validation requires an explicitly isolated workspace');
+    const relativeWorkspace = path.relative(outDir, await realpath(workspace));
+    assert(relativeWorkspace && relativeWorkspace !== '..' && !relativeWorkspace.startsWith('..' + path.sep) && !path.isAbsolute(relativeWorkspace), 'Settings writes must stay inside this fixture output directory');
+    const executablePath = process.env.AGENT_GRID_CODEX;
+    assert(executablePath && path.isAbsolute(executablePath) && path.extname(executablePath).toLowerCase() === '.exe', 'Provide the actual native Codex executable as AGENT_GRID_CODEX');
+    const canonicalExecutable = await realpath(executablePath);
+    assert((await stat(canonicalExecutable)).isFile());
+    const { DatabaseSync } = await import('node:sqlite');
+    const persistedExecutable = () => {
+      const database = new DatabaseSync(path.join(workspace, 'workspace.sqlite3'), { readOnly: true });
+      try { return database.prepare("SELECT value FROM app_settings WHERE key = 'codex_executable'").get()?.value ?? null; }
+      finally { database.close(); }
+    };
+    const originalSessions = await nativeCall('list_sessions');
+    assert.equal(originalSessions.length, 2);
+    const screens = [];
+    for (const title of await tileTitles()) screens.push({ title, screen: await tile(title).locator('.xterm-screen').elementHandle() });
+    const assertLiveSessions = async () => {
+      await assertOnlyOurs();
+      const current = await nativeCall('list_sessions');
+      assert.equal(current.length, originalSessions.length, 'Settings changed the live session count');
+      for (const before of originalSessions) {
+        const after = current.find(session => session.id === before.id);
+        assert(after, 'Settings removed an existing PTY');
+        assert.equal(after.generation, before.generation, 'Settings restarted an existing PTY generation');
+        assert.equal(after.threadId, before.threadId, 'Settings replaced an existing CLI thread');
+        assert(!['stopping', 'stopped', 'exited', 'error'].includes(after.state), 'Settings stopped an existing PTY');
+      }
+      for (const previous of screens) {
+        assert(previous.screen && await previous.screen.evaluate(element => element.isConnected && element.closest('.terminal-card')?.querySelector('.xterm-screen') === element), 'Settings disposed the existing terminal DOM');
+        assert((await tile(previous.title).locator('.terminal-host').innerText()).trim().length > 10);
+      }
+      return current.map(({ id, generation, threadId }) => ({ id, generation, threadId }));
+    };
+    const settingsDialog = page.locator('#codex-settings-dialog');
+    try {
+      await check('native executable picker cancel preserves initial isolated settings and live PTYs', async () => {
+        const before = await nativeCall('get_codex_settings');
+        assert.equal(before.savedPath, null, 'Fresh isolated settings already have a saved executable');
+        assert.equal(persistedExecutable(), null);
+        await page.locator('#codex-settings-open').click();
+        await settingsDialog.waitFor({ state: 'visible' });
+        const picker = await executablePicker('Cancel');
+        await until(() => page.locator('#codex-executable-choose').isEnabled(), value => value, 'cancelled executable picker releases UI');
+        assert.deepEqual(await nativeCall('get_codex_settings'), before);
+        assert.equal(persistedExecutable(), null);
+        return { picker, savedSettingsUnchanged: true, sessions: await assertLiveSessions() };
+      });
+      await check('native executable selection persists exact file and settings reopen with live PTYs', async () => {
+        const picker = await executablePicker('Select', canonicalExecutable);
+        const saved = await until(() => nativeCall('get_codex_settings'), value => value.source === 'saved' && !!value.savedPath, 'executable selection saved');
+        assert.equal(await realpath(saved.savedPath), canonicalExecutable);
+        assert.equal(await realpath(saved.resolvedPath), canonicalExecutable);
+        assert.equal(saved.error, null);
+        assert.equal(persistedExecutable(), saved.savedPath, 'SQLite setting differs from selected file');
+        await until(() => page.locator('#codex-executable-path').inputValue(), value => value === saved.savedPath, 'saved executable appears in UI');
+        await page.locator('#codex-settings-close').click();
+        await page.locator('#codex-settings-open').click();
+        await until(() => page.locator('#codex-executable-path').inputValue(), value => value === saved.savedPath, 'reopened settings reload saved executable');
+        const cancelled = await executablePicker('Cancel');
+        await until(() => page.locator('#codex-executable-choose').isEnabled(), value => value, 'saved-setting cancel completes');
+        assert.deepEqual(await nativeCall('get_codex_settings'), saved);
+        assert.equal(persistedExecutable(), saved.savedPath);
+        return { picker, cancelled, savedPathSha256: hash(saved.savedPath), resolvedPathSha256: hash(saved.resolvedPath), source: saved.source, sqliteMatchesSelectedPath: true, uiReopened: true, savedSettingPreservedOnCancel: true, appRestartVerified: false, sessions: await assertLiveSessions() };
+      });
+      await check('native invalid executable choice exposes error and preserves saved setting and live PTYs', async () => {
+        const before = await nativeCall('get_codex_settings');
+        const invalidExecutable = path.join(outDir, 'invalid-native-cli.exe');
+        await writeFile(invalidExecutable, 'Agent Grid fixture: this is not a Windows PE executable.\n', { encoding: 'utf8', flag: 'wx' });
+        const picker = await executablePicker('Select', invalidExecutable);
+        await page.locator('#codex-settings-error').waitFor({ state: 'visible' });
+        const visibleError = (await page.locator('#codex-settings-error').textContent()) ?? '';
+        assert(visibleError.trim(), 'Invalid executable selection gave no visible reason');
+        assert.deepEqual(await nativeCall('get_codex_settings'), before);
+        assert.equal(persistedExecutable(), before.savedPath);
+        let missingPathError = '';
+        try { await nativeCall('set_codex_executable', { path: path.join(outDir, 'does-not-exist-' + randomUUID() + '.exe') }); }
+        catch (error) { missingPathError = String(error); }
+        assert(missingPathError, 'Missing executable path was silently accepted');
+        assert.deepEqual(await nativeCall('get_codex_settings'), before);
+        assert.equal(persistedExecutable(), before.savedPath);
+        return { picker, visibleErrorSha256: hash(visibleError), missingPathErrorSha256: hash(missingPathError), invalidSelectionPreservedPriorSetting: true, missingPathRejected: true, sessions: await assertLiveSessions() };
+      });
+      await check('native executable reset deletes only saved choice and exposes fallback without restarting live PTYs', async () => {
+        await page.locator('#codex-executable-reset').click();
+        const reset = await until(() => nativeCall('get_codex_settings'), value => value.savedPath === null && value.source !== 'saved', 'executable reset selects fallback');
+        assert.equal(persistedExecutable(), null, 'Reset left saved SQLite row');
+        assert.equal(reset.source, 'environment', 'Fixture AGENT_GRID_CODEX fallback is not explicit');
+        assert.equal(await realpath(reset.resolvedPath), canonicalExecutable);
+        assert.equal(reset.error, null);
+        await until(() => page.locator('#codex-executable-path').inputValue(), value => value === '', 'reset clears saved path UI');
+        assert((await page.locator('#codex-executable-source').textContent())?.trim(), 'Reset fallback source is not visible');
+        assert((await page.locator('#codex-executable-resolved').textContent())?.includes(reset.resolvedPath), 'Reset resolved path is not visible');
+        return { savedPath: null, source: reset.source, resolvedPathSha256: hash(reset.resolvedPath), sqliteSavedRowRemoved: true, fallbackExplicit: true, sessions: await assertLiveSessions() };
+      });
+      await page.locator('#codex-settings-close').click();
+    } finally {
+      for (const previous of screens) await previous.screen?.dispose();
+    }
+  } else report.limitations.push('Native executable picker/settings were not tested: AGENT_GRID_NATIVE_EXECUTABLE_PICKER=1 was not supplied.');
   await check('nonexistent resume thread fails visibly without fresh fallback and error tile closes', async () => {
     const title = `native-smoke-${token}-invalid-resume`;
     const requestedThreadId = randomUUID();

@@ -3,7 +3,7 @@ import { test, expect, type Page } from '@playwright/test';
 const alpha = { id: '01900000-0000-7000-8000-000000000001', title: 'API 구조 개선', cwd: 'D:\\프로젝트\\api', createdAt: 1700000000, updatedAt: 1700000200, status: 'idle' };
 const beta = { ...alpha, id: '01900000-0000-7000-8000-000000000002', title: '회귀 테스트 점검', updatedAt: 1700000300 };
 
-async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; holdStart?: boolean; owned?: boolean; ownedState?: string; saved?: boolean; pages?: boolean; titleOverride?: string } = {}) {
+async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; holdStart?: boolean; failStartOnce?: boolean; owned?: boolean; ownedState?: string; saved?: boolean; pages?: boolean; titleOverride?: string } = {}) {
   await page.addInitScript(({ alpha, beta, options }) => {
     const state = window as any;
     state.isTauri = true;
@@ -47,6 +47,7 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
         if (command === 'start_session') {
           if (new TextEncoder().encode(args.request.title).byteLength > 512 || /\p{Cc}/u.test(args.request.title)) throw new Error('title must be at most 512 bytes without control characters');
           const created = ++fixture.created;
+          if (options.failStartOnce && created === 1) throw new Error('실행 파일을 시작하지 못했습니다');
           if (options.holdStart && created === 1) await new Promise<void>(resolve => { fixture.releaseStart = resolve; });
           return { ...args.request, id: 'created-' + created, generation: 1, state: 'idle', threadId: args.request.threadId || '01900000-0000-7000-8000-000000000003' };
         }
@@ -197,6 +198,23 @@ test('saved workspace and catalog share the owned-thread guard across repeated r
   expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session'))).toEqual([]);
   await expect(page.locator('.terminal-card')).toHaveCount(1);
   await expect(page.locator('.terminal-card[data-id="owned-alpha"]')).toHaveClass(/focused/);
+});
+
+test('failed resume releases the pending thread so the same UUID can be retried', async ({ page }) => {
+  await mockNative(page, { failStartOnce: true });
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-resume')).toBeEnabled();
+  await page.locator('#catalog-resume').click();
+  await expect(page.locator('#catalog-resume-error')).toContainText('실행 파일을 시작하지 못했습니다');
+  await expect(page.locator('#catalog-resume')).toBeEnabled();
+  await expect(page.locator('.terminal-card')).toHaveCount(0);
+  await page.locator('#catalog-resume').click();
+  await expect(page.locator('#catalog-dialog')).toBeHidden();
+  await expect(page.locator('.terminal-card')).toHaveCount(1);
+  const requests = await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session').map((call: any) => call.args.request));
+  expect(requests).toHaveLength(2);
+  expect(requests.map((request: any) => request.threadId)).toEqual([alpha.id, alpha.id]);
+  expect(requests.map((request: any) => request.cwd)).toEqual([alpha.cwd, alpha.cwd]);
 });
 
 test('pending resume is reused when the popup closes and reopens before startup completes', async ({ page }) => {
