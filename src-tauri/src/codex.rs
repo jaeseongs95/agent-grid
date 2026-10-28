@@ -1,6 +1,6 @@
 //! Official Codex app-server protocol adapter. User config/auth remain owned by Codex.
 use portable_pty::CommandBuilder;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -9,7 +9,7 @@ use std::{
     net::{Shutdown, TcpListener, TcpStream},
     path::Path,
     process::{Child, ChildStdin, Command, Stdio},
-    sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc},
+    sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -20,6 +20,13 @@ use crate::process_job::{LaunchGate, ProcessJob};
 const TOKEN_ENV: &str = "AGENT_GRID_REMOTE_TOKEN";
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_FRAME: usize = 8 * 1024 * 1024;
+const CATALOG_PAGE_SIZE: usize = 50;
+const PREVIEW_TEXT_BYTES: usize = 64 * 1024;
+static CATALOG_REQUEST: Mutex<()> = Mutex::new(());
+
+#[path = "codex_catalog.rs"]
+mod catalog;
+pub use catalog::{catalog_list, catalog_preview, CatalogPage, CatalogPreview, CatalogQuery};
 
 #[derive(Debug)]
 pub enum CodexEvent { ThreadId(String), Status(String) }
@@ -266,10 +273,9 @@ fn publish_status(previous: &mut Option<String>, state: String, on_event: &dyn F
     }
 }
 
-pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEvent) + Send + Sync>) -> Result<CodexSession, String> {
-    let cwd = cwd.canonicalize().map_err(|e| format!("Cannot open working directory: {e}"))?;
-    if !cwd.is_dir() { return Err("Working directory must be a directory".into()); }
-    if let Some(id) = thread_id { Uuid::parse_str(id).map_err(|_| "Saved Codex thread ID is not a UUID; refusing ambiguous name-based resume")?; }
+/// Both terminal sessions and short-lived catalog requests use the same owned,
+/// authenticated server. Browsing never creates/resumes a conversation.
+fn launch_server(cwd: &Path, thread_id: Option<&str>) -> Result<(CodexSession, Rpc<TcpStream>), String> {
     let exe = executable()?;
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let endpoint = format!("ws://{}", listener.local_addr().map_err(|e| e.to_string())?);
@@ -283,7 +289,7 @@ pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEv
     hidden(&mut process);
     let server = process.spawn().map_err(|e| format!("Cannot start Codex app-server: {e}"))?;
     let mut session = CodexSession {
-        command: CommandBuilder::new(&exe), server, job:None, _launch_gate:launch_gate,
+        command: tui_command(&exe, cwd, &endpoint, &token, thread_id), server, job:None, _launch_gate:launch_gate,
         stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None,
     };
     session.job = Some(ProcessJob::assign_std(&session.server)?);
@@ -292,6 +298,14 @@ pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEv
     let mut rpc = connect(&endpoint, &token, &mut session.server, job)?;
     rpc.call("initialize", initialize())?;
     rpc.send(json!({"method":"initialized","params":{}}))?;
+    Ok((session, rpc))
+}
+
+pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEvent) + Send + Sync>) -> Result<CodexSession, String> {
+    let cwd = cwd.canonicalize().map_err(|e| format!("Cannot open working directory: {e}"))?;
+    if !cwd.is_dir() { return Err("Working directory must be a directory".into()); }
+    if let Some(id) = thread_id { Uuid::parse_str(id).map_err(|_| "Saved Codex thread ID is not a UUID; refusing ambiguous name-based resume")?; }
+    let (mut session, mut rpc) = launch_server(&cwd, thread_id)?;
     if let Some(id) = thread_id {
         let existing = rpc.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
         verified_thread(&existing["thread"], id, &cwd)?;
@@ -300,7 +314,6 @@ pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEv
     }
     // Fresh TUI owns thread/start; an empty pre-created thread may not have a resumable rollout.
     // The observer uses only read RPCs and never claims the TUI's writer/approval ownership.
-    session.command = tui_command(&exe, &cwd, &endpoint, &token, thread_id);
     session.socket = Some(rpc.ws.get_ref().try_clone().map_err(|e| e.to_string())?);
     let stopped = session.stopped.clone();
     let mut selected = thread_id.map(str::to_owned);

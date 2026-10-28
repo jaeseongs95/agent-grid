@@ -368,6 +368,17 @@ impl Engine {
     pub fn load_layout(&self) -> Result<serde_json::Value, String> { self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.load_layout() }
     pub fn save_layout(&self, layout: &serde_json::Value) -> Result<(), String> { self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.save_layout(layout) }
 
+    pub fn list_projects(&self) -> Result<Vec<crate::project::ProjectInfo>, String> {
+        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.projects()
+    }
+
+    pub fn import_project(&self, cwd: &str) -> Result<crate::project::ProjectInfo, String> {
+        // Canonicalization may touch a network filesystem. Do it before taking
+        // the metadata lock so terminal lifecycle updates remain independent.
+        let directory = crate::project::directory(cwd)?;
+        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.import_project(&directory)
+    }
+
     pub fn shutdown(&self) -> Result<(), String> {
         self.inner.exiting.store(true, Ordering::Release);
         let sessions: Vec<_> = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?.values().cloned().collect();

@@ -1,6 +1,7 @@
 mod codex;
 mod flow;
 mod launch_gate;
+mod project;
 pub mod process_job;
 mod session;
 pub mod self_test;
@@ -12,6 +13,18 @@ use tauri::{menu::{Menu, MenuItem}, tray::{MouseButton, MouseButtonState, TrayIc
 
 #[derive(Default)]
 struct ExitState(AtomicBool);
+
+fn workspace_directory(default: std::path::PathBuf, override_path: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, String> {
+    match override_path {
+        None => Ok(default),
+        Some(path) => {
+            if path.is_empty() { return Err("AGENT_GRID_WORKSPACE_DIR is empty".into()); }
+            let path = std::path::PathBuf::from(path);
+            if !path.is_absolute() { return Err("AGENT_GRID_WORKSPACE_DIR must be an absolute directory path".into()); }
+            Ok(path)
+        }
+    }
+}
 
 #[tauri::command]
 async fn start_session(engine: State<'_, Engine>, request: StartRequest) -> Result<SessionInfo, String> {
@@ -46,6 +59,36 @@ async fn list_external() -> Result<Vec<codex::ExternalSession>, String> {
     tauri::async_runtime::spawn_blocking(codex::list_external).await.map_err(|e| format!("external session observer: {e}"))?
 }
 #[tauri::command]
+async fn list_projects(engine: State<'_, Engine>) -> Result<Vec<project::ProjectInfo>, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.list_projects()).await.map_err(|e| format!("List projects worker: {e}"))?
+}
+#[tauri::command]
+async fn import_project(engine: State<'_, Engine>, cwd: String) -> Result<project::ProjectInfo, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.import_project(&cwd)).await.map_err(|e| format!("Import project worker: {e}"))?
+}
+#[tauri::command]
+async fn choose_project(app: tauri::AppHandle, engine: State<'_, Engine>, picker: State<'_, project::FolderPicker>) -> Result<Option<project::ProjectInfo>, String> {
+    let engine = engine.inner().clone();
+    let picker = picker.inner().clone();
+    #[cfg(windows)]
+    let owner = app.get_webview_window("main").ok_or("Main window is unavailable")?.hwnd().map_err(|e| format!("Get project chooser parent window: {e}"))?.0 as isize;
+    #[cfg(not(windows))]
+    let owner = { let _ = app; 0 };
+    tauri::async_runtime::spawn_blocking(move || {
+        picker.choose(owner)?.map(|cwd| engine.import_project(&cwd)).transpose()
+    }).await.map_err(|e| format!("Project folder chooser worker: {e}"))?
+}
+#[tauri::command]
+async fn catalog_list(request: codex::CatalogQuery) -> Result<codex::CatalogPage, String> {
+    tauri::async_runtime::spawn_blocking(move || codex::catalog_list(request)).await.map_err(|e| format!("Session catalog worker: {e}"))?
+}
+#[tauri::command]
+async fn catalog_preview(thread_id: String, cursor: Option<String>) -> Result<codex::CatalogPreview, String> {
+    tauri::async_runtime::spawn_blocking(move || codex::catalog_preview(&thread_id, cursor)).await.map_err(|e| format!("Session preview worker: {e}"))?
+}
+#[tauri::command]
 async fn complete_exit(app: tauri::AppHandle, engine: State<'_, Engine>, confirmed: bool) -> Result<(), String> {
     if !confirmed { return Err("explicit exit confirmation is required".into()); }
     let engine = engine.inner().clone();
@@ -71,8 +114,12 @@ pub fn run() {
     }
     let result = tauri::Builder::default()
         .manage(ExitState::default())
+        .manage(project::FolderPicker::default())
         .setup(|app| {
-            let directory = app.path().app_data_dir()?;
+            // Process-scoped isolation for this app's metadata only. Codex's
+            // home, credentials and configuration remain entirely unchanged.
+            let directory = workspace_directory(app.path().app_data_dir()?, std::env::var_os("AGENT_GRID_WORKSPACE_DIR"))
+                .map_err(std::io::Error::other)?;
             std::fs::create_dir_all(&directory)?;
             let handle = app.handle().clone();
             let sink = Arc::new(move |event| match event {
@@ -96,7 +143,7 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, complete_exit])
+        .invoke_handler(tauri::generate_handler![start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, complete_exit])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<ExitState>().0.load(Ordering::Acquire) {
@@ -117,5 +164,21 @@ pub fn run() {
             }
         }),
         Err(error) => { eprintln!("Agent Grid initialization failed: {error}"); std::process::exit(1); }
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::workspace_directory;
+    use std::ffi::OsString;
+
+    #[test]
+    fn workspace_override_is_explicit_absolute_and_does_not_change_the_default() {
+        let default = std::env::temp_dir().join("agent-grid-default-workspace");
+        let isolated = std::env::temp_dir().join("agent-grid-isolated-workspace");
+        assert_eq!(workspace_directory(default.clone(), None).unwrap(), default);
+        assert_eq!(workspace_directory(default.clone(), Some(isolated.clone().into_os_string())).unwrap(), isolated);
+        assert!(workspace_directory(default.clone(), Some(OsString::new())).is_err());
+        assert!(workspace_directory(default, Some(OsString::from("relative-workspace"))).is_err());
     }
 }

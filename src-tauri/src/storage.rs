@@ -1,4 +1,4 @@
-use crate::session::SessionInfo;
+use crate::{project::{ProjectDirectory, ProjectInfo}, session::SessionInfo};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 use std::{path::Path, time::Duration};
@@ -20,6 +20,13 @@ impl Store {
              CREATE TABLE IF NOT EXISTS workspace_layout (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 layout TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY NOT NULL,
+                canonical_cwd TEXT UNIQUE NOT NULL,
+                cwd TEXT NOT NULL,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
              );"
         ).map_err(|e| format!("initialize application metadata: {e}"))?;
         Ok(Self { connection })
@@ -73,6 +80,26 @@ impl Store {
         self.connection.execute("INSERT INTO workspace_layout(id,layout) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET layout=excluded.layout", [text]).map_err(|e| format!("save workspace layout: {e}"))?;
         Ok(())
     }
+
+    pub fn import_project(&self, directory: &ProjectDirectory) -> Result<ProjectInfo, String> {
+        self.connection.execute(
+            "INSERT INTO projects(id,canonical_cwd,cwd,name) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(canonical_cwd) DO NOTHING",
+            params![uuid::Uuid::new_v4().to_string(), directory.identity, directory.cwd, directory.name]
+        ).map_err(|e| format!("Register project directory: {e}"))?;
+        self.connection.query_row(
+            "SELECT id,name,cwd,created_at FROM projects WHERE canonical_cwd=?1",
+            [&directory.identity], |row| Ok(ProjectInfo { id: row.get(0)?, name: row.get(1)?, cwd: row.get(2)?, created_at: row.get(3)? })
+        ).map_err(|e| format!("Read imported project: {e}"))
+    }
+
+    pub fn projects(&self) -> Result<Vec<ProjectInfo>, String> {
+        let mut statement = self.connection.prepare("SELECT id,name,cwd,created_at FROM projects ORDER BY created_at DESC,id")
+            .map_err(|e| format!("List imported projects: {e}"))?;
+        let rows = statement.query_map([], |row| Ok(ProjectInfo { id: row.get(0)?, name: row.get(1)?, cwd: row.get(2)?, created_at: row.get(3)? }))
+            .map_err(|e| format!("Query imported projects: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("Read imported project row: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -109,5 +136,43 @@ mod tests {
         assert_eq!(count, 513);
         let active: usize = store.connection.query_row("SELECT COUNT(*) FROM session_metadata WHERE id='session-0000'", [], |r| r.get(0)).unwrap();
         assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn imported_unicode_project_deduplicates_canonical_paths_and_survives_reopen() {
+        let root = std::env::temp_dir().join(format!("agent-grid-project-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let folder = root.join("한글 프로젝트");
+        std::fs::create_dir(&folder).unwrap();
+        let database = root.join("metadata.sqlite3");
+        let first;
+        {
+            let store = Store::open(&database).unwrap();
+            let directory = crate::project::directory(folder.to_str().unwrap()).unwrap();
+            first = store.import_project(&directory).unwrap();
+            let alias = folder.join("..").join("한글 프로젝트");
+            let repeated = store.import_project(&crate::project::directory(alias.to_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(first.id, repeated.id);
+            assert_eq!(first.name, "한글 프로젝트");
+            assert_eq!(store.projects().unwrap().len(), 1);
+            store.save_layout(&serde_json::json!({"version":1,"sessions":[]})).unwrap();
+            store.save_session(&SessionInfo { id: "existing".into(), generation: 1, title: "Existing session".into(), cwd: first.cwd.clone(), thread_id: None, state: "exited".into() }).unwrap();
+        }
+        {
+            let reopened = Store::open(&database).unwrap();
+            let saved = reopened.projects().unwrap();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].id, first.id);
+            assert_eq!(saved[0].cwd, first.cwd);
+            assert_eq!(reopened.sessions().unwrap()[0].id, "existing");
+            assert_eq!(reopened.load_layout().unwrap()["sessions"], serde_json::json!([]));
+        }
+        // Delete only the files and empty directories created by this fixture.
+        for name in ["metadata.sqlite3", "metadata.sqlite3-wal", "metadata.sqlite3-shm"] {
+            let file = root.join(name);
+            if file.exists() { std::fs::remove_file(file).unwrap(); }
+        }
+        std::fs::remove_dir(folder).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 }
