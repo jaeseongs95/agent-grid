@@ -53,7 +53,29 @@ async function assertOnlyOurs() {
 
 async function maskedScreenshot(filename) {
   if (!page || page.isClosed() || !safeInitialState) return;
-  await page.screenshot({ path: path.join(outDir, filename), fullPage: true, mask: [page.locator('.terminal-host'), page.locator('.terminal-path'), page.locator('#external-list'), page.locator('#notification-list'), page.locator('#restore-list')], maskColor: '#141820' });
+  await page.screenshot({ path: path.join(outDir, filename), fullPage: true, mask: [page.locator('.terminal-host'), page.locator('.terminal-path'), page.locator('#external-list'), page.locator('#notification-list'), page.locator('#restore-list'), page.locator('#catalog-list'), page.locator('#catalog-selected'), page.locator('#catalog-project'), page.locator('#projects')], maskColor: '#141820' });
+}
+
+async function nativeCall(command, args = {}) {
+  return page.evaluate(({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args });
+}
+
+async function projectPicker(mode, cwd) {
+  const processId = process.env.AGENT_GRID_NATIVE_PID;
+  const executable = process.env.AGENT_GRID_NATIVE_EXE;
+  assert(processId && executable, 'Native picker tests require the root-launched PID and exact executable');
+  const script = fileURLToPath(new URL('./project-picker-probe.ps1', import.meta.url));
+  const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const args = ['-NoProfile', '-NonInteractive', '-File', script, '-AppProcessId', processId, '-ExpectedExecutable', executable, '-ExpectedDialogText', '프로젝트로 가져올 폴더를 선택하세요', '-Mode', mode];
+  if (cwd) args.push('-ExpectedPath', cwd);
+  await page.locator('#project-import').click();
+  try {
+    const { stdout } = await execFileAsync(powershell, args, { windowsHide: true, timeout: 25_000, maxBuffer: 64 * 1024 });
+    return JSON.parse(stdout.trim());
+  } catch (error) {
+    error.windowProbe = { script: 'tests/project-picker-probe.ps1', code: error.code ?? null, stdout: probeDiagnostic(error.stdout), stderr: probeDiagnostic(error.stderr) };
+    throw error;
+  }
 }
 
 async function createSession(title, cwd) {
@@ -157,6 +179,54 @@ try {
     safeInitialState = true;
     return { title: await page.title(), origin: new URL(page.url()).origin, initialTiles: 0 };
   });
+  if (process.env.AGENT_GRID_NATIVE_PROJECT_PICKER === '1') {
+    assert(process.env.AGENT_GRID_WORKSPACE_DIR && path.isAbsolute(process.env.AGENT_GRID_WORKSPACE_DIR), 'Picker validation requires an explicitly isolated Agent Grid workspace');
+    await check('native project picker cancel preserves empty isolated registry', async () => {
+      assert.equal((await nativeCall('list_projects')).length, 0, 'Fixture workspace must start with no imported projects');
+      const picker = await projectPicker('Cancel');
+      await until(() => page.locator('#project-import').isEnabled(), value => value, 'cancelled picker releases import button');
+      assert.equal((await nativeCall('list_projects')).length, 0, 'Cancelled picker registered a project');
+      assert.equal(await page.locator('#catalog-dialog').getAttribute('open'), null);
+      return { picker, registryUnchanged: true };
+    });
+    await check('native project selection imports directory and opens filtered session popup', async () => {
+      const picker = await projectPicker('Select', cwd);
+      await page.locator('#catalog-dialog').waitFor({ state: 'visible', timeout: 30_000 });
+      const projects = await nativeCall('list_projects'); assert.equal(projects.length, 1);
+      assert.equal(await realpath(projects[0].cwd), cwd);
+      assert.equal(await page.locator('#catalog-project').inputValue(), projects[0].cwd);
+      const duplicate = await nativeCall('import_project', { cwd });
+      assert.equal(duplicate.id, projects[0].id); assert.equal((await nativeCall('list_projects')).length, 1);
+      return { picker, selectedCwdSha256: hash(projects[0].cwd), registryCount: 1, duplicateReturnsSameId: true, popupProjectFilterApplied: true };
+    });
+    await check('actual stored-session lookup, metadata and recent conversation preview', async () => {
+      const status = page.locator('#catalog-list-status');
+      await until(() => status.textContent(), text => !!text && !text.includes('찾는 중'), 'native catalog query finishes', 45_000);
+      const text = await status.textContent(); assert(!text.includes('실패'), 'Native catalog query failed');
+      const rows = page.locator('#catalog-list [role="option"]');
+      const count = await rows.count(); assert(count > 0, 'Trusted fixture project has no discoverable stored sessions');
+      await rows.first().click();
+      await until(() => page.locator('#catalog-preview-status').textContent(), value => !value?.includes('불러오는 중'), 'native preview query finishes', 45_000);
+      for (let older = 0; older < 3 && !await page.locator('#catalog-messages .catalog-message').count() && await page.locator('#catalog-preview-more').isVisible(); older++) {
+        await page.locator('#catalog-preview-more').click();
+        await until(() => page.locator('#catalog-preview-status').textContent(), value => !value?.includes('불러오는 중'), 'older preview page finishes', 45_000);
+      }
+      const previewStatus = (await page.locator('#catalog-preview-status').textContent()) ?? '';
+      assert(!previewStatus.includes('실패'), 'Native conversation preview failed');
+      const messageCount = await page.locator('#catalog-messages .catalog-message').count();
+      assert(messageCount > 0, 'Expected text messages in the bounded real history pages');
+      const selected = (await page.locator('#catalog-list [aria-selected="true"]').getAttribute('data-thread-id')) ?? '';
+      assert(uuid.test(selected));
+      const title = await page.locator('#catalog-session-title').textContent(); assert(title);
+      await page.locator('#catalog-search').fill(title.slice(0, 12));
+      await until(() => status.textContent(), value => !!value && !value.includes('찾는 중'), 'native title search completes', 45_000);
+      assert(!((await status.textContent()) ?? '').includes('실패'));
+      assert(await rows.count() > 0, 'Native title search lost its selected title');
+      await maskedScreenshot('native-session-popup-masked.png');
+      await page.locator('#catalog-close').click();
+      return { projectSessionRows: count, previewMessagesRendered: messageCount, selectedThreadIdSha256: hash(selected), titleSearchPerformed: true, existingSessionResumed: false, transcriptSaved: false };
+    });
+  } else report.limitations.push('Native project folder picker and history popup were not tested: AGENT_GRID_NATIVE_PROJECT_PICKER=1 was not supplied.');
   const token = Date.now().toString(36);
   await check('create first real CLI session', () => createSession(`native-smoke-${token}-A`, cwd));
   await check('create second real CLI session', () => createSession(`native-smoke-${token}-B`, cwd));

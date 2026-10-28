@@ -1,4 +1,9 @@
-# Initial release validation
+# Baseline validation
+
+The results below describe the baseline packaged application at
+`a8e7daed987b7a27cea917e9df271a4748f88ed0`, before the project importer and
+session-browser popup were added. Results for those additions belong to the
+final release's CI run and release notes.
 
 The first release is a Windows x64 preview. Long-duration stress testing is
 being handed to the user; the four-hour automated run was cancelled at their
