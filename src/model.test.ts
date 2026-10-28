@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { acceptOutput, broadcast, broadcastTargets, parseLayout, updateSession, type SessionInfo } from './model.ts';
+import { acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, updateSession, type SessionInfo } from './model.ts';
 
 const base: SessionInfo = { id: 'owned', generation: 2, title: 'test', cwd: 'C:\\work', state: 'running' };
 
@@ -37,6 +37,15 @@ test('persisted layout is bounded and restores metadata without starting any pro
   assert.deepEqual(parsed?.columnSizes, [1, 0.2, 10]);
   assert.deepEqual(parsed?.sessions, [{ title: 'a', cwd: 'C:\\a', threadId: 't' }]);
   assert.equal(parseLayout({ version: 1, columns: NaN, sessions: [] })?.columns, 2);
+});
+
+test('an explicitly empty saved workspace stays empty; only a missing layout falls back to restored metadata', () => {
+  const history = [{ ...base, state: 'restored', threadId: 'historical-thread' }, { ...base, id: 'live', state: 'running' }];
+  const empty = parseLayout({ version: 1, columns: 2, sessions: [] });
+  assert.deepEqual(chooseSavedSessions(empty, history), []);
+  assert.deepEqual(chooseSavedSessions(undefined, history), [{ title: base.title, cwd: base.cwd, threadId: 'historical-thread' }]);
+  const saved = parseLayout({ version: 1, sessions: [{ title: 'kept', cwd: 'C:\\kept' }] });
+  assert.deepEqual(chooseSavedSessions(saved, history), [{ title: 'kept', cwd: 'C:\\kept' }]);
 });
 
 test('broadcast reports partial failure once per target and skips a changed generation or waiting state', async () => {

@@ -58,6 +58,10 @@ export interface Layout {
   sessions: SavedSession[];
 }
 
+export function chooseSavedSessions(layout: Layout | undefined, existing: SessionInfo[]): SavedSession[] {
+  return layout?.sessions ?? existing.filter(session => session.state === 'restored').map(({ title, cwd, threadId }) => ({ title, cwd, threadId }));
+}
+
 export function parseLayout(value: unknown): Layout | undefined {
   if (!value || typeof value !== 'object') return;
   const v = value as Partial<Layout>;

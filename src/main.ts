@@ -5,7 +5,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
-import { acceptOutput, broadcast, broadcastTargets, parseLayout, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo } from './model';
+import { acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo } from './model';
 
 const native = isTauri();
 const demo = !native && new URLSearchParams(location.search).has('demo');
@@ -349,9 +349,9 @@ async function initialize() {
     const [layoutValue, existing] = await Promise.all([call<unknown>('load_layout'), call<SessionInfo[]>('list_sessions')]);
     const wrapper = layoutValue as { layout?: unknown; sessions?: SessionInfo[] } | null;
     const layout = parseLayout(wrapper && 'layout' in wrapper ? wrapper.layout : layoutValue);
-    if (layout) { columns = layout.columns; columnSizes = layout.columnSizes; rowSizes = layout.rowSizes; saved = layout.sessions; $('#restore-banner').hidden = saved.length === 0; }
+    if (layout) { columns = layout.columns; columnSizes = layout.columnSizes; rowSizes = layout.rowSizes; }
     for (const session of existing) if (session.state !== 'restored' && (sessions.get(session.id)?.generation ?? -1) < session.generation) receiveSession(session, false);
-    if (!saved.length) saved = existing.filter(session => session.state === 'restored').map(({ title, cwd, threadId }) => ({ title, cwd, threadId }));
+    saved = chooseSavedSessions(layout, existing);
     $('#restore-banner').hidden = saved.length === 0;
     $('#connection').textContent = '로컬 연결됨'; renderAll();
   } catch (error) { $('#connection').textContent = '연결 오류'; notify(`초기화 실패: ${message(error)}`, true); }
