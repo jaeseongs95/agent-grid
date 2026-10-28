@@ -3,7 +3,7 @@ import { test, expect, type Page } from '@playwright/test';
 const alpha = { id: '01900000-0000-7000-8000-000000000001', title: 'API 구조 개선', cwd: 'D:\\프로젝트\\api', createdAt: 1700000000, updatedAt: 1700000200, status: 'idle' };
 const beta = { ...alpha, id: '01900000-0000-7000-8000-000000000002', title: '회귀 테스트 점검', updatedAt: 1700000300 };
 
-async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; owned?: boolean; pages?: boolean } = {}) {
+async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; owned?: boolean; pages?: boolean; titleOverride?: string } = {}) {
   await page.addInitScript(({ alpha, beta, options }) => {
     const state = window as any;
     state.isTauri = true;
@@ -36,7 +36,8 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
               if (args.request.query === 'failure') throw new Error('조회 연결 오류');
               if (args.request.query === 'latest') return { sessions: [{ ...beta, title: '최종 검색 결과' }] };
               if (args.request.cursor) return { sessions: [beta] };
-              return { sessions: options.pages ? [alpha] : [alpha, beta], nextCursor: options.pages ? 'next-list' : null };
+              const first = { ...alpha, title: options.titleOverride ?? alpha.title };
+              return { sessions: options.pages ? [first] : [first, beta], nextCursor: options.pages ? 'next-list' : null };
             }
             if (options.holdPreview && args.threadId === alpha.id) await new Promise<void>(resolve => { fixture.releasePreview = resolve; });
             const text = args.threadId === alpha.id ? 'ALPHA ONLY' : '최근 답변 <img src=x onerror="window.injected=true">';
@@ -44,6 +45,7 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
           } finally { fixture.active--; }
         }
         if (command === 'start_session') {
+          if (new TextEncoder().encode(args.request.title).byteLength > 512 || /\p{Cc}/u.test(args.request.title)) throw new Error('title must be at most 512 bytes without control characters');
           fixture.created++;
           return { ...args.request, id: 'created-' + fixture.created, generation: 1, state: 'idle', threadId: args.request.threadId || '01900000-0000-7000-8000-000000000003' };
         }
@@ -164,3 +166,26 @@ test('Korean search composition keeps candidate keys inside the IME until commit
   await expect.poll(() => page.evaluate(() => (window as any).fixture.calls.some((call: any) => call.args.request?.query === '한글 검색'))).toBe(true);
   await expect(page.locator('#catalog-dialog')).toBeVisible();
 });
+
+for (const [name, title, expectedTitle] of [
+  ['long multiline Unicode', '\n\t' + '가🙂'.repeat(200) + '\u0085\r\n끝', '가🙂'.repeat(73)],
+  ['control-only fallback', '\n\t\u0000\u0085\r', '이름 없는 세션'],
+  ['513-byte ASCII truncation', 'x'.repeat(513), 'x'.repeat(512)],
+  ['exact 512-byte Unicode unchanged', '가'.repeat(170) + 'ab', '가'.repeat(170) + 'ab'],
+] as const) {
+  test(`catalog title ${name} resumes within the native title boundary`, async ({ page }) => {
+    await mockNative(page, { titleOverride: title });
+    await page.locator('#catalog-open').click();
+    await expect(page.locator('#catalog-list [role=option]')).toHaveCount(2);
+    await page.locator('#catalog-resume').click();
+    await expect(page.locator('#catalog-dialog')).toBeHidden();
+    const request = await page.evaluate(() => (window as any).fixture.calls.find((call: any) => call.command === 'start_session').args.request);
+    expect(request.threadId).toBe(alpha.id);
+    expect(request.cwd).toBe(alpha.cwd);
+    expect(new TextEncoder().encode(request.title).byteLength).toBeLessThanOrEqual(512);
+    expect(request.title).not.toMatch(/\p{Cc}/u);
+    expect(request.title.trim()).not.toBe('');
+    expect(request.title).toBe(expectedTitle);
+    expect(await page.evaluate(() => (window as any).fixture.created)).toBe(1);
+  });
+}

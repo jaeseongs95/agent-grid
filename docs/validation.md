@@ -15,9 +15,12 @@ The external-observer connection was unavailable after the computer reboot;
 the UI displayed that explicitly. The history popup still worked through its
 separate owned server, and no external daemon was started.
 
-Frontend validation included six unit tests and seven browser tests, including
+Frontend validation includes unit and browser tests, including
 coalesced queries, stale-reply rejection, exact resume identity, text-only
-preview rendering and composition-key handling. Browser mocks do not replace
+preview rendering and composition-key handling. Regression fixtures enforce
+the native 512-byte/control-free title boundary for long ASCII, multiline
+Unicode, exact-boundary Unicode and control-only catalog titles while preserving
+the selected thread ID and working directory. Browser mocks do not replace
 the native checks above. Physical Windows IME testing remains separate.
 
 ## Earlier core baseline

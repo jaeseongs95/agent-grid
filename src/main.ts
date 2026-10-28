@@ -66,6 +66,17 @@ $('#app').innerHTML = `
 `;
 
 function message(error: unknown) { return error instanceof Error ? error.message : String(error); }
+function resumeTitle(value: string) {
+  const clean = value.replace(/\p{Cc}/gu, ' ').trim() || '이름 없는 세션';
+  const encoder = new TextEncoder(); let title = ''; let bytes = 0;
+  // Catalog previews can be longer than native session labels. Keep whole Unicode characters.
+  for (const character of clean) {
+    const size = encoder.encode(character).byteLength;
+    if (bytes + size > 512) break;
+    title += character; bytes += size;
+  }
+  return title.trim() || '이름 없는 세션';
+}
 function projectPath(cwd: string) { return cwd.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '').replace(/\//g, '\\'); }
 function notify(text: string, error = false) {
   const toast = document.createElement('div');
@@ -289,7 +300,7 @@ const sessionBrowser = createSessionBrowser({
   async openSession(session) {
     const existing = [...sessions.values()].find(item => item.threadId === session.id && !['restored', 'stopped', 'exited', 'error', 'stopping'].includes(item.state));
     if (existing) return existing.id;
-    return (await start({ title: session.title || '이름 없는 세션', cwd: session.cwd, threadId: session.id })).id;
+    return (await start({ title: resumeTitle(session.title), cwd: session.cwd, threadId: session.id })).id;
   },
   focusSession(id) { if (maximized) maximized = id; renderGrid(); setActive(id); },
   newSession: openCreate,
