@@ -38,9 +38,11 @@ pub struct TerminalOutput { pub id: String, pub generation: u64, pub seq: u64, p
 pub enum BackendEvent { Output(TerminalOutput), Changed(SessionInfo) }
 pub type EventSink = Arc<dyn Fn(BackendEvent) -> Result<(), String> + Send + Sync>;
 
-struct PtyIo { master: Box<dyn MasterPty + Send>, writer: Box<dyn Write + Send> }
 struct ProcessControl {
-    io: Mutex<Option<PtyIo>>,
+    // Closing the master must never wait for a writer blocked in the input
+    // pipe. ClosePseudoConsole tears down that pipe and wakes the writer.
+    master: Mutex<Option<Box<dyn MasterPty + Send>>>,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     job: Mutex<Option<ProcessJob>>,
     adapter: Mutex<Option<CodexSession>>,
@@ -72,8 +74,7 @@ impl Drop for LaunchGuard {
         let process = self.session.process.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(process) = process {
             let _ = process.terminate();
-            let io = process.io.lock().unwrap_or_else(|e| e.into_inner()).take();
-            drop(io);
+            process.close_io();
             let adapter = process.adapter.lock().unwrap_or_else(|e| e.into_inner()).take();
             drop(adapter);
         }
@@ -81,6 +82,13 @@ impl Drop for LaunchGuard {
     }
 }
 impl ProcessControl {
+    fn close_io(&self) {
+        let master = self.master.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(master); // Reader keeps draining during ClosePseudoConsole.
+        let writer = self.writer.lock().unwrap_or_else(|e| e.into_inner()).take();
+        drop(writer);
+    }
+
     fn terminate(&self) -> Result<(), String> {
         let job = self.job.lock().map_err(|_| "owned process job lock poisoned")?;
         let job_result = job.as_ref().map(ProcessJob::terminate).unwrap_or(Ok(()));
@@ -256,7 +264,7 @@ impl Engine {
             };
             gate.release()?;
             let killer = child.child.clone_killer();
-            let process = Arc::new(ProcessControl { io: Mutex::new(Some(PtyIo { master: pair.master, writer })), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter), _gate: gate });
+            let process = Arc::new(ProcessControl { master: Mutex::new(Some(pair.master)), writer: Mutex::new(Some(writer)), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter), _gate: gate });
             *session.process.lock().map_err(|_| "session process lock poisoned")? = Some(process.clone());
             Ok((child, reader, process))
         };
@@ -305,8 +313,7 @@ impl Engine {
             // Kill any descendants retaining the terminal after their leader exits.
             let job = process.job.lock().unwrap_or_else(|e| e.into_inner()).take();
             drop(job);
-            let io = process.io.lock().unwrap_or_else(|e| e.into_inner()).take();
-            drop(io); // Reader is still draining while ClosePseudoConsole runs.
+            process.close_io();
             let adapter = process.adapter.lock().unwrap_or_else(|e| e.into_inner()).take();
             drop(adapter); // No registry/metadata lock is held across observer join.
             let read_result = reader_thread.join();
@@ -338,9 +345,9 @@ impl Engine {
         let session = self.lookup(id, generation)?;
         if session.phase.load(Ordering::Acquire) != 1 { return Err("session is not live".into()); }
         let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone().ok_or("session has no PTY process")?;
-        let mut io = process.io.lock().map_err(|_| "PTY I/O lock poisoned")?;
+        let mut writer = process.writer.lock().map_err(|_| "PTY writer lock poisoned")?;
         if session.phase.load(Ordering::Acquire) != 1 { return Err("session is stopping".into()); }
-        io.as_mut().ok_or("session PTY has exited")?.writer.write_all(data.as_bytes()).map_err(|e| format!("write owned PTY: {e}"))
+        writer.as_mut().ok_or("session PTY has exited")?.write_all(data.as_bytes()).map_err(|e| format!("write owned PTY: {e}"))
     }
 
     pub fn resize(&self, id: &str, generation: u64, cols: u16, rows: u16) -> Result<(), String> {
@@ -348,8 +355,8 @@ impl Engine {
         let session = self.lookup(id, generation)?;
         if session.phase.load(Ordering::Acquire) != 1 { return Err("session is not live".into()); }
         let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone().ok_or("session has no PTY process")?;
-        let io = process.io.lock().map_err(|_| "PTY I/O lock poisoned")?;
-        io.as_ref().ok_or("session PTY has exited")?.master.resize(size(cols, rows)).map_err(|e| format!("resize owned PTY: {e}"))
+        let master = process.master.lock().map_err(|_| "PTY master lock poisoned")?;
+        master.as_ref().ok_or("session PTY has exited")?.resize(size(cols, rows)).map_err(|e| format!("resize owned PTY: {e}"))
     }
 
     pub fn stop(&self, id: &str, generation: u64) -> Result<(), String> { self.lookup(id, generation)?.stop() }

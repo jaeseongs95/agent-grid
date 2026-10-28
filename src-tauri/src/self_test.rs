@@ -100,7 +100,7 @@ impl Harness {
     fn barrier(&self) -> Result<(), String> {
         let (sender, receiver) = mpsc::channel();
         self.capture.send(Capture::Barrier(sender)).map_err(|_| "fixture output collector stopped")?;
-        receiver.recv_timeout(Duration::from_secs(5)).map_err(|_| "fixture output collector did not drain before timeout")
+        receiver.recv_timeout(Duration::from_secs(5)).map_err(|_| "fixture output collector did not drain before timeout".into())
     }
 
     fn take_output(&self, info: &SessionInfo) -> Result<String, String> {
@@ -139,7 +139,7 @@ impl Harness {
     }
 
     fn generation_and_lifecycle(&self) -> Result<u64, String> {
-        let marker = format!("input_{}", Uuid::new_v4().simple());
+        let marker = format!("input_한글_🦀_{}", Uuid::new_v4().simple());
         let script = if cfg!(windows) { "$line = [Console]::ReadLine(); [Console]::WriteLine('received:' + $line)" } else { "read line; printf 'received:%s\\n' \"$line\"" };
         let session = self.start(script)?;
         let stale = session.generation + 1;
@@ -217,6 +217,55 @@ impl Harness {
             Ok(1)
         }
         #[cfg(not(windows))] { Ok(0) }
+    }
+
+    fn blocked_input_stop(&self) -> Result<u64, String> {
+        let baseline = process_job::app_owned_processes()?;
+        let script = if cfg!(windows) { "[Console]::WriteLine('input-unread-ready'); Start-Sleep -Seconds 60" } else { "printf 'input-unread-ready\\n'; exec sleep 60" };
+        let session = self.start(script)?;
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !self.output.lock().unwrap().get(&session.id).is_some_and(|text| text.contains("input-unread-ready")) {
+            if Instant::now() >= deadline { return Err("non-reading input fixture never became ready".into()); }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let entered = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicU64::new(0));
+        let (result_sender, result_receiver) = mpsc::channel();
+        let (attempts, writes, engine, id, generation) = (entered.clone(), completed.clone(), self.engine.clone(), session.id.clone(), session.generation);
+        let worker = thread::spawn(move || {
+            let input = "x".repeat(64 * 1024);
+            loop {
+                attempts.fetch_add(1, Ordering::Release);
+                match engine.write(&id, generation, &input) {
+                    Ok(()) => { writes.fetch_add(1, Ordering::Release); }
+                    Err(error) => { let _ = result_sender.send(error); break; }
+                }
+            }
+        });
+        // Observe an actual write call that stays in flight while no subsequent
+        // call completes. Do not label an uncongested fixture a blocked-write test.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let before = completed.load(Ordering::Acquire);
+            if entered.load(Ordering::Acquire) > before {
+                thread::sleep(Duration::from_millis(200));
+                if completed.load(Ordering::Acquire) == before { break; }
+            }
+            if Instant::now() >= deadline { self.engine.stop(&session.id, session.generation)?; return Err("input fixture did not demonstrate a blocked write; cleanup boundary remains unverified".into()); }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let stopping = Instant::now();
+        self.engine.stop(&session.id, session.generation)?;
+        result_receiver.recv_timeout(Duration::from_secs(5)).map_err(|_| "stopping the session did not unblock its in-flight input write")?;
+        worker.join().map_err(|_| "blocked input worker panicked")?;
+        if stopping.elapsed() > Duration::from_secs(5) { return Err("blocked input cleanup exceeded five seconds".into()); }
+        self.take_output(&session)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_job::app_owned_processes()? != baseline {
+            if Instant::now() >= deadline { return Err("blocked input cleanup did not restore the owned process baseline".into()); }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(1)
     }
 
     fn sustain(&self, start: Instant, duration: Duration, report: &mut Report) -> Result<(), String> {
@@ -318,6 +367,9 @@ fn suite(duration: Duration) -> Report {
         report.pass += 1;
         report.tests += 1;
         report.sessions_started += harness.bounded_output_cancellation()?;
+        report.pass += 1;
+        report.tests += 1;
+        report.sessions_started += harness.blocked_input_stop()?;
         report.pass += 1;
         #[cfg(windows)] {
             report.tests += 1;

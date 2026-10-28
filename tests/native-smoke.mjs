@@ -5,6 +5,12 @@ import { createHash } from 'node:crypto';
 import { mkdir, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium } from '@playwright/test';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+
+const execFileAsync = promisify(execFile);
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const report = {
   schema: 'agent-grid-native-smoke.v1',
@@ -69,7 +75,7 @@ async function createSession(title, cwd) {
     const text = await card.locator('.terminal-host').innerText();
     return { id: await card.getAttribute('data-id'), state, threadId: fullThreadId || /스레드\s+(\S+)/.exec(visible)?.[1], fullThreadId: !!fullThreadId, outputLength: text.trim().length, outputSha256: hash(text) };
   }, info => !!info.id && !!info.threadId && !!info.state && info.outputLength > 10, 'real CLI thread metadata, observed state and terminal text', sessionTimeout);
-  assert(/^[a-zA-Z0-9_-]{12,128}$/.test(info.threadId), 'Invalid UI thread identifier');
+  assert(info.fullThreadId && uuid.test(info.threadId), 'Expected a full UUID in the UI thread identifier tooltip');
   report.sessions.push(info);
   return info;
 }
@@ -127,12 +133,15 @@ try {
   report.cwdSha256 = hash(cwd);
   browser = await chromium.connectOverCDP(cdp.href, { timeout: 15_000 });
   await check('own packaged target guard', async () => {
-    const candidates = [];
-    for (const context of browser.contexts()) for (const candidate of context.pages()) {
-      let url; try { url = new URL(candidate.url()); } catch { continue; }
-      if (url.hostname === 'tauri.localhost' && ['http:', 'https:'].includes(url.protocol) && !url.searchParams.has('demo') && await candidate.title() === 'Agent Grid') candidates.push(candidate);
-    }
-    assert.equal(candidates.length, 1, 'Expected exactly one Agent Grid tauri.localhost target');
+    const candidates = await until(async () => {
+      const matches = [];
+      for (const context of browser.contexts()) for (const candidate of context.pages()) {
+        let url; try { url = new URL(candidate.url()); } catch { continue; }
+        if (url.hostname === 'tauri.localhost' && ['http:', 'https:'].includes(url.protocol) && !url.searchParams.has('demo') && await candidate.title() === 'Agent Grid') matches.push(candidate);
+      }
+      assert(matches.length <= 1, 'Multiple Agent Grid targets found; refusing ambiguous ownership');
+      return matches;
+    }, matches => matches.length === 1, 'exactly one Agent Grid tauri.localhost target');
     page = candidates[0]; page.setDefaultTimeout(10_000);
     page.on('pageerror', error => report.errors.push(shortError(error)));
     page.on('dialog', async dialog => {
@@ -148,6 +157,11 @@ try {
   const token = Date.now().toString(36);
   await check('create first real CLI session', () => createSession(`native-smoke-${token}-A`, cwd));
   await check('create second real CLI session', () => createSession(`native-smoke-${token}-B`, cwd));
+  await check('independent real CLI threads', async () => {
+    assert(report.sessions.every(session => session.fullThreadId && uuid.test(session.threadId)), 'Both sessions must expose full thread UUIDs');
+    assert.notEqual(report.sessions[0].threadId, report.sessions[1].threadId, 'Two new sessions unexpectedly share a thread UUID');
+    return { validFullUuids: true, distinctThreads: true };
+  });
   await check('native terminal focus, layout resize and reorder', async () => {
     await assertOnlyOurs();
     await page.getByRole('button', { name: '2열', exact: true }).click();
@@ -201,7 +215,7 @@ try {
     await page.locator('#external-toggle').click();
     const dialog = page.locator('#external-dialog'); await dialog.waitFor({ state: 'visible' });
     await until(() => page.locator('#external-list').textContent(), text => !!text && !text.includes('불러오는 중'), 'external read-only query');
-    assert.equal(await dialog.locator('input, textarea, .stop, .restore-item button').count(), 0, 'External records expose write controls');
+    assert.equal(await dialog.locator('input, textarea, .stop, .external-item button, .external-item [role="button"]').count(), 0, 'External records expose write controls');
     const list = await page.locator('#external-list').textContent();
     assert(!list.includes('불러오기 실패:'), 'External observer command failed');
     const observedRows = await dialog.locator('.external-item').count();
@@ -209,6 +223,38 @@ try {
     await dialog.getByRole('button', { name: '닫기', exact: true }).click();
     return { observedRows, readOnly: true, externalProcessesTouched: false };
   });
+  if (process.env.AGENT_GRID_NATIVE_PID || process.env.AGENT_GRID_NATIVE_EXE) {
+    await check('own native window close hides and same HWND restores', async () => {
+      assert.equal(process.platform, 'win32', 'Native window probe requires Windows');
+      const processId = process.env.AGENT_GRID_NATIVE_PID;
+      const executable = process.env.AGENT_GRID_NATIVE_EXE;
+      assert(processId && /^[1-9]\d{0,9}$/.test(processId) && Number(processId) <= 2147483647, 'AGENT_GRID_NATIVE_PID must be a positive process ID');
+      assert(executable && path.isAbsolute(executable), 'AGENT_GRID_NATIVE_EXE must be the exact absolute launched executable');
+      await assertOnlyOurs();
+      const before = [];
+      for (const title of ownedTitles) {
+        const card = tile(title);
+        before.push({ title, threadId: await card.locator('.terminal-identity').getAttribute('title'), screen: await card.locator('.xterm-screen').elementHandle(), text: await card.locator('.terminal-host').innerText() });
+      }
+      const script = fileURLToPath(new URL('./window-probe.ps1', import.meta.url));
+      const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      const { stdout } = await execFileAsync(powershell, ['-NoProfile', '-NonInteractive', '-File', script, '-AppProcessId', processId, '-ExpectedExecutable', executable], { windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 });
+      const window = JSON.parse(stdout.trim());
+      assert(window.hidden && window.restored && window.sameHandle && window.processIdentityPreserved, 'Native window did not hide and restore safely');
+      const retained = [];
+      for (const previous of before) {
+        const card = tile(previous.title);
+        const threadId = await card.locator('.terminal-identity').getAttribute('title');
+        assert.equal(threadId, previous.threadId, 'Thread UUID changed during native hide/reopen');
+        assert(previous.screen && await previous.screen.evaluate(element => element.isConnected && element.closest('.terminal-card')?.querySelector('.xterm-screen') === element), 'Existing xterm DOM was disposed during native hide/reopen');
+        const text = await card.locator('.terminal-host').innerText();
+        assert(text.trim().length > 10, 'Terminal output DOM is empty after native hide/reopen');
+        retained.push({ threadId, sameTerminalDom: true, beforeOutputLength: previous.text.trim().length, afterOutputLength: text.trim().length, beforeOutputSha256: hash(previous.text), afterOutputSha256: hash(text), outputUnchanged: previous.text === text });
+        await previous.screen.dispose();
+      }
+      return { ...window, sessions: retained, trayIconClickVerified: false };
+    });
+  } else report.limitations.push('Native window close/hide/reopen was not tested: AGENT_GRID_NATIVE_PID and AGENT_GRID_NATIVE_EXE were not supplied.');
   await check('masked native UI screenshot', async () => { await maskedScreenshot('native-ui-masked.png'); return { file: 'native-ui-masked.png', terminalTextMasked: true }; });
 } catch (error) {
   report.errors.push(shortError(error));

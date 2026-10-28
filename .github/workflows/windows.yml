@@ -25,13 +25,12 @@ jobs:
           workspaces: src-tauri
           cache-on-failure: true
       - run: npm ci
-      - run: cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
       - run: node scripts/notices.mjs
       - run: npm test
       - run: npm run build
       - run: npx playwright install chromium
       - run: npm run test:e2e
-      - run: cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml -- --nocapture
       - run: npm run tauri -- build --bundles nsis
       - name: Prepare portable executable and checksums
         shell: pwsh

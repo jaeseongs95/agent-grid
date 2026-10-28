@@ -7,6 +7,10 @@ resizable grid, group them by working directory, search terminal output and
 send input to selected sessions. Waiting and unknown sessions are excluded
 from group input. Each target reports its own delivery result.
 
+![Agent Grid design preview](docs/design-demo.png)
+
+*Design demo with static terminal examples; this image is not runtime evidence.*
+
 Agent Grid is an independent MIT implementation. It does not include code,
 assets or branding from Claudes. That project's multi-terminal workflow was
 a product reference; its source-available license does not permit unapproved
@@ -36,9 +40,8 @@ Requires Node.js 24, Rust stable, MSVC build tools and WebView2 on Windows.
 npm ci
 npm test
 npm run build
-cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
 node scripts/notices.mjs
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo test --locked --manifest-path src-tauri/Cargo.toml
 npm run tauri -- dev
 ```
 
