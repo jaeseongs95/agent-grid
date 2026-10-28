@@ -1,9 +1,32 @@
-# Baseline validation
+# Validation evidence
+
+## Project import and session browser
+
+The packaged application at `dd8f0627bd905cb5e2c76b14937f129d51d97f32`
+passed 16 native UI checks. These included the actual Windows folder chooser's
+cancel and selection paths, canonical directory verification, duplicate import,
+project filtering, stored-session title search and rendered recent messages.
+After the app exited, its isolated SQLite database retained the imported project.
+
+After completed history queries, the still-running fixture process had zero
+owned helper children and zero CLOSE_WAIT sockets. This is a measurement of the
+fixture's completed queries, not a claim about every process on the computer.
+The external-observer connection was unavailable after the computer reboot;
+the UI displayed that explicitly. The history popup still worked through its
+separate owned server, and no external daemon was started.
+
+Frontend validation included six unit tests and seven browser tests, including
+coalesced queries, stale-reply rejection, exact resume identity, text-only
+preview rendering and composition-key handling. Browser mocks do not replace
+the native checks above. Physical Windows IME testing remains separate.
+
+## Earlier core baseline
 
 The results below describe the baseline packaged application at
 `a8e7daed987b7a27cea917e9df271a4748f88ed0`, before the project importer and
 session-browser popup were added. Results for those additions belong to the
-final release's CI run and release notes.
+final release's CI run and release notes; the section above records the packaged
+feature checks performed before publication.
 
 The first release is a Windows x64 preview. Long-duration stress testing is
 being handed to the user; the four-hour automated run was cancelled at their

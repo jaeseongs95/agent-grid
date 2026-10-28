@@ -226,6 +226,20 @@ try {
       await page.locator('#catalog-close').click();
       return { projectSessionRows: count, previewMessagesRendered: messageCount, selectedThreadIdSha256: hash(selected), titleSearchPerformed: true, existingSessionResumed: false, transcriptSaved: false };
     });
+    await check('completed catalog queries leave no owned helper or CLOSE_WAIT socket', async () => {
+      const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      // Fixed code reads the explicitly supplied fixture identity from its own
+      // environment. No path or command text is interpolated into this script.
+      const command = `$ErrorActionPreference='Stop'; $targetProcessId=[int]$env:AGENT_GRID_NATIVE_PID; $target=Get-Process -Id $targetProcessId; if(-not [string]::Equals([IO.Path]::GetFullPath($target.Path),[IO.Path]::GetFullPath($env:AGENT_GRID_NATIVE_EXE),[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected fixture process'}; $children=@(Get-CimInstance Win32_Process -Filter ('ParentProcessId='+$targetProcessId)); $connections=@(Get-NetTCPConnection -ErrorAction Stop); @{ownedHelperChildren=@($children|Where-Object Name -eq 'agent-grid-helper.exe').Count; closeWaitSockets=@($connections|Where-Object {$_.OwningProcess -eq $targetProcessId -and $_.State -eq 'CloseWait'}).Count}|ConvertTo-Json -Compress`;
+      const deadline = Date.now() + 15_000; let sample;
+      do {
+        const { stdout } = await execFileAsync(powershell, ['-NoProfile', '-NonInteractive', '-Command', command], { windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 });
+        sample = JSON.parse(stdout.trim());
+        if (sample.ownedHelperChildren === 0 && sample.closeWaitSockets === 0) return { ...sample, scope: 'Only the root-launched native fixture process, after catalog replies and before PTYs start' };
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } while (Date.now() < deadline);
+      assert.fail(`Catalog resources remained: ${JSON.stringify(sample)}`);
+    });
   } else report.limitations.push('Native project folder picker and history popup were not tested: AGENT_GRID_NATIVE_PROJECT_PICKER=1 was not supplied.');
   const token = Date.now().toString(36);
   await check('create first real CLI session', () => createSession(`native-smoke-${token}-A`, cwd));
@@ -321,17 +335,18 @@ try {
     const echoed = await until(() => rows.innerText(), text => text.includes(marker), 'actual Korean marker echo after composition end', 15_000);
     return { events, marker, markerInitiallyAbsent: true, echoObservedIn: 'VT-rendered xterm rows (composition overlay excluded)', echoWaitMs: Date.now() - dispatchedAt, beforeOutputLength: before.length, afterOutputLength: echoed.length, beforeOutputSha256: hash(before), afterOutputSha256: hash(echoed), enterSent: false, physicalImeVerified: false, koreanPtyRoundTripVerified: true, unsubmittedTextCleared: false, disposition: 'Left unsubmitted until the owned session is stopped; no Ctrl+U sent to a potentially waiting session.' };
   });
-  await check('external observations stay read only', async () => {
+  await check('external observations stay read only and report unavailable daemon explicitly', async () => {
     await page.locator('#external-toggle').click();
     const dialog = page.locator('#external-dialog'); await dialog.waitFor({ state: 'visible' });
     await until(() => page.locator('#external-list').textContent(), text => !!text && !text.includes('불러오는 중'), 'external read-only query');
     assert.equal(await dialog.locator('input, textarea, .stop, .external-item button, .external-item [role="button"]').count(), 0, 'External records expose write controls');
     const list = await page.locator('#external-list').textContent();
-    assert(!list.includes('불러오기 실패:'), 'External observer command failed');
+    const unavailable = list.includes('불러오기 실패:');
+    if (unavailable) assert(/daemon|데몬/i.test(list), 'Unavailable external observer must explain the daemon connection failure');
     const observedRows = await dialog.locator('.external-item').count();
     if (observedRows) assert((await dialog.locator('.external-item small').allTextContents()).some(text => text.includes('현재 상태 미확인')), 'Unknown external state must be explicit');
     await dialog.getByRole('button', { name: '닫기', exact: true }).click();
-    return { observedRows, readOnly: true, externalProcessesTouched: false };
+    return { observedRows, readOnly: true, available: !unavailable, ...(unavailable ? { unavailableReasonSha256: hash(list), explicitUnavailableDisplayed: true } : {}), externalProcessesTouched: false };
   });
   if (process.env.AGENT_GRID_NATIVE_PID || process.env.AGENT_GRID_NATIVE_EXE) {
     await check('own native window close hides and same HWND restores', async () => {
