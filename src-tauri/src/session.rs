@@ -1,4 +1,4 @@
-use crate::{codex::{self, CodexEvent, CodexSession}, flow::{OutputFlow, Utf8Decoder}, process_job::ProcessJob, storage::Store};
+use crate::{codex::{self, CodexEvent, CodexSession}, flow::{OutputFlow, Utf8Decoder}, process_job::{LaunchGate, ProcessJob}, storage::Store};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, io::{Read, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU8, Ordering}, Arc, Condvar, Mutex}, thread, time::Duration};
@@ -44,6 +44,7 @@ struct ProcessControl {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     job: Mutex<Option<ProcessJob>>,
     adapter: Mutex<Option<CodexSession>>,
+    _gate: LaunchGate,
 }
 
 /// Child's library handle does not terminate on Drop. Every failed thread spawn
@@ -155,11 +156,11 @@ impl Session {
         if self.phase.fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| if phase < 3 { Some(2) } else { None }).is_err() { return Ok(()); }
         self.stop_requested.store(true, Ordering::Release);
         self.flow.cancel();
-        let status_result = self.update(|info| { if !matches!(info.state.as_str(), "stopped" | "exited") { info.state = "stopping".into(); } }, false);
+        let status_result = self.update(|info| { if self.phase.load(Ordering::Acquire) == 2 { info.state = "stopping".into(); } }, false);
         let process = self.process.lock().map_err(|_| "session process lock poisoned")?.clone();
         if let Some(process) = process { process.terminate()?; }
         let done = self.done.0.lock().map_err(|_| "session completion lock poisoned")?;
-        let (_, timeout) = self.done.1.wait_timeout_while(done, Duration::from_secs(35), |done| !*done).map_err(|_| "session completion lock poisoned")?;
+        let (_done_guard, timeout) = self.done.1.wait_timeout_while(done, Duration::from_secs(35), |done| !*done).map_err(|_| "session completion lock poisoned")?;
         if timeout.timed_out() { return Err("owned session cleanup has not completed within 35 seconds".into()); }
         status_result
     }
@@ -202,7 +203,13 @@ impl Engine {
             else { return Err("session metadata limit reached".into()); }
         }
         let info = SessionInfo { id: Uuid::new_v4().to_string(), generation: 1, title: request.title.clone(), cwd: cwd.to_string_lossy().into_owned(), thread_id: request.thread_id.clone(), state: "starting".into() };
-        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.save_session(&info)?;
+        {
+            let store = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?;
+            store.save_session(&info)?;
+            let mut live_ids: Vec<_> = sessions.iter().filter(|(_, session)| session.phase.load(Ordering::Acquire) < 3).map(|(id, _)| id.clone()).collect();
+            live_ids.push(info.id.clone());
+            store.prune_sessions(&live_ids)?;
+        }
         let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone() });
         sessions.insert(info.id.clone(), session.clone());
         drop(sessions);
@@ -239,6 +246,7 @@ impl Engine {
             let pair = native_pty_system().openpty(size(cols, rows)).map_err(|e| format!("open native PTY: {e}"))?;
             let reader = pair.master.try_clone_reader().map_err(|e| format!("open PTY reader: {e}"))?;
             let writer = pair.master.take_writer().map_err(|e| format!("open PTY writer: {e}"))?;
+            let (command, gate) = LaunchGate::wrap_pty(command)?;
             let raw_child = pair.slave.spawn_command(command).map_err(|e| format!("spawn owned PTY process: {e}"))?;
             let child = OwnedChild { child: raw_child, reaped: false };
             drop(pair.slave);
@@ -246,8 +254,9 @@ impl Engine {
                 Ok(job) => job,
                 Err(error) => return Err(error),
             };
+            gate.release()?;
             let killer = child.child.clone_killer();
-            let process = Arc::new(ProcessControl { io: Mutex::new(Some(PtyIo { master: pair.master, writer })), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter) });
+            let process = Arc::new(ProcessControl { io: Mutex::new(Some(PtyIo { master: pair.master, writer })), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter), _gate: gate });
             *session.process.lock().map_err(|_| "session process lock poisoned")? = Some(process.clone());
             Ok((child, reader, process))
         };
@@ -260,7 +269,9 @@ impl Engine {
         if session.stop_requested.load(Ordering::Acquire) { process.terminate()?; }
         else {
             session.phase.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).ok();
-            session.update(|info| { if info.state == "starting" { info.state = "running".into(); } }, true)?;
+            // Process liveness does not prove the vendor is running a turn.
+            // Only an adapter observation may report idle/running/waiting.
+            session.update(|info| { if info.state == "starting" { info.state = "unknown".into(); } }, true)?;
         }
         let reading = session.clone();
         let reader_thread = thread::Builder::new().name("pty-output".into()).spawn(move || -> Result<(), String> {
@@ -301,7 +312,7 @@ impl Engine {
             let read_result = reader_thread.join();
             waiting.process.lock().unwrap_or_else(|e| e.into_inner()).take();
             let stopped = waiting.stop_requested.load(Ordering::Acquire);
-            let failed = waited.is_err() || !matches!(read_result, Ok(Ok(())));
+            let failed = !matches!(waited, Ok(ref status) if status.success()) || !matches!(read_result, Ok(Ok(())));
             let state = if stopped { "stopped" } else if failed { "error" } else { "exited" };
             let _ = waiting.finish(state);
         }).map_err(|e| format!("start PTY reaper: {e}"))?;
@@ -351,16 +362,16 @@ impl Engine {
         let sessions: Vec<_> = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?.values().cloned().collect();
         // Send every cancellation before waiting, so one slow session cannot
         // prevent the others from receiving their stop signal.
+        let mut failures = Vec::new();
         for session in &sessions {
             if session.phase.load(Ordering::Acquire) < 3 {
                 session.stop_requested.store(true, Ordering::Release);
                 let _ = session.phase.fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| if phase < 3 { Some(2) } else { None });
                 session.flow.cancel();
-                let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone();
-                if let Some(process) = process { process.terminate()?; }
+                let process = match session.process.lock() { Ok(lock) => lock.clone(), Err(_) => { failures.push("session process lock poisoned".into()); continue; } };
+                if let Some(process) = process { if let Err(error) = process.terminate() { failures.push(error); } }
             }
         }
-        let mut failures = Vec::new();
         for session in sessions { if let Err(error) = session.stop() { failures.push(error); } }
         if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
     }
@@ -368,7 +379,7 @@ impl Engine {
     pub(crate) fn wait_for_exit(&self, id: &str, generation: u64, timeout: Duration) -> Result<SessionInfo, String> {
         let session = self.lookup(id, generation)?;
         let done = session.done.0.lock().map_err(|_| "session completion lock poisoned")?;
-        let (_, result) = session.done.1.wait_timeout_while(done, timeout, |done| !*done).map_err(|_| "session completion lock poisoned")?;
+        let (_done_guard, result) = session.done.1.wait_timeout_while(done, timeout, |done| !*done).map_err(|_| "session completion lock poisoned")?;
         if result.timed_out() { return Err("fixture session did not exit before timeout".into()); }
         session.info()
     }

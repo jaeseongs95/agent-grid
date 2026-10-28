@@ -23,6 +23,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          cache-on-failure: true
       - run: npm ci
       - run: cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
       - run: node scripts/notices.mjs
@@ -41,6 +42,7 @@ jobs:
           Copy-Item LICENSE artifacts/
           Copy-Item THIRD_PARTY_NOTICES.md artifacts/
           Copy-Item src-tauri/Cargo.lock artifacts/Cargo.lock
+          @{ commit = '${{ github.sha }}'; run = '${{ github.run_id }}'; platform = 'windows-x64'; signed = $false } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM artifacts/build-info.json
           $probe = Start-Process -FilePath (Resolve-Path 'artifacts/agent-grid.exe') -ArgumentList @('--self-test','--duration-seconds','60','--report',"$PWD/artifacts/self-test.json") -WindowStyle Hidden -Wait -PassThru
           if ($probe.ExitCode -ne 0) { throw "Packaged PTY self-test failed: $($probe.ExitCode)" }
           Get-ChildItem artifacts -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(), $_.Name } | Set-Content -Encoding utf8NoBOM artifacts/SHA256SUMS.txt
@@ -49,4 +51,14 @@ jobs:
           name: agent-grid-windows-x64
           path: artifacts/
           if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation-evidence
+          path: |
+            src-tauri/Cargo.lock
+            test-results/
+            artifacts/self-test.json
+          if-no-files-found: warn
           retention-days: 14

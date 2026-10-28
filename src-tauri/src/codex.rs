@@ -15,7 +15,7 @@ use std::{
 };
 use tungstenite::{client::IntoClientRequest, Message, WebSocket};
 use uuid::Uuid;
-use crate::process_job::ProcessJob;
+use crate::process_job::{LaunchGate, ProcessJob};
 
 const TOKEN_ENV: &str = "AGENT_GRID_REMOTE_TOKEN";
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -39,6 +39,7 @@ pub struct CodexSession {
     pub command: CommandBuilder,
     server: Child,
     job: Option<ProcessJob>,
+    _launch_gate: LaunchGate,
     stopped: Arc<AtomicBool>,
     socket: Option<TcpStream>,
     observer: Option<JoinHandle<()>>,
@@ -128,7 +129,9 @@ fn adopt_root(threads: &[Value], cwd: &Path) -> Result<Option<Value>, String> {
     let mut roots = threads.iter().filter(|thread| {
         thread["parentThreadId"].is_null()
             && thread["forkedFromId"].is_null()
+            && matches!(thread["source"].as_str(), Some("cli" | "vscode" | "appServer"))
             && thread["threadSource"].as_str().map_or(true, |s| s == "user")
+            && thread["sessionId"].as_str() == thread["id"].as_str()
             && thread["id"].as_str().is_some_and(|id| verified_thread(thread, id, cwd).is_ok())
     });
     let root = roots.next().cloned();
@@ -200,7 +203,7 @@ fn connect(endpoint: &str, token: &str, server: &mut Child) -> Result<Rpc<TcpStr
             let mut config = tungstenite::protocol::WebSocketConfig::default();
             config.max_message_size = Some(MAX_FRAME);
             config.max_frame_size = Some(MAX_FRAME);
-            let (ws, _) = tungstenite::client_with_config(request, stream, Some(config))
+            let (ws, _) = tungstenite::client::client_with_config(request, stream, Some(config))
                 .map_err(|_| "Codex authenticated WebSocket handshake failed".to_string())?;
             return Ok(Rpc {ws, next_id:0});
         }
@@ -246,6 +249,13 @@ fn event_status(message: &Value, selected: &str) -> Option<String> {
     }
 }
 
+fn publish_status(previous: &mut Option<String>, state: String, on_event: &dyn Fn(CodexEvent)) {
+    if previous.as_ref() != Some(&state) {
+        *previous = Some(state.clone());
+        on_event(CodexEvent::Status(state));
+    }
+}
+
 pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEvent) + Send + Sync>) -> Result<CodexSession, String> {
     let cwd = cwd.canonicalize().map_err(|e| format!("Cannot open working directory: {e}"))?;
     if !cwd.is_dir() { return Err("Working directory must be a directory".into()); }
@@ -257,16 +267,17 @@ pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEv
     // Two independent OS-random UUIDs provide 244 unpredictable bits; raw token stays in memory/child environment.
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let verifier = format!("{:x}", Sha256::digest(token.as_bytes()));
-    let mut process = Command::new(&exe);
+    let (mut process, launch_gate) = LaunchGate::wrap_std(exe.as_os_str())?;
     process.args(server_args(&endpoint, &verifier)).current_dir(&cwd)
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     hidden(&mut process);
     let server = process.spawn().map_err(|e| format!("Cannot start Codex app-server: {e}"))?;
     let mut session = CodexSession {
-        command: CommandBuilder::new(&exe), server, job:None,
+        command: CommandBuilder::new(&exe), server, job:None, _launch_gate:launch_gate,
         stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None,
     };
     session.job = Some(ProcessJob::assign_std(&session.server)?);
+    session._launch_gate.release()?;
     let mut rpc = connect(&endpoint, &token, &mut session.server)?;
     rpc.call("initialize", initialize())?;
     rpc.send(json!({"method":"initialized","params":{}}))?;
@@ -295,22 +306,18 @@ pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEv
                         failures = 0;
                         if selected.is_none() {
                             let Some(id) = thread["id"].as_str().filter(|id| Uuid::parse_str(id).is_ok()) else {
-                                on_event(CodexEvent::Status("unknown".into()));
+                                publish_status(&mut last_state, "unknown".into(), on_event.as_ref());
                                 break;
                             };
                             selected = Some(id.to_owned());
                             on_event(CodexEvent::ThreadId(id.to_owned()));
                         }
-                        let state = status(&thread["status"]);
-                        if last_state.as_ref() != Some(&state) {
-                            on_event(CodexEvent::Status(state.clone()));
-                            last_state = Some(state);
-                        }
+                        publish_status(&mut last_state, status(&thread["status"]), on_event.as_ref());
                     }
                     Ok(None) => { failures = 0; }
                     Err(_) => {
                         failures += 1;
-                        on_event(CodexEvent::Status("unknown".into()));
+                        publish_status(&mut last_state, "unknown".into(), on_event.as_ref());
                         // Only bounded read-only retries; never resume/start from the observer.
                         if failures >= 3 { break; }
                     }
@@ -321,11 +328,11 @@ pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEv
             if stopped.load(Ordering::Acquire) { break; }
             match incoming {
                 Ok(Some(message)) => if let Some(id) = selected.as_deref() {
-                    if let Some(state) = event_status(&message, id) { on_event(CodexEvent::Status(state)); }
+                    if let Some(state) = event_status(&message, id) { publish_status(&mut last_state, state, on_event.as_ref()); }
                 },
                 Ok(None) => {},
                 Err(_) => {
-                    if !stopped.load(Ordering::Acquire) { on_event(CodexEvent::Status("unknown".into())); }
+                    if !stopped.load(Ordering::Acquire) { publish_status(&mut last_state, "unknown".into(), on_event.as_ref()); }
                     break;
                 }
             }
@@ -368,12 +375,15 @@ impl Write for ProxyStream {
 /// A short-lived connection to an *existing* official daemon. Never starts/stops it.
 struct Proxy {
     child: Child,
+    job: Option<ProcessJob>,
+    _launch_gate: LaunchGate,
     rpc: Option<Rpc<ProxyStream>>,
     reader: Option<JoinHandle<()>>,
 }
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.rpc.take(); // Drop stdin/receiver, unblocking a reader waiting to send.
+        if let Some(job) = self.job.take() { let _ = job.terminate(); }
         let _ = self.child.kill();
         let _ = self.child.wait();
         if let Some(reader) = self.reader.take() { let _ = reader.join(); }
@@ -381,12 +391,16 @@ impl Drop for Proxy {
 }
 impl Proxy {
     fn open() -> Result<Self, String> {
-        let mut command = Command::new(executable()?);
+        let exe = executable()?;
+        let (mut command, launch_gate) = LaunchGate::wrap_std(exe.as_os_str())?;
         command.args(["app-server", "proxy"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         hidden(&mut command);
-        let mut child = command.spawn().map_err(|e| format!("Cannot open existing Codex daemon proxy: {e}"))?;
-        let input = child.stdin.take().expect("piped stdin");
-        let mut output = child.stdout.take().expect("piped stdout");
+        let child = command.spawn().map_err(|e| format!("Cannot open existing Codex daemon proxy: {e}"))?;
+        let mut proxy = Self {child,job:None,_launch_gate:launch_gate,rpc:None,reader:None};
+        proxy.job = Some(ProcessJob::assign_std(&proxy.child)?);
+        proxy._launch_gate.release()?;
+        let input = proxy.child.stdin.take().expect("piped stdin");
+        let mut output = proxy.child.stdout.take().expect("piped stdout");
         let (sender, receiver) = mpsc::sync_channel(32);
         let reader = thread::spawn(move || {
             loop {
@@ -400,13 +414,13 @@ impl Proxy {
                 if sender.send(value).is_err() || failed { break; }
             }
         });
-        let mut proxy = Self {child,rpc:None,reader:Some(reader)};
+        proxy.reader = Some(reader);
         let stream = ProxyStream {input,receiver:Some(receiver),pending:Vec::new(),offset:0,timeout:Duration::from_secs(8)};
         let mut config = tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(MAX_FRAME);
         config.max_frame_size = Some(MAX_FRAME);
         // The URL supplies HTTP Upgrade metadata only; bytes travel through the official proxy.
-        let handshake = tungstenite::client_with_config("ws://localhost/", stream, Some(config));
+        let handshake = tungstenite::client::client_with_config("ws://localhost/", stream, Some(config));
         match handshake {
             Ok((mut ws, _)) => {
                 ws.get_mut().timeout = Duration::from_millis(500);
@@ -500,11 +514,24 @@ mod tests {
         let cwd = env::current_dir().unwrap().canonicalize().unwrap();
         let cmd = tui_command(&OsString::from("codex"), &cwd, "ws://127.0.0.1:1234", "token", None);
         assert!(!cmd.get_argv().iter().any(|arg| arg == "resume"));
-        let root = json!({"id":"root","cwd":cwd,"threadSource":"user"});
-        let child = json!({"id":"child","cwd":cwd,"parentThreadId":"root","threadSource":"subagent"});
+        // Keys and enum serialization match official v2/thread_data.rs, not the core's snake_case metadata.
+        let root = json!({"id":"root","sessionId":"root","cwd":cwd,"source":"vscode","threadSource":null,"parentThreadId":null,"forkedFromId":null});
+        let child = json!({"id":"child","sessionId":"root","cwd":cwd,"parentThreadId":"root","source":{"subAgent":"compact"},"threadSource":"subagent"});
         assert_eq!(adopt_root(&[root.clone(), child], &cwd).unwrap().unwrap()["id"], "root");
         assert!(adopt_root(&[], &cwd).unwrap().is_none());
-        assert!(adopt_root(&[root.clone(), json!({"id":"other","cwd":cwd})], &cwd).is_err());
+        assert!(adopt_root(&[root.clone(), json!({"id":"other","sessionId":"other","source":"cli","cwd":cwd})], &cwd).is_err());
+        assert!(adopt_root(&[json!({"id":"unknown","sessionId":"unknown","cwd":cwd,"source":"unknown"})], &cwd).unwrap().is_none());
+        assert!(adopt_root(&[json!({"id":"missing-source","sessionId":"missing-source","cwd":cwd})], &cwd).unwrap().is_none());
+    }
+    #[test]
+    fn status_recovers_after_unknown_observation_and_deduplicates_only_current_state() {
+        let updates = std::cell::RefCell::new(Vec::new());
+        let sink = |event| if let CodexEvent::Status(state) = event { updates.borrow_mut().push(state); };
+        let mut previous = None;
+        for state in ["running", "running", "unknown", "running", "idle"] {
+            publish_status(&mut previous, state.into(), &sink);
+        }
+        assert_eq!(*updates.borrow(), ["running", "unknown", "running", "idle"]);
     }
     #[test]
     fn external_status_is_observed_and_missing_status_stays_unknown() {

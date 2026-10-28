@@ -2,10 +2,31 @@
 
 A Windows desktop grid for running coding-agent CLI sessions side by side.
 
+The first adapter supports the official Codex CLI. Arrange terminals in a
+resizable grid, group them by working directory, search terminal output and
+send input to selected sessions. Waiting and unknown sessions are excluded
+from group input. Each target reports its own delivery result.
+
 Agent Grid is an independent MIT implementation. It does not include code,
 assets or branding from Claudes. That project's multi-terminal workflow was
 a product reference; its source-available license does not permit unapproved
-modification or redistribution.
+modification or redistribution. See the [reference license](https://github.com/paulallington/Claudes/blob/v1.9.82/LICENSE).
+
+## Running
+
+Download the portable executable or per-user installer from
+[Releases](https://github.com/jaeseongs95/agent-grid/releases). Windows x64 and
+WebView2 are required. The application is unsigned.
+
+Install and sign in to the official Codex CLI first. Its native executable
+must be on `PATH`; alternatively set `AGENT_GRID_CODEX` to its absolute path.
+The CLI must support authenticated app-server WebSockets and `--remote`.
+Older CLI versions are not silently downgraded to a different connection mode.
+
+Choose **새 세션**, enter a working directory and start the session. Use the
+official TUI to choose a model, sign in or answer permission prompts. Select
+terminal cards before using group input. A reported delivery means bytes
+reached that terminal; it does not mean a model accepted or completed a turn.
 
 ## Development
 
@@ -15,6 +36,8 @@ Requires Node.js 24, Rust stable, MSVC build tools and WebView2 on Windows.
 npm ci
 npm test
 npm run build
+cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
+node scripts/notices.mjs
 cargo test --manifest-path src-tauri/Cargo.toml
 npm run tauri -- dev
 ```
@@ -22,6 +45,8 @@ npm run tauri -- dev
 Package with `npm run tauri -- build --bundles nsis`.
 If Unicode workspace paths cause native tool failures, build in a separate
 checkout under `D:/codex/build/agent-grid`.
+Generate third-party notices before native compilation; they are bundled
+with the installer and distributed alongside the portable executable.
 
 ## Codex
 
@@ -39,6 +64,8 @@ Closing the window hides it to the tray. Complete exit terminates owned
 processes after confirmation. Restoring after a complete exit starts new
 processes against the saved conversation ID, rather than reviving an old PID.
 Authentication tokens are not stored in the application database.
+Only layout and session metadata are stored in the app's own SQLite database.
+Terminal transcripts and Codex authentication files are not copied there.
 
 ## Validation and releases
 
@@ -48,3 +75,19 @@ Unsigned builds may trigger Windows reputation warnings.
 
 Actual test results and remaining limits belong in release notes; a successful
 build is not evidence of long-duration stability or complete CLI compatibility.
+
+The packaged executable provides separate diagnostic modes:
+
+```powershell
+agent-grid.exe --self-test --duration-seconds 60 --report D:/codex/build/pty-result.json
+agent-grid.exe --codex-smoke --sessions 2 --report D:/codex/build/codex-result.json
+```
+
+The first exercises real native PTYs with local shell fixtures, including
+2/8/16-session isolation, stale-generation rejection, bounded output,
+cancellation and 100 create/stop cycles followed by eight sustained PTYs.
+Use `--duration-seconds 14400` for four hours of sustained PTY activity.
+The second starts actual Codex servers and remote TUIs in isolated directories
+without submitting model prompts or answering trust/approval dialogs. It
+requires observed thread IDs and live statuses, and records terminal hashes
+rather than transcripts. Neither mode proves physical IME or GUI behavior.

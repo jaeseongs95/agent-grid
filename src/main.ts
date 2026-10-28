@@ -252,7 +252,21 @@ function renderHandles(count: number, rows: number) {
 }
 
 function renderAll() {
-  for (const [id, session] of sessions) { const card = terminals.get(id)!.card; card.querySelector('.terminal-title')!.textContent = session.title; card.querySelector('.terminal-path')!.textContent = `▱  ${session.cwd}`; const state = card.querySelector('.session-state')!; state.textContent = states[session.state] ?? '상태 미확인'; state.className = `session-state ${session.state}`; card.querySelector('.terminal-identity')!.textContent = `${String(order.indexOf(id) + 1).padStart(2, '0')}  ·  ${demo ? 'DEMO · 실제 세션 아님' : session.threadId ? `스레드 ${session.threadId.slice(0, 12)}` : '로컬 세션'}`; const checkbox = card.querySelector<HTMLInputElement>('input')!; checkbox.checked = selected.has(id); checkbox.disabled = !writable(session); card.classList.toggle('focused', id === active); }
+  for (const [id, session] of sessions) {
+    const card = terminals.get(id)!.card;
+    card.querySelector('.terminal-title')!.textContent = session.title;
+    card.querySelector('.terminal-path')!.textContent = `▱  ${session.cwd}`;
+    const state = card.querySelector('.session-state')!;
+    state.textContent = states[session.state] ?? '상태 미확인';
+    state.className = `session-state ${session.state}`;
+    const identity = card.querySelector<HTMLElement>('.terminal-identity')!;
+    identity.textContent = `${String(order.indexOf(id) + 1).padStart(2, '0')}  ·  ${demo ? 'DEMO · 실제 세션 아님' : session.threadId ? `스레드 ${session.threadId.slice(0, 12)}` : '로컬 세션'}`;
+    identity.title = session.threadId ?? '';
+    const checkbox = card.querySelector<HTMLInputElement>('input')!;
+    checkbox.checked = selected.has(id);
+    checkbox.disabled = !writable(session);
+    card.classList.toggle('focused', id === active);
+  }
   renderCounts(); renderSide(); renderGrid();
 }
 

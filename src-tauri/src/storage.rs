@@ -49,6 +49,19 @@ impl Store {
         Ok(infos)
     }
 
+    pub fn prune_sessions(&self, live_ids: &[String]) -> Result<(), String> {
+        // Keep every current process plus the 512 newest records. Restored
+        // historical records have no process ownership and can be retired.
+        let keep = serde_json::to_string(live_ids).map_err(|e| e.to_string())?;
+        self.connection.execute(
+            "DELETE FROM session_metadata
+             WHERE id NOT IN (SELECT value FROM json_each(?1))
+             AND id NOT IN (SELECT id FROM session_metadata ORDER BY updated_at DESC,rowid DESC LIMIT 512)",
+            [keep]
+        ).map_err(|e| format!("retain bounded session metadata: {e}"))?;
+        Ok(())
+    }
+
     pub fn load_layout(&self) -> Result<Value, String> {
         let stored: Option<String> = self.connection.query_row("SELECT layout FROM workspace_layout WHERE id=1", [], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
         stored.map(|text| serde_json::from_str(&text).map_err(|e| format!("invalid stored layout: {e}"))).unwrap_or(Ok(Value::Null))
@@ -83,5 +96,18 @@ mod tests {
         assert_eq!(store.load_layout().unwrap(), layout);
         assert!(store.save_layout(&Value::String("x".repeat(1024 * 1024))).is_err());
         assert_eq!(store.load_layout().unwrap(), layout);
+    }
+
+    #[test]
+    fn metadata_retention_preserves_active_sessions_without_unbounded_history() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        for index in 0..600 {
+            store.save_session(&SessionInfo { id: format!("session-{index:04}"), generation: 1, title: "fixture".into(), cwd: ".".into(), thread_id: None, state: "exited".into() }).unwrap();
+        }
+        store.prune_sessions(&["session-0000".into()]).unwrap();
+        let count: usize = store.connection.query_row("SELECT COUNT(*) FROM session_metadata", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 513);
+        let active: usize = store.connection.query_row("SELECT COUNT(*) FROM session_metadata WHERE id='session-0000'", [], |r| r.get(0)).unwrap();
+        assert_eq!(active, 1);
     }
 }

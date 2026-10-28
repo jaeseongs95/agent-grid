@@ -1,7 +1,7 @@
 //! Only processes created by this application are assigned to these jobs.
-//! portable-pty returns an already-running child: per-session assignment has a
-//! small pre-assignment descendant race. The app job still owns those children
-//! on Windows, so app exit always reclaims them. Do not extend this to external PIDs.
+//! LaunchGate prevents app-created helpers from spawning before Job assignment.
+//! Do not extend this to external PIDs or existing vendor services.
+pub use crate::launch_gate::{run_child, LaunchGate};
 
 #[cfg(windows)]
 mod platform {

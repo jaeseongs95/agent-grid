@@ -1,5 +1,6 @@
 mod codex;
 mod flow;
+mod launch_gate;
 pub mod process_job;
 mod session;
 pub mod self_test;
@@ -66,7 +67,7 @@ pub fn run() {
     if let Err(error) = process_job::install_app_job() {
         // Fail closed: starting unowned background processes is never a fallback.
         eprintln!("Agent Grid startup failed: {error}");
-        return;
+        std::process::exit(1);
     }
     let result = tauri::Builder::default()
         .manage(ExitState::default())
@@ -115,6 +116,6 @@ pub fn run() {
                 }
             }
         }),
-        Err(error) => eprintln!("Agent Grid initialization failed: {error}"),
+        Err(error) => { eprintln!("Agent Grid initialization failed: {error}"); std::process::exit(1); }
     }
 }

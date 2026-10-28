@@ -4,6 +4,7 @@ use std::{collections::VecDeque, sync::{Condvar, Mutex}};
 /// A stalled renderer blocks the PTY reader, then the OS PTY, instead of growing
 /// an unbounded event queue. Stop wakes the reader without needing the renderer.
 pub const MAX_PENDING_BYTES: usize = 1024 * 1024;
+pub const MAX_PENDING_FRAMES: usize = 128;
 
 #[derive(Default)]
 struct Pending {
@@ -24,7 +25,7 @@ impl OutputFlow {
     pub fn reserve(&self, bytes: usize) -> Result<Option<u64>, String> {
         if bytes > MAX_PENDING_BYTES { return Err("output frame exceeds the delivery limit".into()); }
         let mut pending = self.pending.lock().map_err(|_| "output flow lock poisoned")?;
-        while !pending.cancelled && pending.bytes + bytes > MAX_PENDING_BYTES {
+        while !pending.cancelled && (pending.bytes + bytes > MAX_PENDING_BYTES || pending.frames.len() >= MAX_PENDING_FRAMES) {
             pending = self.changed.wait(pending).map_err(|_| "output flow lock poisoned")?;
         }
         if pending.cancelled { return Ok(None); }
@@ -127,5 +128,18 @@ mod tests {
             assert_eq!(actual, text);
         }
         assert_eq!(Utf8Decoder::default().decode(&[0xf0, 0x9f], true), "\u{fffd}");
+    }
+
+    #[test]
+    fn tiny_frames_cannot_grow_the_renderer_event_count_without_bound() {
+        let flow = Arc::new(OutputFlow::default());
+        for _ in 0..MAX_PENDING_FRAMES { flow.reserve(1).unwrap(); }
+        let reader = flow.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || sender.send(reader.reserve(1)).unwrap());
+        assert!(receiver.recv_timeout(Duration::from_millis(40)).is_err());
+        flow.acknowledge(MAX_PENDING_FRAMES as u64).unwrap();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(), Some(MAX_PENDING_FRAMES as u64 + 1));
+        worker.join().unwrap();
     }
 }
