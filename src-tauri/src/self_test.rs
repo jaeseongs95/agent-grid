@@ -23,6 +23,7 @@ struct Report {
     sessions_started: u64,
     output_frames: u64,
     output_bytes: u64,
+    blocked_input_observed: Option<bool>,
     sample_memory: Vec<MemorySample>,
     errors: Vec<String>,
     scope: &'static str,
@@ -239,44 +240,51 @@ impl Harness {
         #[cfg(not(windows))] { Ok(0) }
     }
 
-    fn blocked_input_stop(&self) -> Result<u64, String> {
+    fn blocked_input_stop(&self) -> Result<(u64, bool), String> {
         let baseline = process_job::app_owned_processes()?;
-        let script = if cfg!(windows) { "[Console]::WriteLine('input-unread-ready'); Start-Sleep -Seconds 60" } else { "printf 'input-unread-ready\\n'; exec sleep 60" };
+        let script = if cfg!(windows) { "[Console]::WriteLine('input-echo-ready'); $null = [Console]::ReadLine()" } else { "printf 'input-echo-ready\\n'; read line" };
         let session = self.start(script)?;
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !self.output.lock().unwrap().get(&session.id).is_some_and(|text| text.contains("input-unread-ready")) {
-            if Instant::now() >= deadline { return Err("non-reading input fixture never became ready".into()); }
-            thread::sleep(Duration::from_millis(20));
-        }
+        self.wait_output(&session, "input-echo-ready", Duration::from_secs(20))?;
+        let before_bytes = self.output_bytes.load(Ordering::Acquire);
+        let before_frames = self.output_frames.load(Ordering::Acquire);
+        // A cooked ReadLine echoes input without a terminating newline. Stop
+        // consuming its output to propagate pressure back through the console.
+        self.ack.store(false, Ordering::Release);
         let entered = Arc::new(AtomicU64::new(0));
         let completed = Arc::new(AtomicU64::new(0));
         let (result_sender, result_receiver) = mpsc::channel();
         let (attempts, writes, engine, id, generation) = (entered.clone(), completed.clone(), self.engine.clone(), session.id.clone(), session.generation);
         let worker = thread::spawn(move || {
             let input = "x".repeat(64 * 1024);
-            loop {
+            // Bound total injected input even on hosts that eagerly buffer it.
+            for _ in 0..256 {
                 attempts.fetch_add(1, Ordering::Release);
                 match engine.write(&id, generation, &input) {
                     Ok(()) => { writes.fetch_add(1, Ordering::Release); }
-                    Err(error) => { let _ = result_sender.send(error); break; }
+                    Err(error) => { let _ = result_sender.send(Err(error)); return; }
                 }
             }
+            let _ = result_sender.send(Ok(()));
         });
         // Observe an actual write call that stays in flight while no subsequent
         // call completes. Do not label an uncongested fixture a blocked-write test.
         let deadline = Instant::now() + Duration::from_secs(10);
+        let mut blocked = false;
         loop {
             let before = completed.load(Ordering::Acquire);
-            if entered.load(Ordering::Acquire) > before {
+            let saturated = self.output_bytes.load(Ordering::Acquire) - before_bytes >= (MAX_PENDING_BYTES - 32768) as u64 || self.output_frames.load(Ordering::Acquire) - before_frames >= MAX_PENDING_FRAMES as u64;
+            if saturated && entered.load(Ordering::Acquire) > before {
                 thread::sleep(Duration::from_millis(200));
-                if completed.load(Ordering::Acquire) == before { break; }
+                if completed.load(Ordering::Acquire) == before { blocked = true; break; }
             }
-            if Instant::now() >= deadline { self.engine.stop(&session.id, session.generation)?; return Err("input fixture did not demonstrate a blocked write; cleanup boundary remains unverified".into()); }
+            if before >= 256 || Instant::now() >= deadline { break; }
             thread::sleep(Duration::from_millis(10));
         }
         let stopping = Instant::now();
         self.engine.stop(&session.id, session.generation)?;
-        result_receiver.recv_timeout(Duration::from_secs(5)).map_err(|_| "stopping the session did not unblock its in-flight input write")?;
+        self.ack.store(true, Ordering::Release);
+        let write_result = result_receiver.recv_timeout(Duration::from_secs(5)).map_err(|_| "stopping the session did not complete its bounded input worker")?;
+        if blocked && write_result.is_ok() { return Err("a blocked input worker unexpectedly completed all 16 MiB after stop".into()); }
         worker.join().map_err(|_| "blocked input worker panicked")?;
         if stopping.elapsed() > Duration::from_secs(5) { return Err("blocked input cleanup exceeded five seconds".into()); }
         self.take_output(&session)?;
@@ -285,7 +293,7 @@ impl Harness {
             if Instant::now() >= deadline { return Err("blocked input cleanup did not restore the owned process baseline".into()); }
             thread::sleep(Duration::from_millis(20));
         }
-        Ok(1)
+        Ok((1, blocked))
     }
 
     fn sustain(&self, start: Instant, duration: Duration, report: &mut Report) -> Result<(), String> {
@@ -379,7 +387,7 @@ fn fixture_tail(output: &str) -> String {
 
 fn suite(duration: Duration) -> Report {
     let start = Instant::now();
-    let mut report = Report { schema: "agent-grid-self-test-v1", tests: 0, pass: 0, fail: 0, duration_seconds: 0.0, iterations: 0, sessions_started: 0, output_frames: 0, output_bytes: 0, sample_memory: vec![memory_sample(start)], errors: Vec::new(), scope: "Headless native PTY fixtures only. No GUI, vendor protocol, model API, or user-config validation." };
+    let mut report = Report { schema: "agent-grid-self-test-v1", tests: 0, pass: 0, fail: 0, duration_seconds: 0.0, iterations: 0, sessions_started: 0, output_frames: 0, output_bytes: 0, blocked_input_observed: None, sample_memory: vec![memory_sample(start)], errors: Vec::new(), scope: "Headless native PTY fixtures only. No GUI, vendor protocol, model API, or user-config validation. blockedInputObserved=false means the host did not demonstrate input backpressure; that case verifies bounded write/stop completion without claiming a blocked-write boundary." };
     let mut counters = None;
     let result = (|| -> Result<(), String> {
         process_job::install_app_job()?;
@@ -397,7 +405,9 @@ fn suite(duration: Duration) -> Report {
         report.sessions_started += harness.bounded_output_cancellation()?;
         report.pass += 1;
         report.tests += 1;
-        report.sessions_started += harness.blocked_input_stop()?;
+        let (started, blocked) = harness.blocked_input_stop()?;
+        report.sessions_started += started;
+        report.blocked_input_observed = Some(blocked);
         report.pass += 1;
         #[cfg(windows)] {
             report.tests += 1;
@@ -496,14 +506,16 @@ struct SmokeReport {
 /// at the official CLI's trust/auth/first-run UI; that is an explicit failed
 /// binding check, never permission to answer the prompt on the user's behalf.
 pub fn run_codex_smoke() -> i32 {
-    let options = (|| -> Result<(usize, PathBuf), String> {
+    let options = (|| -> Result<(usize, PathBuf, bool), String> {
         let args: Vec<_> = std::env::args().collect();
         let mut count = 1;
         let mut report = None;
+        let mut diagnostic_terminal = false;
         let mut index = 1;
         while index < args.len() {
             match args[index].as_str() {
                 "--codex-smoke" => {}
+                "--diagnostic-terminal" => diagnostic_terminal = true,
                 "--sessions" => { index += 1; count = args.get(index).ok_or("missing sessions count")?.parse().map_err(|_| "invalid sessions count")?; }
                 "--report" => { index += 1; report = Some(PathBuf::from(args.get(index).ok_or("missing report path")?)); }
                 other => return Err(format!("unknown Codex smoke option: {other}")),
@@ -513,9 +525,9 @@ pub fn run_codex_smoke() -> i32 {
         if !(1..=16).contains(&count) { return Err("smoke sessions must be in 1..16".into()); }
         let report = report.ok_or("Codex smoke requires --report <absolute-path>")?;
         if !report.is_absolute() || !report.parent().is_some_and(Path::is_dir) { return Err("Codex smoke report must be absolute with an existing parent directory".into()); }
-        Ok((count, report))
+        Ok((count, report, diagnostic_terminal))
     })();
-    let (count, destination) = match options { Ok(options) => options, Err(error) => { eprintln!("{error}"); return 2; } };
+    let (count, destination, diagnostic_terminal) = match options { Ok(options) => options, Err(error) => { eprintln!("{error}"); return 2; } };
     let start = Instant::now();
     let directory = destination.parent().expect("report parent was validated").join(format!("agent-grid-codex-smoke-{}", Uuid::new_v4().simple()));
     let mut report = SmokeReport { schema: "agent-grid-codex-smoke-v1", pass: false, duration_seconds: 0.0, test_directory: directory.to_string_lossy().into_owned(), sessions: Vec::new(), memory: Vec::new(), errors: Vec::new(), scope: "Actual owned Codex app-server/remote TUI startup and observed thread/status binding only. Only terminal protocol negotiation replies; no user text, model turns, approval decisions, user config writes, or GUI validation. PTY evidence is a SHA-256 of its bounded captured prefix; no raw terminal text is saved." };
@@ -560,6 +572,15 @@ pub fn run_codex_smoke() -> i32 {
             let info = snapshots.iter().find(|info| info.id == original.id).unwrap_or(original);
             let valid = info.thread_id.as_ref().is_some_and(|id| Uuid::parse_str(id).is_ok()) && matches!(info.state.as_str(), "idle" | "running" | "waiting");
             let output = harness.take_output(info)?;
+            if diagnostic_terminal {
+                // Explicit local-only diagnostic for these newly created TUIs.
+                // Default reports remain hashes; this artifact is never emitted
+                // to stdout and is not part of the packaging/upload manifest.
+                let prefix: String = output.chars().take(8192).collect();
+                let escaped = serde_json::to_vec_pretty(&serde_json::json!({"sessionId":info.id,"redactedStartupPrefix":redact_terminal(&prefix)})).map_err(|e| format!("encode local terminal diagnostic: {e}"))?;
+                let path = directory.join(format!("startup-terminal-{}.json", info.id));
+                std::fs::write(path, escaped).map_err(|e| format!("write local terminal diagnostic: {e}"))?;
+            }
             let output_present = !output.is_empty();
             let error = if !valid { Some("exact UUID and observed live status were not both established within 45 seconds; trust/auth/first-run UI was not answered".into()) } else if !output_present { Some("remote TUI emitted no captured PTY output".into()) } else { None };
             report.sessions.push(SmokeSession { cwd: info.cwd.clone(), session_id: Some(info.id.clone()), generation: Some(info.generation), thread_id: info.thread_id.clone(), observed_state: info.state.clone(), captured_pty_bytes: output.len(), captured_pty_sha256: format!("{:x}", Sha256::digest(output.as_bytes())), error });
@@ -581,4 +602,31 @@ pub fn run_codex_smoke() -> i32 {
     if let Err(error) = std::fs::write(&destination, text.as_bytes()) { eprintln!("write Codex smoke report: {error}"); return 2; }
     println!("{text}");
     if report.pass { 0 } else { 1 }
+}
+
+fn redact_terminal(text: &str) -> String {
+    let mut redacted = text.to_owned();
+    for pattern in ["bearer ", "bearer\t", "sk-", "agent_grid_remote_token=", "token=", "token:", "token ", "api_key=", "api_key:", "apikey="] {
+        let mut from = 0;
+        while let Some(relative) = redacted[from..].to_ascii_lowercase().find(pattern) {
+            let matched = from + relative;
+            let mut start = matched + if pattern == "sk-" { 0 } else { pattern.len() };
+            while redacted[start..].starts_with(|ch: char| matches!(ch, ' ' | '\t' | '"' | '\'')) { start += 1; }
+            let end = redacted[start..].find(|ch: char| matches!(ch, ' ' | '\t' | '\r' | '\n' | '"' | '\'' | '`' | ';' | '<' | '>')).map(|length| start + length).unwrap_or(redacted.len());
+            if start == end { from = (matched + pattern.len()).min(redacted.len()); }
+            else { redacted.replace_range(start..end, "[REDACTED]"); from = start + "[REDACTED]".len(); }
+        }
+    }
+    redacted
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn explicit_terminal_diagnostics_redact_credentials_and_keep_control_text() {
+        let result = super::redact_terminal("\x1b[31mError\x1b[0m Bearer abc.def token=secret sk-example-token AGENT_GRID_REMOTE_TOKEN=capability\nnext");
+        assert!(result.contains("\x1b[31mError\x1b[0m"));
+        for secret in ["abc.def", "secret", "sk-example-token", "capability"] { assert!(!result.contains(secret)); }
+        assert!(result.ends_with("\nnext"));
+    }
 }
