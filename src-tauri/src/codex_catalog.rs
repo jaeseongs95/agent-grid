@@ -43,7 +43,7 @@ pub struct CatalogPreview {
     pub unavailable_reason: Option<String>,
 }
 
-fn with_reader<T>(read: impl FnOnce(&mut Rpc<TcpStream>) -> Result<T, String>) -> Result<T, String> {
+fn with_reader<T>(exe: &OsString, read: impl FnOnce(&mut Rpc<TcpStream>) -> Result<T, String>) -> Result<T, String> {
     // No blocking admission queue: frontends coalesce pending intentions, and a
     // second caller cannot accumulate workers or additional protocol processes.
     let _request = CATALOG_REQUEST.try_lock().map_err(|error| match error {
@@ -51,7 +51,7 @@ fn with_reader<T>(read: impl FnOnce(&mut Rpc<TcpStream>) -> Result<T, String>) -
         std::sync::TryLockError::Poisoned(_) => "세션 조회 잠금이 손상되었습니다. 앱을 다시 시작하세요.".to_owned(),
     })?;
     let directory = env::temp_dir().canonicalize().map_err(|e| format!("Cannot open catalog process working directory: {e}"))?;
-    let (server, mut rpc) = launch_server(&directory, None)?;
+    let (server, mut rpc) = launch_server(exe, &directory, None)?;
     let result = read(&mut rpc);
     // Closing is best-effort; always shut down the transport and reap the owned
     // Job even after an RPC error. Do not retain a CLOSE_WAIT socket or wait for
@@ -120,6 +120,10 @@ fn parse_page(value: &Value, previous: Option<&str>) -> Result<CatalogPage, Stri
 }
 
 pub fn catalog_list(request: CatalogQuery) -> Result<CatalogPage, String> {
+    catalog_list_with_executable(&executable()?, request)
+}
+
+pub fn catalog_list_with_executable(exe: &OsString, request: CatalogQuery) -> Result<CatalogPage, String> {
     let query = request.query.trim();
     if query.len() > 1024 { return Err("Session search must not exceed 1024 UTF-8 bytes".into()); }
     validate_cursor(request.cursor.as_deref())?;
@@ -144,7 +148,7 @@ pub fn catalog_list(request: CatalogQuery) -> Result<CatalogPage, String> {
         }
         None => None,
     };
-    with_reader(|rpc| {
+    with_reader(exe, |rpc| {
         let page = parse_page(&rpc.call("thread/list", params)?, request.cursor.as_deref())?;
         if let Some(expected) = selected_directory {
             for session in &page.sessions {
@@ -203,9 +207,13 @@ fn parse_preview(value: &Value, previous: Option<&str>) -> Result<CatalogPreview
 }
 
 pub fn catalog_preview(thread_id: &str, previous: Option<String>) -> Result<CatalogPreview, String> {
+    catalog_preview_with_executable(&executable()?, thread_id, previous)
+}
+
+pub fn catalog_preview_with_executable(exe: &OsString, thread_id: &str, previous: Option<String>) -> Result<CatalogPreview, String> {
     Uuid::parse_str(thread_id).map_err(|_| "Preview requires an exact thread UUID")?;
     validate_cursor(previous.as_deref())?;
-    with_reader(|rpc| {
+    with_reader(exe, |rpc| {
         let params = json!({"threadId":thread_id,"limit":CATALOG_PAGE_SIZE,"sortDirection":"desc","cursor":previous.as_deref()});
         parse_preview(&rpc.call("thread/items/list", params)?, previous.as_deref())
     })

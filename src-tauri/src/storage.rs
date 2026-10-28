@@ -21,6 +21,10 @@ impl Store {
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 layout TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS projects (
                 id TEXT PRIMARY KEY NOT NULL,
                 canonical_cwd TEXT UNIQUE NOT NULL,
@@ -81,6 +85,19 @@ impl Store {
         Ok(())
     }
 
+    pub fn codex_executable(&self) -> Result<Option<String>, String> {
+        self.connection.query_row("SELECT value FROM app_settings WHERE key='codex_executable'", [], |row| row.get(0))
+            .optional().map_err(|e| format!("Read app executable setting: {e}"))
+    }
+
+    pub fn set_codex_executable(&self, path: Option<&str>) -> Result<(), String> {
+        match path {
+            Some(path) => self.connection.execute(
+                "INSERT INTO app_settings(key,value) VALUES('codex_executable',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [path]),
+            None => self.connection.execute("DELETE FROM app_settings WHERE key='codex_executable'", []),
+        }.map(|_| ()).map_err(|e| format!("Save app executable setting: {e}"))
+    }
+
     pub fn import_project(&self, directory: &ProjectDirectory) -> Result<ProjectInfo, String> {
         self.connection.execute(
             "INSERT INTO projects(id,canonical_cwd,cwd,name) VALUES(?1,?2,?3,?4)
@@ -105,6 +122,43 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn executable_setting_reopens_and_reset_preserves_workspace_records() {
+        let directory = std::env::temp_dir().join(format!("agent-grid-setting-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let database = directory.join("workspace.sqlite3");
+        let layout = serde_json::json!({"version":1,"sessions":[],"columns":2});
+        let project;
+        {
+            let store = Store::open(&database).unwrap();
+            store.save_layout(&layout).unwrap();
+            store.save_session(&SessionInfo { id: "existing-session".into(), generation: 3, title: "existing title".into(), cwd: directory.to_string_lossy().into_owned(), thread_id: None, state: "idle".into() }).unwrap();
+            project = store.import_project(&crate::project::directory(directory.to_str().unwrap()).unwrap()).unwrap();
+            store.set_codex_executable(Some("C:\\native\\codex.exe")).unwrap();
+        }
+        {
+            let store = Store::open(&database).unwrap();
+            assert_eq!(store.codex_executable().unwrap().as_deref(), Some("C:\\native\\codex.exe"));
+            assert_eq!(store.load_layout().unwrap(), layout);
+            assert_eq!(store.sessions().unwrap()[0].generation, 3);
+            assert_eq!(store.projects().unwrap()[0].id, project.id);
+            store.set_codex_executable(Some("C:\\other\\codex.exe")).unwrap();
+            assert_eq!(store.codex_executable().unwrap().as_deref(), Some("C:\\other\\codex.exe"));
+            store.set_codex_executable(None).unwrap();
+        }
+        {
+            let store = Store::open(&database).unwrap();
+            assert!(store.codex_executable().unwrap().is_none());
+            assert_eq!(store.load_layout().unwrap(), layout);
+            assert_eq!(store.sessions().unwrap()[0].id, "existing-session");
+            assert_eq!(store.projects().unwrap()[0].id, project.id);
+        }
+        for file in ["workspace.sqlite3-wal", "workspace.sqlite3-shm", "workspace.sqlite3"] {
+            let path = directory.join(file);
+            if path.exists() { std::fs::remove_file(path).unwrap(); }
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
     #[test]
     fn metadata_restores_without_running_and_layout_replaces_atomically() {
         let store = Store::open(Path::new(":memory:")).unwrap();

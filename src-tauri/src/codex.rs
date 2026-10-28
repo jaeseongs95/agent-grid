@@ -26,7 +26,7 @@ static CATALOG_REQUEST: Mutex<()> = Mutex::new(());
 
 #[path = "codex_catalog.rs"]
 mod catalog;
-pub use catalog::{catalog_list, catalog_preview, CatalogPage, CatalogPreview, CatalogQuery};
+pub use catalog::{catalog_list, catalog_list_with_executable, catalog_preview, catalog_preview_with_executable, CatalogPage, CatalogPreview, CatalogQuery};
 
 #[derive(Debug)]
 pub enum CodexEvent { ThreadId(String), Status(String) }
@@ -65,19 +65,7 @@ impl Drop for CodexSession {
 }
 
 fn executable() -> Result<OsString, String> {
-    if let Some(value) = env::var_os("AGENT_GRID_CODEX") {
-        if value.is_empty() { return Err("AGENT_GRID_CODEX is empty".into()); }
-        return Ok(value);
-    }
-    // Resolve the native executable rather than a shell shim; never invoke a shell.
-    let names: &[&str] = if cfg!(windows) { &["codex.exe"] } else { &["codex"] };
-    for dir in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
-        for name in names {
-            let path = dir.join(name);
-            if path.is_file() { return Ok(path.into_os_string()); }
-        }
-    }
-    Err("Codex executable was not found on PATH; set AGENT_GRID_CODEX to its native executable".into())
+    crate::codex_settings::resolve(None).executable()
 }
 
 fn hidden(command: &mut Command) {
@@ -275,8 +263,7 @@ fn publish_status(previous: &mut Option<String>, state: String, on_event: &dyn F
 
 /// Both terminal sessions and short-lived catalog requests use the same owned,
 /// authenticated server. Browsing never creates/resumes a conversation.
-fn launch_server(cwd: &Path, thread_id: Option<&str>) -> Result<(CodexSession, Rpc<TcpStream>), String> {
-    let exe = executable()?;
+fn launch_server(exe: &OsString, cwd: &Path, thread_id: Option<&str>) -> Result<(CodexSession, Rpc<TcpStream>), String> {
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let endpoint = format!("ws://{}", listener.local_addr().map_err(|e| e.to_string())?);
     drop(listener);
@@ -289,7 +276,7 @@ fn launch_server(cwd: &Path, thread_id: Option<&str>) -> Result<(CodexSession, R
     hidden(&mut process);
     let server = process.spawn().map_err(|e| format!("Cannot start Codex app-server: {e}"))?;
     let mut session = CodexSession {
-        command: tui_command(&exe, cwd, &endpoint, &token, thread_id), server, job:None, _launch_gate:launch_gate,
+        command: tui_command(exe, cwd, &endpoint, &token, thread_id), server, job:None, _launch_gate:launch_gate,
         stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None,
     };
     session.job = Some(ProcessJob::assign_std(&session.server)?);
@@ -302,10 +289,14 @@ fn launch_server(cwd: &Path, thread_id: Option<&str>) -> Result<(CodexSession, R
 }
 
 pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEvent) + Send + Sync>) -> Result<CodexSession, String> {
+    prepare_with_executable(&executable()?, cwd, thread_id, on_event)
+}
+
+pub fn prepare_with_executable(exe: &OsString, cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEvent) + Send + Sync>) -> Result<CodexSession, String> {
     let cwd = cwd.canonicalize().map_err(|e| format!("Cannot open working directory: {e}"))?;
     if !cwd.is_dir() { return Err("Working directory must be a directory".into()); }
     if let Some(id) = thread_id { Uuid::parse_str(id).map_err(|_| "Saved Codex thread ID is not a UUID; refusing ambiguous name-based resume")?; }
-    let (mut session, mut rpc) = launch_server(&cwd, thread_id)?;
+    let (mut session, mut rpc) = launch_server(exe, &cwd, thread_id)?;
     if let Some(id) = thread_id {
         let existing = rpc.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
         verified_thread(&existing["thread"], id, &cwd)?;
@@ -414,8 +405,7 @@ impl Drop for Proxy {
     }
 }
 impl Proxy {
-    fn open() -> Result<Self, String> {
-        let exe = executable()?;
+    fn open(exe: &OsString) -> Result<Self, String> {
         let (mut command, launch_gate) = LaunchGate::wrap_std(exe.as_os_str())?;
         command.args(["app-server", "proxy"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         hidden(&mut command);
@@ -473,7 +463,11 @@ fn external(thread: &Value, observed_at: &str) -> Result<ExternalSession, String
 }
 
 pub fn list_external() -> Result<Vec<ExternalSession>, String> {
-    let mut proxy = Proxy::open()?;
+    list_external_with_executable(&executable()?)
+}
+
+pub fn list_external_with_executable(exe: &OsString) -> Result<Vec<ExternalSession>, String> {
+    let mut proxy = Proxy::open(exe)?;
     proxy.call("initialize", initialize())?;
     proxy.rpc.as_mut().unwrap().send(json!({"method":"initialized","params":{}}))?;
     let observed = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().to_string();

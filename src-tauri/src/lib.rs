@@ -1,4 +1,6 @@
 mod codex;
+mod codex_settings;
+mod executable_picker;
 mod flow;
 mod launch_gate;
 mod project;
@@ -55,8 +57,30 @@ fn load_layout(engine: State<'_, Engine>) -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn save_layout(engine: State<'_, Engine>, layout: serde_json::Value) -> Result<(), String> { engine.save_layout(&layout) }
 #[tauri::command]
-async fn list_external() -> Result<Vec<codex::ExternalSession>, String> {
-    tauri::async_runtime::spawn_blocking(codex::list_external).await.map_err(|e| format!("external session observer: {e}"))?
+async fn list_external(engine: State<'_, Engine>) -> Result<Vec<codex::ExternalSession>, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.list_external()).await.map_err(|e| format!("external session observer: {e}"))?
+}
+#[tauri::command]
+async fn get_codex_settings(engine: State<'_, Engine>) -> Result<codex_settings::CodexSettings, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.get_codex_settings()).await.map_err(|e| format!("Read executable setting worker: {e}"))?
+}
+#[tauri::command]
+async fn set_codex_executable(engine: State<'_, Engine>, path: Option<String>) -> Result<codex_settings::CodexSettings, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.set_codex_executable(path.as_deref())).await.map_err(|e| format!("Save executable setting worker: {e}"))?
+}
+#[tauri::command]
+async fn choose_codex_executable(app: tauri::AppHandle, engine: State<'_, Engine>, picker: State<'_, executable_picker::ExecutablePicker>) -> Result<Option<codex_settings::CodexSettings>, String> {
+    let engine = engine.inner().clone();
+    let picker = picker.inner().clone();
+    #[cfg(windows)]
+    let owner = app.get_webview_window("main").ok_or("Main window is unavailable")?.hwnd().map_err(|e| format!("Get executable chooser parent window: {e}"))?.0 as isize;
+    #[cfg(not(windows))]
+    let owner = { let _ = app; 0 };
+    tauri::async_runtime::spawn_blocking(move || picker.choose(owner)?.map(|path| engine.set_codex_executable(Some(&path))).transpose())
+        .await.map_err(|e| format!("Executable chooser worker: {e}"))?
 }
 #[tauri::command]
 async fn list_projects(engine: State<'_, Engine>) -> Result<Vec<project::ProjectInfo>, String> {
@@ -81,12 +105,14 @@ async fn choose_project(app: tauri::AppHandle, engine: State<'_, Engine>, picker
     }).await.map_err(|e| format!("Project folder chooser worker: {e}"))?
 }
 #[tauri::command]
-async fn catalog_list(request: codex::CatalogQuery) -> Result<codex::CatalogPage, String> {
-    tauri::async_runtime::spawn_blocking(move || codex::catalog_list(request)).await.map_err(|e| format!("Session catalog worker: {e}"))?
+async fn catalog_list(engine: State<'_, Engine>, request: codex::CatalogQuery) -> Result<codex::CatalogPage, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.catalog_list(request)).await.map_err(|e| format!("Session catalog worker: {e}"))?
 }
 #[tauri::command]
-async fn catalog_preview(thread_id: String, cursor: Option<String>) -> Result<codex::CatalogPreview, String> {
-    tauri::async_runtime::spawn_blocking(move || codex::catalog_preview(&thread_id, cursor)).await.map_err(|e| format!("Session preview worker: {e}"))?
+async fn catalog_preview(engine: State<'_, Engine>, thread_id: String, cursor: Option<String>) -> Result<codex::CatalogPreview, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.catalog_preview(&thread_id, cursor)).await.map_err(|e| format!("Session preview worker: {e}"))?
 }
 #[tauri::command]
 async fn complete_exit(app: tauri::AppHandle, engine: State<'_, Engine>, confirmed: bool) -> Result<(), String> {
@@ -115,6 +141,7 @@ pub fn run() {
     let result = tauri::Builder::default()
         .manage(ExitState::default())
         .manage(project::FolderPicker::default())
+        .manage(executable_picker::ExecutablePicker::default())
         .setup(|app| {
             // Process-scoped isolation for this app's metadata only. Codex's
             // home, credentials and configuration remain entirely unchanged.
@@ -143,7 +170,7 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, complete_exit])
+        .invoke_handler(tauri::generate_handler![start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, complete_exit])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<ExitState>().0.load(Ordering::Acquire) {

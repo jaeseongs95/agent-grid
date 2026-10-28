@@ -233,7 +233,7 @@ impl Engine {
         let weak = Arc::downgrade(&session);
         let on_event = Arc::new(move |event| { if let Some(session) = weak.upgrade() { session.observe(event); } });
         let info = session.info()?;
-        let adapter = match codex::prepare(Path::new(&info.cwd), info.thread_id.as_deref(), on_event) {
+        let adapter = match self.codex_executable().and_then(|exe| codex::prepare_with_executable(&exe, Path::new(&info.cwd), info.thread_id.as_deref(), on_event)) {
             Ok(adapter) => adapter,
             Err(error) => { session.finish("error")?; return Err(error); }
         };
@@ -379,6 +379,36 @@ impl Engine {
         self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.import_project(&directory)
     }
 
+    pub fn get_codex_settings(&self) -> Result<crate::codex_settings::CodexSettings, String> {
+        // Read one setting snapshot, then release SQLite before filesystem I/O.
+        let saved = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.codex_executable()?;
+        Ok(crate::codex_settings::resolve(saved.as_deref()))
+    }
+
+    pub fn set_codex_executable(&self, path: Option<&str>) -> Result<crate::codex_settings::CodexSettings, String> {
+        // Validate before changing the existing value. Cancel and invalid saves
+        // cannot discard a working configuration or restart live sessions.
+        let selected = path.map(|path| crate::codex_settings::validate(Path::new(path))).transpose()?;
+        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.set_codex_executable(selected.as_deref())?;
+        // Reset is successful even when its environment/PATH fallback is absent.
+        // Return that resolution failure as status, never as a failed save.
+        Ok(crate::codex_settings::resolve(selected.as_deref()))
+    }
+
+    fn codex_executable(&self) -> Result<std::ffi::OsString, String> { self.get_codex_settings()?.executable() }
+
+    pub fn catalog_list(&self, request: codex::CatalogQuery) -> Result<codex::CatalogPage, String> {
+        codex::catalog_list_with_executable(&self.codex_executable()?, request)
+    }
+
+    pub fn catalog_preview(&self, thread_id: &str, cursor: Option<String>) -> Result<codex::CatalogPreview, String> {
+        codex::catalog_preview_with_executable(&self.codex_executable()?, thread_id, cursor)
+    }
+
+    pub fn list_external(&self) -> Result<Vec<codex::ExternalSession>, String> {
+        codex::list_external_with_executable(&self.codex_executable()?)
+    }
+
     pub fn shutdown(&self) -> Result<(), String> {
         self.inner.exiting.store(true, Ordering::Release);
         let sessions: Vec<_> = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?.values().cloned().collect();
@@ -410,4 +440,37 @@ impl Engine {
 fn size(cols: u16, rows: u16) -> PtySize { PtySize { cols, rows, pixel_width: 0, pixel_height: 0 } }
 fn validate_size(cols: u16, rows: u16) -> Result<(), String> {
     if !(2..=1000).contains(&cols) || !(1..=1000).contains(&rows) { Err("terminal size must be 2..1000 columns and 1..1000 rows".into()) } else { Ok(()) }
+}
+
+#[cfg(all(test, windows))]
+mod settings_tests {
+    use super::*;
+    #[test]
+    fn invalid_executable_save_preserves_value_and_reset_reports_status() {
+        let directory = std::env::temp_dir().join(format!("agent-grid-setting-engine-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let database = directory.join("workspace.sqlite3");
+        let engine = Engine::new(&database, Arc::new(|_| Ok(()))).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let saved = engine.set_codex_executable(Some(executable.to_str().unwrap())).unwrap();
+        assert_eq!(saved.source, "saved");
+        let admitted = engine.codex_executable().unwrap();
+        assert!(engine.set_codex_executable(Some("relative.cmd")).is_err());
+        assert_eq!(engine.get_codex_settings().unwrap().saved_path, saved.saved_path);
+        assert_eq!(engine.codex_executable().unwrap(), admitted);
+        let reset = engine.set_codex_executable(None).unwrap();
+        assert!(reset.saved_path.is_none());
+        // A missing fallback is status data; resetting a key still succeeded.
+        if reset.resolved_path.is_none() { assert!(reset.error.is_some()); }
+        assert_eq!(admitted, saved.executable().unwrap());
+        drop(engine);
+        let reopened = Engine::new(&database, Arc::new(|_| Ok(()))).unwrap();
+        assert!(reopened.get_codex_settings().unwrap().saved_path.is_none());
+        drop(reopened);
+        for file in ["workspace.sqlite3-wal", "workspace.sqlite3-shm", "workspace.sqlite3"] {
+            let path = directory.join(file);
+            if path.exists() { std::fs::remove_file(path).unwrap(); }
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
 }
