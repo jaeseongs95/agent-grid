@@ -135,7 +135,13 @@ function createTerminal(session: Session) {
   card.querySelector('.stop')!.addEventListener('click', () => {
     const current = sessions.get(session.id)!;
     if (['restored', 'stopped', 'exited'].includes(current.state)) { removeSession(session.id); return; }
-    if (confirm(`“${current.title}” 세션을 종료할까요? 실행 중인 작업이 중단됩니다.`)) void call('session_stop', { id: current.id, generation: current.generation }).catch(error => notify(`종료 실패: ${message(error)}`, true));
+    if (confirm(`“${current.title}” 세션을 종료할까요? 실행 중인 작업이 중단됩니다.`)) {
+      void call('session_stop', { id: current.id, generation: current.generation }).then(() => {
+        // A reaped error may not emit another state event. A live observation error
+        // is removed only after the native stop has completed its actual cleanup.
+        if (current.state === 'error' && sessions.get(current.id)?.generation === current.generation) removeSession(current.id);
+      }).catch(error => notify(`종료 실패: ${message(error)}`, true));
+    }
   });
   card.querySelector('.move-left')!.addEventListener('click', () => move(session.id, -1));
   card.querySelector('.move-right')!.addEventListener('click', () => move(session.id, 1));

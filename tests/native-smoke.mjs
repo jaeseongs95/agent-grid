@@ -1,7 +1,7 @@
 // Opt-in test of a root-launched packaged Agent Grid WebView2. Never starts a browser,
 // changes app config, approves a terminal prompt, or sends an Enter key to a terminal.
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, realpath, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { chromium } from '@playwright/test';
@@ -122,11 +122,13 @@ try {
   assert(cdp.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(cdp.hostname) && cdp.port && !cdp.username && !cdp.password && cdp.pathname === '/', 'AGENT_GRID_CDP_URL must be an explicit loopback HTTP endpoint with port');
   const requestedCwd = process.env.AGENT_GRID_SMOKE_CWD;
   const requestedOutput = process.env.AGENT_GRID_NATIVE_OUTPUT;
-  assert(requestedCwd && path.isAbsolute(requestedCwd), 'AGENT_GRID_SMOKE_CWD must name a fresh absolute directory');
+  assert(requestedCwd && path.isAbsolute(requestedCwd), 'AGENT_GRID_SMOKE_CWD must name an absolute directory');
   assert(requestedOutput && path.isAbsolute(requestedOutput), 'AGENT_GRID_NATIVE_OUTPUT must name an absolute output directory');
   const cwd = await realpath(requestedCwd);
   assert((await stat(cwd)).isDirectory(), 'Smoke cwd is not a directory');
-  assert((await readdir(cwd)).every(name => name === '.git'), 'Smoke cwd must be fresh (empty, or only .git); refusing an existing project');
+  const trustedExistingCwd = process.env.AGENT_GRID_NATIVE_USE_TRUSTED_CWD === '1';
+  if (!trustedExistingCwd) assert((await readdir(cwd)).every(name => name === '.git'), 'Smoke cwd must be fresh (empty, or only .git); refusing an existing project without explicit trusted-cwd opt-in');
+  report.startupContext = { mode: trustedExistingCwd ? 'existing/read-only user project' : 'fresh isolated fixture', trustedCwdExplicitlySelected: trustedExistingCwd, projectCommandsSent: false, projectFileWritesRequested: false, trustAnswersSent: false };
   outDir = path.resolve(requestedOutput);
   if (process.platform === 'win32') assert(outDir.toLowerCase().startsWith('d:\\codex\\build\\'), 'Native test artifacts must stay under D:/codex/build');
   await mkdir(outDir, { recursive: true });
@@ -161,6 +163,35 @@ try {
     assert(report.sessions.every(session => session.fullThreadId && uuid.test(session.threadId)), 'Both sessions must expose full thread UUIDs');
     assert.notEqual(report.sessions[0].threadId, report.sessions[1].threadId, 'Two new sessions unexpectedly share a thread UUID');
     return { validFullUuids: true, distinctThreads: true };
+  });
+  await check('nonexistent resume thread fails visibly without fresh fallback and error tile closes', async () => {
+    const title = `native-smoke-${token}-invalid-resume`;
+    const requestedThreadId = randomUUID();
+    assert(!report.sessions.some(session => session.threadId === requestedThreadId));
+    ownedTitles.add(title);
+    await page.locator('#new-session').click();
+    await page.locator('#session-title').fill(title);
+    await page.locator('#session-cwd').fill(cwd);
+    await page.locator('#session-thread').fill(requestedThreadId);
+    await page.locator('#create-submit').click();
+    const errorText = await until(async () => {
+      const dialogOpen = await page.locator('#create-dialog').getAttribute('open');
+      assert(dialogOpen !== null, 'Invalid resume unexpectedly succeeded or fell back to a fresh session');
+      return await page.locator('#create-error').isVisible() ? await page.locator('#create-error').textContent() : '';
+    }, value => !!value, 'nonexistent resume exposes a creation error', sessionTimeout);
+    assert(/thread|resume|rollout|스레드|대화/i.test(errorText), 'Resume failure must identify a thread/resume error');
+    const card = tile(title);
+    await until(() => card.locator('.session-state').getAttribute('class'), state => /\berror\b/.test(state ?? ''), 'failed resume has an error tile');
+    assert.equal(await card.locator('.terminal-identity').getAttribute('title'), requestedThreadId, 'Invalid resume was replaced with another thread ID');
+    await page.locator('#create-dialog').getByRole('button', { name: '취소', exact: true }).click();
+    expectedStopTitle = title;
+    try {
+      await card.locator('.stop').click();
+      await card.waitFor({ state: 'detached', timeout: 45_000 });
+    } finally { expectedStopTitle = ''; }
+    await assertOnlyOurs();
+    assert.equal(await page.locator('.terminal-card').count(), 2, 'Failed resume left a tile or created an extra session');
+    return { requestedThreadId, errorDisplayed: true, errorSha256: hash(errorText), freshFallbackOccurred: false, errorTileRemovedAfterNativeStop: true };
   });
   await check('native terminal focus, layout resize and reorder', async () => {
     await assertOnlyOurs();
@@ -240,7 +271,7 @@ try {
       assert(executable && path.isAbsolute(executable), 'AGENT_GRID_NATIVE_EXE must be the exact absolute launched executable');
       await assertOnlyOurs();
       const before = [];
-      for (const title of ownedTitles) {
+      for (const title of await tileTitles()) {
         const card = tile(title);
         before.push({ title, threadId: await card.locator('.terminal-identity').getAttribute('title'), screen: await card.locator('.xterm-screen').elementHandle(), text: await card.locator('.terminal-host').innerText() });
       }
