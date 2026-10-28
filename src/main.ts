@@ -31,6 +31,7 @@ let notificationCount = 0;
 let dragging = '';
 let searchVisible = false;
 let pendingStarts = 0;
+const pendingThreads = new Map<string, Promise<SessionInfo>>();
 let importedProjects: ProjectInfo[] = [];
 
 $('#app').innerHTML = `
@@ -298,8 +299,6 @@ const sessionBrowser = createSessionBrowser({
   call,
   projectsChanged(projects) { importedProjects = projects; renderSide(); },
   async openSession(session) {
-    const existing = [...sessions.values()].find(item => item.threadId === session.id && !['restored', 'stopped', 'exited', 'error', 'stopping'].includes(item.state));
-    if (existing) return existing.id;
     return (await start({ title: resumeTitle(session.title), cwd: session.cwd, threadId: session.id })).id;
   },
   focusSession(id) { if (maximized) maximized = id; renderGrid(); setActive(id); },
@@ -333,16 +332,26 @@ $('#broadcast-form').onsubmit = async event => {
 };
 
 async function start(request: SavedSession) {
+  if (request.threadId) {
+    const pending = pendingThreads.get(request.threadId);
+    if (pending) return pending;
+    const existing = [...sessions.values()].find(item => item.threadId === request.threadId && !['restored', 'stopped', 'exited'].includes(item.state));
+    if (existing) { if (maximized) maximized = existing.id; renderGrid(); setActive(existing.id); return existing; }
+  }
   // Reserve a slot before awaiting IPC so simultaneous restore clicks cannot exceed persistence capacity.
   if (sessions.size + pendingStarts >= MAX_WORKSPACE_SESSIONS) throw new Error(`작업 공간에는 시작 중인 세션을 포함해 최대 ${MAX_WORKSPACE_SESSIONS}개를 표시할 수 있습니다. 완료된 세션을 닫은 뒤 다시 시작하세요.`);
   pendingStarts++;
-  try {
-    const info = await call<SessionInfo>('start_session', { request: { ...request, cols: 100, rows: 30 } });
-    if ((sessions.get(info.id)?.generation ?? -1) < info.generation) receiveSession(info);
-    setActive(info.id);
-    queueResize(info.id);
-    return info;
-  } finally { pendingStarts--; }
+  const operation = (async () => {
+    try {
+      const info = await call<SessionInfo>('start_session', { request: { ...request, cols: 100, rows: 30 } });
+      if ((sessions.get(info.id)?.generation ?? -1) < info.generation) receiveSession(info);
+      setActive(info.id);
+      queueResize(info.id);
+      return info;
+    } finally { pendingStarts--; if (request.threadId) pendingThreads.delete(request.threadId); }
+  })();
+  if (request.threadId) pendingThreads.set(request.threadId, operation);
+  return operation;
 }
 $('#create-form').onsubmit = async event => {
   event.preventDefault(); const button = $<HTMLButtonElement>('#create-submit'); button.disabled = true;

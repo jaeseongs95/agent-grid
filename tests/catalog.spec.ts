@@ -3,11 +3,11 @@ import { test, expect, type Page } from '@playwright/test';
 const alpha = { id: '01900000-0000-7000-8000-000000000001', title: 'API 구조 개선', cwd: 'D:\\프로젝트\\api', createdAt: 1700000000, updatedAt: 1700000200, status: 'idle' };
 const beta = { ...alpha, id: '01900000-0000-7000-8000-000000000002', title: '회귀 테스트 점검', updatedAt: 1700000300 };
 
-async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; owned?: boolean; pages?: boolean; titleOverride?: string } = {}) {
+async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; holdStart?: boolean; owned?: boolean; ownedState?: string; saved?: boolean; pages?: boolean; titleOverride?: string } = {}) {
   await page.addInitScript(({ alpha, beta, options }) => {
     const state = window as any;
     state.isTauri = true;
-    state.fixture = { calls: [], active: 0, maxActive: 0, chooseCount: 0, created: 0, releaseSearch: () => {}, releasePreview: () => {} };
+    state.fixture = { calls: [], active: 0, maxActive: 0, chooseCount: 0, created: 0, releaseSearch: () => {}, releasePreview: () => {}, releaseStart: () => {} };
     let callback = 0;
     state.__TAURI_INTERNALS__ = {
       transformCallback: () => ++callback,
@@ -16,8 +16,8 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
         const fixture = state.fixture;
         fixture.calls.push({ command, args });
         if (command.startsWith('plugin:event|')) return callback;
-        if (command === 'load_layout') return { version: 1, columns: 2, sessions: [] };
-        if (command === 'list_sessions') return options.owned ? [{ id: 'owned-alpha', generation: 1, title: alpha.title, cwd: alpha.cwd, threadId: alpha.id, state: 'idle' }] : [];
+        if (command === 'load_layout') return { version: 1, columns: 2, sessions: options.saved ? [{ title: alpha.title, cwd: alpha.cwd, threadId: alpha.id }] : [] };
+        if (command === 'list_sessions') return options.owned ? [{ id: 'owned-alpha', generation: 1, title: alpha.title, cwd: alpha.cwd, threadId: alpha.id, state: options.ownedState ?? 'idle' }] : [];
         if (command === 'list_projects') return JSON.parse(localStorage.getItem('fixture-projects') || '[]');
         if (command === 'choose_project') {
           fixture.chooseCount++;
@@ -46,8 +46,9 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
         }
         if (command === 'start_session') {
           if (new TextEncoder().encode(args.request.title).byteLength > 512 || /\p{Cc}/u.test(args.request.title)) throw new Error('title must be at most 512 bytes without control characters');
-          fixture.created++;
-          return { ...args.request, id: 'created-' + fixture.created, generation: 1, state: 'idle', threadId: args.request.threadId || '01900000-0000-7000-8000-000000000003' };
+          const created = ++fixture.created;
+          if (options.holdStart && created === 1) await new Promise<void>(resolve => { fixture.releaseStart = resolve; });
+          return { ...args.request, id: 'created-' + created, generation: 1, state: 'idle', threadId: args.request.threadId || '01900000-0000-7000-8000-000000000003' };
         }
         return null;
       },
@@ -165,6 +166,53 @@ test('Korean search composition keeps candidate keys inside the IME until commit
   await search.evaluate(element => element.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '한글 검색' })));
   await expect.poll(() => page.evaluate(() => (window as any).fixture.calls.some((call: any) => call.args.request?.query === '한글 검색'))).toBe(true);
   await expect(page.locator('#catalog-dialog')).toBeVisible();
+});
+
+for (const state of ['error', 'stopping'] as const) {
+  test(`already owned ${state} session is focused without starting a duplicate`, async ({ page }) => {
+    await mockNative(page, { owned: true, ownedState: state });
+    await expect(page.locator('.terminal-card')).toHaveCount(1);
+    await page.locator('#catalog-open').click();
+    await expect(page.locator('#catalog-messages')).toContainText('ALPHA ONLY');
+    await page.locator('#catalog-resume').click();
+    await expect(page.locator('#catalog-dialog')).toBeHidden();
+    expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session'))).toEqual([]);
+    await expect(page.locator('.terminal-card')).toHaveCount(1);
+    await expect(page.locator('.terminal-card[data-id="owned-alpha"]')).toHaveClass(/focused/);
+  });
+}
+
+test('saved workspace and catalog share the owned-thread guard across repeated restore clicks', async ({ page }) => {
+  await mockNative(page, { owned: true, ownedState: 'error', saved: true });
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await page.locator('#restore-open').click();
+    await page.locator('#restore-list').getByRole('button', { name: '이 대화 재개 →' }).click();
+    expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session'))).toEqual([]);
+    await page.locator('#restore-dialog').getByRole('button', { name: '닫기', exact: true }).click();
+  }
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-messages')).toContainText('ALPHA ONLY');
+  await page.locator('#catalog-resume').click();
+  await expect(page.locator('#catalog-dialog')).toBeHidden();
+  expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session'))).toEqual([]);
+  await expect(page.locator('.terminal-card')).toHaveCount(1);
+  await expect(page.locator('.terminal-card[data-id="owned-alpha"]')).toHaveClass(/focused/);
+});
+
+test('pending resume is reused when the popup closes and reopens before startup completes', async ({ page }) => {
+  await mockNative(page, { holdStart: true });
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-messages')).toContainText('ALPHA ONLY');
+  await page.locator('#catalog-resume').click();
+  await expect.poll(() => page.evaluate(() => (window as any).fixture.created)).toBe(1);
+  await page.locator('#catalog-close').click();
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-messages')).toContainText('ALPHA ONLY');
+  await page.locator('#catalog-resume').click();
+  expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session').length)).toBe(1);
+  await page.evaluate(() => (window as any).fixture.releaseStart());
+  await expect(page.locator('#catalog-dialog')).toBeHidden();
+  await expect(page.locator('.terminal-card')).toHaveCount(1);
 });
 
 for (const [name, title, expectedTitle] of [
