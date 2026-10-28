@@ -17,7 +17,7 @@ const report = {
   startedAt: new Date().toISOString(),
   runtime: 'packaged WebView2 through opt-in CDP',
   checks: [], sessions: [], errors: [], cleanup: [],
-  limitations: ['Synthetic composition events do not verify a physical Windows IME or a Korean PTY round trip.', 'No model turn, trust approval, or terminal Enter is sent.', 'Screenshots mask all terminal text and observed external records.'],
+  limitations: ['Synthetic composition events do not verify a physical Windows IME; Korean PTY echo is checked separately in rendered terminal rows.', 'No model turn, trust approval, or terminal Enter is sent.', 'Screenshots mask all terminal text and observed external records.'],
 };
 const shortError = error => ({ name: error?.name ?? 'Error', message: String(error?.message ?? error).split('\n')[0].slice(0, 400) });
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -192,24 +192,32 @@ try {
     await page.locator('#search-close').click();
     return { searchResult: result };
   });
-  await check('synthetic Korean terminal composition dispatch (not physical IME)', async () => {
+  await check('synthetic Korean composition reaches actual PTY echo (not physical IME)', async () => {
     const card = tile([...ownedTitles][0]);
+    const marker = '한글입력검사';
+    // Read only VT-rendered rows, excluding xterm's local composition overlay and textarea.
+    const rows = card.locator('.xterm-rows');
+    await rows.waitFor({ state: 'visible' });
+    const before = await rows.innerText();
+    assert(!before.includes(marker), 'Korean echo marker must be absent before synthetic input');
     await card.locator('.terminal-host').click();
-    const events = await card.locator('textarea.xterm-helper-textarea').evaluate(element => {
+    const events = await card.locator('textarea.xterm-helper-textarea').evaluate((element, marker) => {
       const seen = [];
       const record = event => seen.push({ type: event.type, trusted: event.isTrusted });
       for (const type of ['compositionstart', 'compositionupdate', 'compositionend']) element.addEventListener(type, record);
       element.focus();
       element.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' }));
-      element.value = '한글';
-      element.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, data: '한글' }));
-      element.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '한글' }));
+      element.value = marker;
+      element.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, data: marker }));
+      element.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: marker }));
       for (const type of ['compositionstart', 'compositionupdate', 'compositionend']) element.removeEventListener(type, record);
       return seen;
-    });
+    }, marker);
     assert.deepEqual(events.map(event => event.type), ['compositionstart', 'compositionupdate', 'compositionend']);
     assert(events.every(event => event.trusted === false));
-    return { events, enterSent: false, physicalImeVerified: false, koreanPtyRoundTripVerified: false };
+    const dispatchedAt = Date.now();
+    const echoed = await until(() => rows.innerText(), text => text.includes(marker), 'actual Korean marker echo after composition end', 15_000);
+    return { events, marker, markerInitiallyAbsent: true, echoObservedIn: 'VT-rendered xterm rows (composition overlay excluded)', echoWaitMs: Date.now() - dispatchedAt, beforeOutputLength: before.length, afterOutputLength: echoed.length, beforeOutputSha256: hash(before), afterOutputSha256: hash(echoed), enterSent: false, physicalImeVerified: false, koreanPtyRoundTripVerified: true, unsubmittedTextCleared: false, disposition: 'Left unsubmitted until the owned session is stopped; no Ctrl+U sent to a potentially waiting session.' };
   });
   await check('external observations stay read only', async () => {
     await page.locator('#external-toggle').click();

@@ -155,7 +155,10 @@ impl Harness {
 
     fn generation_and_lifecycle(&self) -> Result<u64, String> {
         let marker = format!("input_한글_🦀_{}", Uuid::new_v4().simple());
-        let script = if cfg!(windows) { "[Console]::WriteLine('input-ready; encodings=' + [Console]::InputEncoding.CodePage + '/' + [Console]::OutputEncoding.CodePage); $line = [Console]::ReadLine(); [Console]::WriteLine('received:' + $line)" } else { "printf 'input-ready\\n'; read line; printf 'received:%s\\n' \"$line\"" };
+        // Windows PowerShell's default CP437 consumer demonstrably replaces
+        // Korean/emoji with '?'. Give this fixture an explicit UTF-8 contract;
+        // the actual vendor TUI owns its own terminal mode/encoding setup.
+        let script = if cfg!(windows) { "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::WriteLine('input-ready; encodings=' + [Console]::InputEncoding.CodePage + '/' + [Console]::OutputEncoding.CodePage); $line = [Console]::ReadLine(); [Console]::WriteLine('received:' + $line)" } else { "printf 'input-ready\\n'; read line; printf 'received:%s\\n' \"$line\"" };
         let session = self.start(script)?;
         self.wait_output(&session, "input-ready", Duration::from_secs(20))?;
         let stale = session.generation + 1;
@@ -488,7 +491,8 @@ struct SmokeReport {
     scope: &'static str,
 }
 
-/// Real adapter smoke without a model turn or any terminal input. This may stop
+/// Real adapter smoke with terminal-protocol replies only, without user text or
+/// a model turn. This may stop
 /// at the official CLI's trust/auth/first-run UI; that is an explicit failed
 /// binding check, never permission to answer the prompt on the user's behalf.
 pub fn run_codex_smoke() -> i32 {
@@ -507,12 +511,14 @@ pub fn run_codex_smoke() -> i32 {
             index += 1;
         }
         if !(1..=16).contains(&count) { return Err("smoke sessions must be in 1..16".into()); }
-        Ok((count, report.ok_or("Codex smoke requires --report <absolute-path>")?))
+        let report = report.ok_or("Codex smoke requires --report <absolute-path>")?;
+        if !report.is_absolute() || !report.parent().is_some_and(Path::is_dir) { return Err("Codex smoke report must be absolute with an existing parent directory".into()); }
+        Ok((count, report))
     })();
     let (count, destination) = match options { Ok(options) => options, Err(error) => { eprintln!("{error}"); return 2; } };
     let start = Instant::now();
-    let directory = std::env::temp_dir().join(format!("agent-grid-codex-smoke-{}", Uuid::new_v4().simple()));
-    let mut report = SmokeReport { schema: "agent-grid-codex-smoke-v1", pass: false, duration_seconds: 0.0, test_directory: directory.to_string_lossy().into_owned(), sessions: Vec::new(), memory: Vec::new(), errors: Vec::new(), scope: "Actual owned Codex app-server/remote TUI startup and observed thread/status binding only. No terminal input, model turns, approval decisions, user config writes, or GUI validation. PTY evidence is a SHA-256 of its bounded captured prefix; no raw terminal text is saved." };
+    let directory = destination.parent().expect("report parent was validated").join(format!("agent-grid-codex-smoke-{}", Uuid::new_v4().simple()));
+    let mut report = SmokeReport { schema: "agent-grid-codex-smoke-v1", pass: false, duration_seconds: 0.0, test_directory: directory.to_string_lossy().into_owned(), sessions: Vec::new(), memory: Vec::new(), errors: Vec::new(), scope: "Actual owned Codex app-server/remote TUI startup and observed thread/status binding only. Only terminal protocol negotiation replies; no user text, model turns, approval decisions, user config writes, or GUI validation. PTY evidence is a SHA-256 of its bounded captured prefix; no raw terminal text is saved." };
     let outcome = (|| -> Result<(), String> {
         process_job::install_app_job()?;
         let baseline = process_job::app_owned_processes()?;
