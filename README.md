@@ -43,6 +43,12 @@ projects remain in the sidebar after their terminals stop. The session browser
 opens for that project; choose an existing conversation or start a new session
 with its working directory already filled in.
 
+Use the project tabs above the grid, or click a project in the sidebar, to
+view that project's sessions. **전체** shows every session. Switching tabs keeps
+all terminals running and retains their output; group input and keyboard
+session shortcuts apply only to the visible project. New sessions and the
+session browser start with the selected project's directory.
+
 **세션 불러오기** opens a two-pane popup. Search session titles and filter by
 project on the left; inspect dates, the conversation ID and recent messages on
 the right before resuming. Already open conversations focus their existing

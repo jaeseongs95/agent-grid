@@ -1,5 +1,21 @@
 # Validation evidence
 
+## Project tabs
+
+Project tabs filter the existing workspace rather than creating a second
+terminal owner. Switching a project must preserve session IDs, generations,
+thread IDs, xterm elements and output acknowledgement for hidden terminals.
+Keyboard navigation, group input, counts and the empty state follow the
+selected project. The global session limit and saved workspace still include
+all projects. Exact normalized directory matching excludes children and
+similarly named siblings.
+
+Browser fixtures exercise these boundaries with controlled IPC replies.
+The opt-in packaged native fixture imports an additional empty project,
+switches between it and the project with two actual CLI terminals, and checks
+that ownership and existing xterm elements survive. Exact final results and
+source identifiers belong in the release notes.
+
 ## Project import and session browser
 
 The packaged application at `dd8f0627bd905cb5e2c76b14937f129d51d97f32`

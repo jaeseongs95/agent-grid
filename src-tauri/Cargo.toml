@@ -1,6 +1,6 @@
 [package]
 name = "agent-grid"
-version = "0.1.0"
+version = "0.2.0"
 description = "Independent terminal workspace for local coding agents"
 authors = ["Agent Grid contributors"]
 license = "MIT"

@@ -46,12 +46,13 @@ jobs:
           New-Item -ItemType Directory -Path artifacts -Force | Out-Null
           Copy-Item src-tauri/target/release/agent-grid.exe artifacts/agent-grid.exe
           Copy-Item src-tauri/target/release/agent-grid-helper.exe artifacts/agent-grid-helper.exe
-          Copy-Item src-tauri/target/release/bundle/nsis/*.exe artifacts/
+          $gridVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          Copy-Item src-tauri/target/release/bundle/nsis/*.exe "artifacts/AgentGrid-$gridVersion-windows-x64-setup.exe"
           Copy-Item LICENSE artifacts/
           Copy-Item THIRD_PARTY_NOTICES.md artifacts/
           Copy-Item src-tauri/Cargo.lock artifacts/Cargo.lock
           @{ commit = '${{ github.sha }}'; run = '${{ github.run_id }}'; platform = 'windows-x64'; signed = $false } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM artifacts/build-info.json
-          Compress-Archive -Path artifacts/agent-grid.exe,artifacts/agent-grid-helper.exe,artifacts/LICENSE,artifacts/THIRD_PARTY_NOTICES.md,artifacts/build-info.json -DestinationPath artifacts/agent-grid-0.1.0-windows-x64-portable.zip
+          Compress-Archive -Path artifacts/agent-grid.exe,artifacts/agent-grid-helper.exe,artifacts/LICENSE,artifacts/THIRD_PARTY_NOTICES.md,artifacts/build-info.json -DestinationPath "artifacts/agent-grid-$gridVersion-windows-x64-portable.zip"
           $probe = Start-Process -FilePath (Resolve-Path 'artifacts/agent-grid.exe') -ArgumentList @('--self-test','--duration-seconds','60','--report',"$PWD/artifacts/self-test.json") -WindowStyle Hidden -Wait -PassThru
           if ($probe.ExitCode -ne 0) { throw "Packaged PTY self-test failed: $($probe.ExitCode)" }
           Get-ChildItem artifacts -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(), $_.Name } | Set-Content -Encoding utf8NoBOM artifacts/SHA256SUMS.txt

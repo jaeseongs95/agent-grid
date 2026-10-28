@@ -19,6 +19,12 @@ export interface Output {
 
 export interface Session extends SessionInfo { seq: number }
 
+// Native canonical paths may carry the Windows extended-length prefix.
+// Match the directory itself, never its similarly named siblings or children.
+export function projectKey(cwd: string): string {
+  return cwd.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '').replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+}
+
 // A stale generation must never overwrite a newer process or feed its terminal.
 export function updateSession(previous: Session | undefined, next: SessionInfo): Session {
   if (previous && next.generation < previous.generation) return previous;

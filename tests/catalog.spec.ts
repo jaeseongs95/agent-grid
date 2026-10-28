@@ -108,6 +108,9 @@ test('project import handles cancel/error and opens an empty filtered popup; reg
   await expect(page.locator('#projects .project-row')).toContainText('새 프로젝트');
   await expect(page.locator('.terminal-card')).toHaveCount(0);
   await page.locator('#projects .project-row').click();
+  await expect(page.locator('#catalog-dialog')).toBeHidden();
+  await expect(page.locator('#project-tabs [role=tab][aria-selected="true"]')).toContainText('새 프로젝트');
+  await page.locator('#catalog-open').click();
   await expect(page.locator('#catalog-project')).toHaveValue('D:\\프로젝트\\새 프로젝트');
 });
 

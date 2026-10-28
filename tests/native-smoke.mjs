@@ -54,7 +54,7 @@ async function assertOnlyOurs() {
 
 async function maskedScreenshot(filename) {
   if (!page || page.isClosed() || !safeInitialState) return;
-  await page.screenshot({ path: path.join(outDir, filename), fullPage: true, mask: [page.locator('.terminal-host'), page.locator('.terminal-path'), page.locator('#external-list'), page.locator('#notification-list'), page.locator('#restore-list'), page.locator('#catalog-list'), page.locator('#catalog-selected'), page.locator('#catalog-project'), page.locator('#projects'), page.locator('#codex-executable-path'), page.locator('#codex-executable-resolved')], maskColor: '#141820' });
+  await page.screenshot({ path: path.join(outDir, filename), fullPage: true, mask: [page.locator('.terminal-host'), page.locator('.terminal-path'), page.locator('#external-list'), page.locator('#notification-list'), page.locator('#restore-list'), page.locator('#catalog-list'), page.locator('#catalog-selected'), page.locator('#catalog-project'), page.locator('#projects'), page.locator('#project-tabs'), page.locator('#codex-executable-path'), page.locator('#codex-executable-resolved')], maskColor: '#141820' });
 }
 
 async function nativeCall(command, args = {}) {
@@ -125,6 +125,9 @@ async function createSession(title, cwd) {
 }
 
 async function stopOurs() {
+  if (await page.locator('dialog[open]').count()) await page.keyboard.press('Escape');
+  const allProjects = page.locator('#project-tabs [role="tab"][data-project-cwd=""]');
+  if (await allProjects.count()) await allProjects.click();
   for (const title of ownedTitles) {
     try {
       const card = tile(title);
@@ -270,6 +273,77 @@ try {
     assert.notEqual(report.sessions[0].threadId, report.sessions[1].threadId, 'Two new sessions unexpectedly share a thread UUID');
     return { validFullUuids: true, distinctThreads: true };
   });
+  if (process.env.AGENT_GRID_NATIVE_PROJECT_PICKER === '1') {
+    await check('native project tabs filter live terminals without replacing PTYs or xterm DOM', async () => {
+      const originalProjects = await nativeCall('list_projects');
+      assert.equal(originalProjects.length, 1);
+      const originalProject = originalProjects[0];
+      assert.equal(await realpath(originalProject.cwd), cwd);
+      const originalSessions = await nativeCall('list_sessions');
+      assert.equal(originalSessions.length, 2);
+      const screens = [];
+      for (const title of await tileTitles()) screens.push({ title, screen: await tile(title).locator('.xterm-screen').elementHandle() });
+      const tab = async projectCwd => {
+        const tabs = page.locator('#project-tabs [role="tab"]');
+        const index = await tabs.evaluateAll((elements, value) => elements.findIndex(element => element.dataset.projectCwd === value), projectCwd);
+        assert(index >= 0, 'Imported project has no selectable main-grid tab');
+        return tabs.nth(index);
+      };
+      const assertLive = async () => {
+        const current = await nativeCall('list_sessions');
+        assert.equal(current.length, 2, 'Project switching changed the backend session count');
+        for (const before of originalSessions) {
+          const after = current.find(session => session.id === before.id);
+          assert(after && after.active === true, 'Project switching stopped or removed an owned PTY');
+          assert.equal(after.generation, before.generation, 'Project switching restarted a PTY generation');
+          assert.equal(after.threadId, before.threadId, 'Project switching replaced a CLI thread');
+        }
+        for (const previous of screens) assert(previous.screen && await previous.screen.evaluate(element => element.isConnected && element.closest('.terminal-card')?.querySelector('.xterm-screen') === element), 'Project switching disposed or replaced an xterm DOM');
+        return current.map(({ id, generation, threadId }) => ({ id, generation, threadId }));
+      };
+      try {
+        const projectTab = await tab(originalProject.cwd);
+        await projectTab.click();
+        await until(() => page.locator('.terminal-card:visible').count(), count => count === 2, 'original project shows both live terminals');
+        assert.equal(await projectTab.getAttribute('aria-selected'), 'true');
+        assert.equal(await page.locator('#session-list .session-link').count(), 2);
+        const emptyDirectory = path.join(outDir, 'empty-project-' + token);
+        await mkdir(emptyDirectory); // Fresh fixture only; no CLI is started in this untrusted folder.
+        const picker = await projectPicker('Select', emptyDirectory);
+        await page.locator('#catalog-dialog').waitFor({ state: 'visible', timeout: 30_000 });
+        const projects = await nativeCall('list_projects');
+        assert.equal(projects.length, 2);
+        const emptyProject = projects.find(project => project.id !== originalProject.id);
+        assert(emptyProject);
+        assert.equal(await realpath(emptyProject.cwd), await realpath(emptyDirectory));
+        assert.equal(await page.locator('#catalog-project').inputValue(), emptyProject.cwd);
+        await page.locator('#catalog-close').click();
+        const emptyTab = await tab(emptyProject.cwd);
+        assert.equal(await emptyTab.getAttribute('aria-selected'), 'true', 'Import did not select its project tab');
+        await until(() => page.locator('.terminal-card:visible').count(), count => count === 0, 'empty project hides unrelated terminals');
+        assert.equal(await page.locator('#empty').isVisible(), true);
+        assert.equal(await page.locator('#session-list .session-link').count(), 0);
+        assert.equal(await page.locator('.terminal-card').count(), 2, 'Filtering removed hidden terminal nodes');
+        await assertLive();
+        await (await tab('')).click();
+        await until(() => page.locator('.terminal-card:visible').count(), count => count === 2, 'all-project tab restores both terminals');
+        await assertLive();
+        await (await tab(originalProject.cwd)).click();
+        await until(() => page.locator('.terminal-card:visible').count(), count => count === 2, 'returning to original project restores both terminals');
+        const retained = [];
+        for (const previous of screens) {
+          const text = await tile(previous.title).locator('.terminal-host').innerText();
+          assert(text.trim().length > 10, 'Terminal output is empty after project switching');
+          retained.push({ sameTerminalDom: true, outputLength: text.trim().length, outputSha256: hash(text) });
+        }
+        return { picker, registryCount: 2, selectedImportedProject: true, emptyProjectVisibleTerminals: 0, originalProjectVisibleTerminals: 2, allProjectsVisibleTerminals: 2, sessions: await assertLive(), terminals: retained, hiddenOutputArrivalTimingVerified: false, additionalCliStarted: false };
+      } finally {
+        if (await page.locator('dialog[open]').count()) await page.keyboard.press('Escape');
+        await (await tab('')).click();
+        for (const previous of screens) await previous.screen?.dispose();
+      }
+    });
+  } else report.limitations.push('Native project tabs were not tested: AGENT_GRID_NATIVE_PROJECT_PICKER=1 was not supplied.');
   if (process.env.AGENT_GRID_NATIVE_EXECUTABLE_PICKER === '1') {
     const workspace = process.env.AGENT_GRID_WORKSPACE_DIR;
     assert(workspace && path.isAbsolute(workspace), 'Executable picker validation requires an explicitly isolated workspace');

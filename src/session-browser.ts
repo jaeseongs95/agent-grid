@@ -6,8 +6,8 @@ interface CatalogPreview { messages: PreviewMessage[]; nextCursor?: string | nul
 interface BrowserHost {
   call<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   projectsChanged(projects: ProjectInfo[]): void;
-  openSession(session: CatalogSession): Promise<string>;
-  focusSession(id: string): void;
+  projectImported(project: ProjectInfo): void;
+  openSession(session: CatalogSession): Promise<() => void>;
   newSession(cwd?: string): void;
   notify(text: string, error?: boolean): void;
 }
@@ -149,7 +149,7 @@ export function createSessionBrowser(host: BrowserHost) {
     const row = selected; if (!row || opening) return;
     const attempt = ++openAttempt; const version = listVersion;
     opening = true; $<HTMLButtonElement>('#catalog-resume').disabled = true; $('#catalog-resume-error').hidden = true;
-    try { const id = await host.openSession(row); if (dialog.open && version === listVersion) { dialog.close(); host.focusSession(id); } }
+    try { const focus = await host.openSession(row); if (dialog.open && version === listVersion) { dialog.close(); focus(); } }
     catch (error) { if (dialog.open && version === listVersion) { $('#catalog-resume-error').hidden = false; $('#catalog-resume-error').textContent = `불러오기 실패: ${errorMessage(error)}`; } else host.notify(`불러오기 실패: ${errorMessage(error)}`, true); }
     finally { if (attempt === openAttempt) { opening = false; $<HTMLButtonElement>('#catalog-resume').disabled = !selected; } }
   }
@@ -163,7 +163,7 @@ export function createSessionBrowser(host: BrowserHost) {
   }
   async function importProject() {
     const button = document.querySelector<HTMLButtonElement>('#project-import')!; button.disabled = true;
-    try { const project = await host.call<ProjectInfo | null>('choose_project'); if (project) { setProjects([...projects.filter(item => item.id !== project.id && item.cwd !== project.cwd), project]); await open(project.cwd); } }
+    try { const project = await host.call<ProjectInfo | null>('choose_project'); if (project) { setProjects([...projects.filter(item => item.id !== project.id && item.cwd !== project.cwd), project]); host.projectImported(project); await open(project.cwd); } }
     catch (error) { host.notify(`프로젝트 가져오기 실패: ${errorMessage(error)}`, true); }
     finally { button.disabled = false; }
   }
