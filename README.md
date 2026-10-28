@@ -30,8 +30,20 @@ must be on `PATH`; alternatively set `AGENT_GRID_CODEX` to its absolute path.
 The CLI must support authenticated app-server WebSockets and `--remote`.
 Older CLI versions are not silently downgraded to a different connection mode.
 
-Choose **새 세션**, enter a working directory and start the session. Use the
-official TUI to choose a model, sign in or answer permission prompts. Select
+Choose **프로젝트 가져오기** to select an existing local folder. Imported
+projects remain in the sidebar after their terminals stop. The session browser
+opens for that project; choose an existing conversation or start a new session
+with its working directory already filled in.
+
+**세션 불러오기** opens a two-pane popup. Search session titles and filter by
+project on the left; inspect dates, the conversation ID and recent messages on
+the right before resuming. Already open conversations focus their existing
+terminal. Browsing uses read-only requests through a short-lived owned server,
+so it does not require an existing desktop daemon. Recent messages are fetched
+in bounded pages and are not stored in Agent Grid's database.
+
+Use **새 세션** to enter a directory directly. Use the official TUI to choose
+a model, sign in or answer permission prompts. Select
 terminal cards before using group input. A reported delivery means bytes
 reached that terminal; it does not mean a model accepted or completed a turn.
 

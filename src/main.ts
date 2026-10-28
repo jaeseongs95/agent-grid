@@ -6,6 +6,7 @@ import { SearchAddon } from '@xterm/addon-search';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
 import { MAX_WORKSPACE_SESSIONS, acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo } from './model';
+import { createSessionBrowser, type ProjectInfo } from './session-browser';
 
 const native = isTauri();
 const demo = !native && new URLSearchParams(location.search).has('demo');
@@ -30,6 +31,7 @@ let notificationCount = 0;
 let dragging = '';
 let searchVisible = false;
 let pendingStarts = 0;
+let importedProjects: ProjectInfo[] = [];
 
 $('#app').innerHTML = `
   <aside class="sidebar">
@@ -37,6 +39,7 @@ $('#app').innerHTML = `
     <div class="workspace-label">WORKSPACE <span class="local-pill">LOCAL</span></div>
     <button class="workspace-choice"><span class="folder-icon">▤</span><span>나의 작업 공간<small>독립된 터미널, 하나의 화면</small></span></button>
     <div class="side-heading">프로젝트 <span id="project-count">0</span></div>
+    <button id="project-import" class="project-import quiet-button">+ 프로젝트 가져오기</button>
     <div id="projects" class="projects"></div>
     <div class="side-heading sessions-heading">세션 <span id="side-count">0</span><button id="side-add" class="icon-button" aria-label="새 세션 만들기">+</button></div>
     <nav id="session-list" aria-label="세션 목록"></nav>
@@ -45,7 +48,7 @@ $('#app').innerHTML = `
   </aside>
   <main>
     <header class="topbar"><div class="breadcrumb">작업 공간 <span>/</span> <strong>세션 그리드</strong></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="알림 보기">♧<span id="notification-count" hidden></span></button><button id="exit" class="quiet-button">앱 종료</button></div></header>
-    <section class="workspace-header"><div><div class="eyebrow">YOUR AGENTS, IN VIEW</div><h1>세션 그리드<span class="heading-dot">.</span></h1><p>흐름을 놓치지 않고, 여러 작업을 함께.</p></div><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></section>
+    <section class="workspace-header"><div><div class="eyebrow">YOUR AGENTS, IN VIEW</div><h1>세션 그리드<span class="heading-dot">.</span></h1><p>흐름을 놓치지 않고, 여러 작업을 함께.</p></div><div class="workspace-actions"><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div></section>
     <section class="toolbar" aria-label="그리드 도구"><div class="session-summary"><span class="connection-dot"></span><strong id="running-count">0</strong> 실행 중 <span class="divider"></span><span id="total-count">0개 세션</span></div><div class="layout-tools"><button id="search-toggle" class="quiet-button" title="활성 터미널 검색 (Ctrl+Shift+F)">⌕ <span>검색</span></button><span class="divider"></span><span class="layout-label">열</span><div id="column-options" class="segmented" role="group" aria-label="그리드 열 수"><button data-columns="1" aria-label="1열">▯</button><button data-columns="2" class="active" aria-label="2열">▥</button><button data-columns="3" aria-label="3열">▥▯</button><button data-columns="4" aria-label="4열">▥▥</button></div></div></section>
     <div id="runtime-banner" class="runtime-banner" hidden></div>
     <div id="restore-banner" class="restore-banner" hidden><span>저장된 작업 공간이 있습니다. 프로세스는 자동으로 시작하지 않습니다.</span><button id="restore-open" class="quiet-button">저장 세션 보기 →</button></div>
@@ -63,6 +66,7 @@ $('#app').innerHTML = `
 `;
 
 function message(error: unknown) { return error instanceof Error ? error.message : String(error); }
+function projectPath(cwd: string) { return cwd.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '').replace(/\//g, '\\'); }
 function notify(text: string, error = false) {
   const toast = document.createElement('div');
   toast.className = `toast${error ? ' error' : ''}`;
@@ -212,11 +216,12 @@ function renderCounts() {
 
 function renderSide() {
   const projects = new Map<string, number>();
-  for (const session of sessions.values()) projects.set(session.cwd, (projects.get(session.cwd) ?? 0) + 1);
+  for (const project of importedProjects) projects.set(projectPath(project.cwd), 0);
+  for (const session of sessions.values()) { const cwd = projectPath(session.cwd); projects.set(cwd, (projects.get(cwd) ?? 0) + 1); }
   $('#project-count').textContent = String(projects.size);
   $('#projects').replaceChildren();
-  for (const [cwd, count] of projects) { const row = document.createElement('button'); row.className = 'project-row'; const label = document.createElement('span'); label.textContent = cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? cwd; row.title = cwd; const total = document.createElement('small'); total.textContent = String(count); row.append(document.createTextNode('▱ '), label, total); row.onclick = () => { const found = order.find(id => sessions.get(id)?.cwd === cwd); if (found) setActive(found); }; $('#projects').append(row); }
-  if (!projects.size) { const p = document.createElement('p'); p.className = 'side-empty'; p.textContent = '세션을 시작하면 표시됩니다'; $('#projects').append(p); }
+  for (const [cwd, count] of projects) { const row = document.createElement('button'); row.className = 'project-row'; const label = document.createElement('span'); label.textContent = importedProjects.find(project => projectPath(project.cwd) === cwd)?.name ?? cwd.split(/[\\/]/).filter(Boolean).at(-1) ?? cwd; row.title = cwd; const total = document.createElement('small'); total.textContent = String(count); row.append(document.createTextNode('▱ '), label, total); row.onclick = () => void sessionBrowser.open(cwd); $('#projects').append(row); }
+  if (!projects.size) { const p = document.createElement('p'); p.className = 'side-empty'; p.textContent = '폴더를 가져와 작업을 시작하세요'; $('#projects').append(p); }
   $('#session-list').replaceChildren();
   order.forEach((id, index) => { const session = sessions.get(id)!; const button = document.createElement('button'); button.className = `session-link${active === id ? ' active' : ''}`; button.dataset.sessionLink = id; const dot = document.createElement('span'); dot.className = `status-dot ${session.state}`; const label = document.createElement('span'); label.textContent = session.title; const shortcut = document.createElement('small'); shortcut.textContent = index < 9 ? `⌥${index + 1}` : ''; button.append(dot, label, shortcut); button.onclick = () => { if (maximized) maximized = id; renderGrid(); setActive(id); }; $('#session-list').append(button); });
 }
@@ -277,8 +282,22 @@ function renderAll() {
   renderCounts(); renderSide(); renderGrid();
 }
 
-function openCreate() { $('#create-error').hidden = true; $<HTMLDialogElement>('#create-dialog').showModal(); $<HTMLInputElement>('#session-title').focus(); }
-for (const id of ['new-session', 'side-add', 'empty-add']) $(`#${id}`).onclick = openCreate;
+function openCreate(cwd?: string) { $('#create-error').hidden = true; if (cwd) { $<HTMLInputElement>('#session-cwd').value = cwd; $<HTMLInputElement>('#session-thread').value = ''; } $<HTMLDialogElement>('#create-dialog').showModal(); $<HTMLInputElement>('#session-title').focus(); }
+const sessionBrowser = createSessionBrowser({
+  call,
+  projectsChanged(projects) { importedProjects = projects; renderSide(); },
+  async openSession(session) {
+    const existing = [...sessions.values()].find(item => item.threadId === session.id && !['restored', 'stopped', 'exited', 'error', 'stopping'].includes(item.state));
+    if (existing) return existing.id;
+    return (await start({ title: session.title || '이름 없는 세션', cwd: session.cwd, threadId: session.id })).id;
+  },
+  focusSession(id) { if (maximized) maximized = id; renderGrid(); setActive(id); },
+  newSession: openCreate,
+  notify,
+});
+for (const id of ['new-session', 'side-add', 'empty-add']) $(`#${id}`).onclick = () => openCreate();
+$('#catalog-open').onclick = () => void sessionBrowser.open();
+$('#project-import').onclick = () => void sessionBrowser.importProject();
 for (const button of document.querySelectorAll<HTMLElement>('[data-close]')) button.onclick = () => button.closest('dialog')?.close();
 $('#column-options').onclick = event => { const button = (event.target as HTMLElement).closest<HTMLElement>('[data-columns]'); if (button) { columns = Number(button.dataset.columns); maximized = ''; renderGrid(); scheduleSave(); } };
 $('#clear-selection').onclick = () => { selected.clear(); renderAll(); };
@@ -372,6 +391,7 @@ async function initialize() {
     saved = chooseSavedSessions(layout, existing);
     $('#restore-banner').hidden = saved.length === 0;
     $('#connection').textContent = '로컬 연결됨'; renderAll();
+    void sessionBrowser.refreshProjects().catch(error => notify(`프로젝트 목록 조회 실패: ${message(error)}`, true));
   } catch (error) { $('#connection').textContent = '연결 오류'; notify(`초기화 실패: ${message(error)}`, true); }
 }
 
