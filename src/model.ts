@@ -1,3 +1,5 @@
+export const MAX_WORKSPACE_SESSIONS = 32;
+
 export interface SessionInfo {
   id: string;
   generation: number;
@@ -66,11 +68,11 @@ export function parseLayout(value: unknown): Layout | undefined {
   if (!value || typeof value !== 'object') return;
   const v = value as Partial<Layout>;
   if (v.version !== 1 || !Array.isArray(v.sessions)) return;
-  const sizes = (value: unknown) => Array.isArray(value) ? value.slice(0, 16).map(n => typeof n === 'number' && Number.isFinite(n) ? Math.max(0.2, Math.min(10, n)) : 1) : [];
+  const sizes = (value: unknown) => Array.isArray(value) ? value.slice(0, MAX_WORKSPACE_SESSIONS).map(n => typeof n === 'number' && Number.isFinite(n) ? Math.max(0.2, Math.min(10, n)) : 1) : [];
   return {
     version: 1,
     columns: typeof v.columns === 'number' && Number.isFinite(v.columns) ? Math.max(1, Math.min(4, Math.round(v.columns))) : 2,
     columnSizes: sizes(v.columnSizes), rowSizes: sizes(v.rowSizes),
-    sessions: v.sessions.filter(s => s && typeof s.title === 'string' && typeof s.cwd === 'string').slice(0, 16).map(s => ({ title: s.title, cwd: s.cwd, ...(typeof s.threadId === 'string' ? { threadId: s.threadId } : {}) })),
+    sessions: v.sessions.filter(s => s && typeof s.title === 'string' && typeof s.cwd === 'string').slice(0, MAX_WORKSPACE_SESSIONS).map(s => ({ title: s.title, cwd: s.cwd, ...(typeof s.threadId === 'string' ? { threadId: s.threadId } : {}) })),
   };
 }

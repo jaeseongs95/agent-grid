@@ -48,6 +48,18 @@ test('an explicitly empty saved workspace stays empty; only a missing layout fal
   assert.deepEqual(chooseSavedSessions(saved, history), [{ title: 'kept', cwd: 'C:\\kept' }]);
 });
 
+test('all 32 native session identities and row sizes round-trip; oversized layouts are bounded at 32', () => {
+  const sessions = Array.from({ length: 32 }, (_, index) => ({ title: `session-${index}`, cwd: `C:\\project-${index}`, threadId: `thread-${index}` }));
+  const rowSizes = Array.from({ length: 32 }, (_, index) => 1 + index / 32);
+  const value = { version: 1, columns: 1, columnSizes: [1], rowSizes, sessions };
+  const restored = parseLayout(JSON.parse(JSON.stringify(value)));
+  assert.deepEqual(restored?.sessions, sessions);
+  assert.deepEqual(restored?.rowSizes, rowSizes);
+  const oversized = parseLayout({ ...value, rowSizes: [...rowSizes, 2, 3], sessions: [...sessions, { title: 'overflow', cwd: 'C:\\overflow', threadId: 'overflow' }] });
+  assert.deepEqual(oversized?.sessions, sessions);
+  assert.deepEqual(oversized?.rowSizes, rowSizes);
+});
+
 test('broadcast reports partial failure once per target and skips a changed generation or waiting state', async () => {
   const targets = [base, ...['failed', 'restarted', 'waiting'].map(id => ({ ...base, id }))];
   const current = new Map(targets.map(session => [session.id, session]));

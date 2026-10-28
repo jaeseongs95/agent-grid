@@ -38,6 +38,7 @@ struct Harness {
     collector: Option<thread::JoinHandle<()>>,
     errors: Arc<Mutex<Vec<String>>>,
     capture: mpsc::SyncSender<Capture>,
+    sessions_started: Arc<AtomicU64>,
 }
 
 enum Capture { Event(BackendEvent), Barrier(mpsc::Sender<()>) }
@@ -87,14 +88,16 @@ impl Harness {
                 }
             }
         });
-        Ok(Self { engine, output, output_bytes, output_frames, ack, collector_stop, collector: Some(collector), errors, capture: sender })
+        Ok(Self { engine, output, output_bytes, output_frames, ack, collector_stop, collector: Some(collector), errors, capture: sender, sessions_started: Arc::new(AtomicU64::new(0)) })
     }
 
     fn start(&self, script: &str) -> Result<SessionInfo, String> {
         let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
         let mut command = shell(script)?;
         command.cwd(&cwd);
-        self.engine.start_fixture(StartRequest { cwd: cwd.to_string_lossy().into_owned(), title: "Headless PTY fixture".into(), thread_id: None, cols: 100, rows: 30 }, command)
+        let info = self.engine.start_fixture(StartRequest { cwd: cwd.to_string_lossy().into_owned(), title: "Headless PTY fixture".into(), thread_id: None, cols: 100, rows: 30 }, command)?;
+        self.sessions_started.fetch_add(1, Ordering::Relaxed);
+        Ok(info)
     }
 
     fn barrier(&self) -> Result<(), String> {
@@ -108,6 +111,18 @@ impl Harness {
         // the renderer fixture consumed all earlier output before we inspect it.
         self.barrier()?;
         Ok(self.output.lock().unwrap().remove(&info.id).unwrap_or_default())
+    }
+
+    fn wait_output(&self, info: &SessionInfo, marker: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.output.lock().unwrap().get(&info.id).is_some_and(|text| text.contains(marker)) { return Ok(()); }
+            if Instant::now() >= deadline {
+                let output = self.take_output(info)?;
+                return Err(format!("fixture readiness marker {marker:?} was not observed; pure-fixture output tail={}", fixture_tail(&output)));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn isolation(&self, count: usize) -> Result<u64, String> {
@@ -140,13 +155,15 @@ impl Harness {
 
     fn generation_and_lifecycle(&self) -> Result<u64, String> {
         let marker = format!("input_한글_🦀_{}", Uuid::new_v4().simple());
-        let script = if cfg!(windows) { "$line = [Console]::ReadLine(); [Console]::WriteLine('received:' + $line)" } else { "read line; printf 'received:%s\\n' \"$line\"" };
+        let script = if cfg!(windows) { "[Console]::WriteLine('input-ready; encodings=' + [Console]::InputEncoding.CodePage + '/' + [Console]::OutputEncoding.CodePage); $line = [Console]::ReadLine(); [Console]::WriteLine('received:' + $line)" } else { "printf 'input-ready\\n'; read line; printf 'received:%s\\n' \"$line\"" };
         let session = self.start(script)?;
+        self.wait_output(&session, "input-ready", Duration::from_secs(20))?;
         let stale = session.generation + 1;
         if self.engine.write(&session.id, stale, "bad").is_ok() || self.engine.resize(&session.id, stale, 90, 20).is_ok() || self.engine.stop(&session.id, stale).is_ok() || self.engine.acknowledge(&session.id, stale, 1).is_ok() { return Err("stale generation request was accepted".into()); }
         self.engine.write(&session.id, session.generation, &(marker.clone() + "\r\n"))?;
         self.engine.wait_for_exit(&session.id, session.generation, Duration::from_secs(30))?;
-        if !self.take_output(&session)?.contains(&("received:".to_string() + &marker)) { return Err("PTY input did not reach the correct process".into()); }
+        let output = self.take_output(&session)?;
+        if !output.contains(&("received:".to_string() + &marker)) { return Err(format!("PTY input did not reach the correct process; expected={marker:?}; pure-fixture output tail={}", fixture_tail(&output))); }
         let slow = self.start(if cfg!(windows) { "Start-Sleep -Seconds 60" } else { "sleep 60" })?;
         self.engine.stop(&slow.id, slow.generation)?;
         self.engine.stop(&slow.id, slow.generation)?; // idempotent cleanup
@@ -351,12 +368,20 @@ fn memory_sample(start: Instant) -> MemorySample {
     sample
 }
 
+fn fixture_tail(output: &str) -> String {
+    // Only call for deterministic local fixture text, never actual vendor TUI.
+    let tail: String = output.chars().rev().take(4096).collect::<Vec<_>>().into_iter().rev().collect();
+    serde_json::to_string(&tail).unwrap_or_else(|_| "\"fixture tail serialization failed\"".into())
+}
+
 fn suite(duration: Duration) -> Report {
     let start = Instant::now();
     let mut report = Report { schema: "agent-grid-self-test-v1", tests: 0, pass: 0, fail: 0, duration_seconds: 0.0, iterations: 0, sessions_started: 0, output_frames: 0, output_bytes: 0, sample_memory: vec![memory_sample(start)], errors: Vec::new(), scope: "Headless native PTY fixtures only. No GUI, vendor protocol, model API, or user-config validation." };
+    let mut counters = None;
     let result = (|| -> Result<(), String> {
         process_job::install_app_job()?;
         let mut harness = Harness::new()?;
+        counters = Some((harness.sessions_started.clone(), harness.output_frames.clone(), harness.output_bytes.clone()));
         for count in [2, 8, 16] {
             report.tests += 1;
             report.sessions_started += harness.isolation(count)?;
@@ -401,6 +426,11 @@ fn suite(duration: Duration) -> Report {
         Ok(())
     })();
     if let Err(error) = result { report.fail += 1; report.errors.push(error); }
+    if let Some((sessions, frames, bytes)) = counters {
+        report.sessions_started = sessions.load(Ordering::Acquire);
+        report.output_frames = frames.load(Ordering::Acquire);
+        report.output_bytes = bytes.load(Ordering::Acquire);
+    }
     report.sample_memory.push(memory_sample(start));
     report.duration_seconds = start.elapsed().as_secs_f64();
     report

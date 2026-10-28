@@ -57,6 +57,7 @@ jobs:
           name: validation-evidence
           path: |
             src-tauri/Cargo.lock
+            src-tauri/target/debug/agent-grid.exe
             test-results/
             artifacts/self-test.json
           if-no-files-found: warn

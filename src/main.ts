@@ -5,7 +5,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
-import { acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo } from './model';
+import { MAX_WORKSPACE_SESSIONS, acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo } from './model';
 
 const native = isTauri();
 const demo = !native && new URLSearchParams(location.search).has('demo');
@@ -29,6 +29,7 @@ let saveQueue = Promise.resolve();
 let notificationCount = 0;
 let dragging = '';
 let searchVisible = false;
+let pendingStarts = 0;
 
 $('#app').innerHTML = `
   <aside class="sidebar">
@@ -295,7 +296,18 @@ $('#broadcast-form').onsubmit = async event => {
   input.disabled = false; renderCounts();
 };
 
-async function start(request: SavedSession) { const info = await call<SessionInfo>('start_session', { request: { ...request, cols: 100, rows: 30 } }); if ((sessions.get(info.id)?.generation ?? -1) < info.generation) receiveSession(info); setActive(info.id); queueResize(info.id); return info; }
+async function start(request: SavedSession) {
+  // Reserve a slot before awaiting IPC so simultaneous restore clicks cannot exceed persistence capacity.
+  if (sessions.size + pendingStarts >= MAX_WORKSPACE_SESSIONS) throw new Error(`작업 공간에는 시작 중인 세션을 포함해 최대 ${MAX_WORKSPACE_SESSIONS}개를 표시할 수 있습니다. 완료된 세션을 닫은 뒤 다시 시작하세요.`);
+  pendingStarts++;
+  try {
+    const info = await call<SessionInfo>('start_session', { request: { ...request, cols: 100, rows: 30 } });
+    if ((sessions.get(info.id)?.generation ?? -1) < info.generation) receiveSession(info);
+    setActive(info.id);
+    queueResize(info.id);
+    return info;
+  } finally { pendingStarts--; }
+}
 $('#create-form').onsubmit = async event => {
   event.preventDefault(); const button = $<HTMLButtonElement>('#create-submit'); button.disabled = true;
   const threadId = $<HTMLInputElement>('#session-thread').value.trim();
