@@ -187,7 +187,7 @@ impl<S: Read + Write> Rpc<S> {
     }
 }
 
-fn connect(endpoint: &str, token: &str, server: &mut Child) -> Result<Rpc<TcpStream>, String> {
+fn connect(endpoint: &str, token: &str, server: &mut Child, job: &ProcessJob) -> Result<Rpc<TcpStream>, String> {
     let address = endpoint.trim_start_matches("ws://").parse().map_err(|e| format!("Invalid loopback endpoint: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
@@ -195,6 +195,10 @@ fn connect(endpoint: &str, token: &str, server: &mut Child) -> Result<Rpc<TcpStr
             return Err(format!("Codex app-server exited before connecting ({status}); verify the CLI supports authenticated WebSockets"));
         }
         if let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) {
+            // Authenticate the OS peer before constructing or sending a bearer credential.
+            // A released ephemeral port may have been claimed by an unrelated listener.
+            job.verify_tcp_peer(&stream)
+                .map_err(|error| format!("Codex app-server TCP peer ownership verification failed: {error}"))?;
             stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
             stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
             let mut request = endpoint.into_client_request().map_err(|e| e.to_string())?;
@@ -210,6 +214,12 @@ fn connect(endpoint: &str, token: &str, server: &mut Child) -> Result<Rpc<TcpStr
         if Instant::now() >= deadline { return Err("Codex app-server did not become ready within 12 seconds".into()); }
         thread::sleep(Duration::from_millis(80));
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn verify_connect_peer_fixture(endpoint: &str, server: &mut Child, job: &ProcessJob) -> Result<(), String> {
+    // Exercise the real connection path: the unrelated fixture listener must receive zero HTTP bytes.
+    connect(endpoint, "agent-grid-port-preemption-fixture", server, job).map(|_| ())
 }
 
 fn verified_thread(thread: &Value, requested: &str, cwd: &Path) -> Result<(), String> {
@@ -278,7 +288,8 @@ pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEv
     };
     session.job = Some(ProcessJob::assign_std(&session.server)?);
     session._launch_gate.release()?;
-    let mut rpc = connect(&endpoint, &token, &mut session.server)?;
+    let job = session.job.as_ref().ok_or("Codex server has no owned process job")?;
+    let mut rpc = connect(&endpoint, &token, &mut session.server, job)?;
     rpc.call("initialize", initialize())?;
     rpc.send(json!({"method":"initialized","params":{}}))?;
     if let Some(id) = thread_id {
