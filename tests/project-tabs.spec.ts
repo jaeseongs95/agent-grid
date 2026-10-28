@@ -205,6 +205,7 @@ for (const back of [false, true]) test(`queued direct and broadcast input stays 
   await page.evaluate(() => { (window as any).tabsFixture.holdNextWrite = true; });
   await card(page, 'a1').locator('.xterm-helper-textarea').press('x');
   await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => call.command === 'session_write').length)).toBe(1);
+  await card(page, 'a1').locator('.xterm-helper-textarea').press('y');
   await card(page, 'a1').getByLabel('선택 전송 대상', { exact: true }).check();
   await page.locator('#broadcast-input').fill('must-not-send');
   await page.locator('#broadcast-send').click();
@@ -215,7 +216,6 @@ for (const back of [false, true]) test(`queued direct and broadcast input stays 
   const writes = await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => call.command === 'session_write').map((call: any) => call.args.data));
   expect(writes).toEqual(['x']);
 });
-  await card(page, 'a1').locator('.xterm-helper-textarea').press('y');
 
 for (const ownedThread of [false, true]) test(`late catalog ${ownedThread ? 'owned refresh' : 'new start'} cannot change the project chosen after close`, async ({ page }) => {
   await workspace(page);
