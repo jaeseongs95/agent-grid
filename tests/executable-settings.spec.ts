@@ -20,7 +20,7 @@ async function mockSettings(page: Page, options: { holdChoose?: boolean; unavail
         if (command.startsWith('plugin:event|')) return callback;
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: [] };
         if (command === 'list_projects') return [];
-        if (command === 'list_sessions') return [{ id: 'live-owned', generation: 9, title: '열린 작업', cwd: 'D:\\fixture', threadId: '01900000-0000-7000-8000-000000000001', state: 'idle' }];
+        if (command === 'list_sessions') return [{ id: 'live-owned', generation: 9, title: '열린 작업', cwd: 'D:\\fixture', threadId: '01900000-0000-7000-8000-000000000001', state: 'idle', active: true }];
         if (command === 'get_codex_settings') { if (fixture.getFailure) throw new Error('설정 파일을 읽을 수 없습니다'); return fixture.settings; }
         if (command === 'choose_codex_executable') {
           const choice = ++fixture.choices;

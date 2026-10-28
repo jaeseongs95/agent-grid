@@ -117,9 +117,13 @@ function setActive(id: string, focus = true) {
 
 function sendInput(id: string, data: string) {
   const session = sessions.get(id); const view = terminals.get(id);
-  if (!session || !view || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(session.state)) return;
+  if (!session || !session.active || !view || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(session.state)) return;
   const generation = session.generation;
-  view.input = view.input.then(() => call<void>('session_write', { id, generation, data })).catch(error => notify(`${session.title} 입력 실패: ${message(error)}`, true));
+  view.input = view.input.then(() => {
+    const current = sessions.get(id);
+    if (!current?.active || current.generation !== generation || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(current.state)) return;
+    return call<void>('session_write', { id, generation, data });
+  }).catch(error => notify(`${session.title} 입력 실패: ${message(error)}`, true));
 }
 
 function queueResize(id: string) {
@@ -128,7 +132,7 @@ function queueResize(id: string) {
   view.resizeTimer = setTimeout(() => {
     view.resize = view.resize.then(async () => {
       const current = sessions.get(id);
-      if (!current || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(current.state)) return;
+      if (!current || !current.active || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(current.state)) return;
       await call('session_resize', { id, generation: current.generation, cols: view.terminal.cols, rows: view.terminal.rows });
     }).catch(error => notify(`터미널 크기 변경 실패: ${message(error)}`, true));
   }, 60);
@@ -221,7 +225,7 @@ function receiveOutput(output: Output) {
 }
 
 function renderCounts() {
-  const live = [...sessions.values()].filter(session => !['restored', 'stopped', 'exited', 'error'].includes(session.state)).length;
+  const live = [...sessions.values()].filter(session => session.active).length;
   $('#running-count').textContent = String(live); $('#total-count').textContent = `${sessions.size}개 세션`; $('#side-count').textContent = String(sessions.size);
   const targets = broadcastTargets([...sessions.values()], selected);
   $('#selected-count').textContent = selected.size ? `${selected.size}개 선택 · 전송 가능 ${targets.length}개` : '선택한 세션이 없습니다';
@@ -339,21 +343,43 @@ async function start(request: SavedSession) {
   if (request.threadId) {
     const pending = pendingThreads.get(request.threadId);
     if (pending) return pending;
-    const existing = [...sessions.values()].find(item => item.threadId === request.threadId && !['restored', 'stopped', 'exited'].includes(item.state));
-    if (existing) { if (maximized) maximized = existing.id; renderGrid(); setActive(existing.id); return existing; }
   }
-  // Reserve a slot before awaiting IPC so simultaneous restore clicks cannot exceed persistence capacity.
-  if (sessions.size + pendingStarts >= MAX_WORKSPACE_SESSIONS) throw new Error(`작업 공간에는 시작 중인 세션을 포함해 최대 ${MAX_WORKSPACE_SESSIONS}개를 표시할 수 있습니다. 완료된 세션을 닫은 뒤 다시 시작하세요.`);
-  pendingStarts++;
-  const operation = (async () => {
+  let reserved = false;
+  // Register the shared promise before its first ownership query can start.
+  const operation = Promise.resolve().then(async () => {
     try {
-      const info = await call<SessionInfo>('start_session', { request: { ...request, cols: 100, rows: 30 } });
-      if ((sessions.get(info.id)?.generation ?? -1) < info.generation) receiveSession(info);
-      setActive(info.id);
-      queueResize(info.id);
-      return info;
-    } finally { pendingStarts--; if (request.threadId) pendingThreads.delete(request.threadId); }
-  })();
+      const existing = request.threadId && [...sessions.values()].find(item => item.threadId === request.threadId && item.active);
+      if (existing) {
+        let latest: SessionInfo[];
+        try { latest = await call<SessionInfo[]>('list_sessions'); }
+        catch (error) { throw new Error(`실행 중 세션 확인 실패: ${message(error)}`); }
+        for (const info of latest) if (sessions.has(info.id)) receiveSession(info);
+        const owned = latest.find(info => info.threadId === request.threadId && info.active);
+        if (owned) {
+          receiveSession(owned);
+          if (sessions.get(owned.id)?.active) { if (maximized) maximized = owned.id; renderGrid(); setActive(owned.id); return owned; }
+        }
+      }
+      // Reserve capacity only for a new native process, after reconciling any existing card.
+      if (sessions.size + pendingStarts >= MAX_WORKSPACE_SESSIONS) throw new Error(`작업 공간에는 시작 중인 세션을 포함해 최대 ${MAX_WORKSPACE_SESSIONS}개를 표시할 수 있습니다. 완료된 세션을 닫은 뒤 다시 시작하세요.`);
+      pendingStarts++; reserved = true;
+      try {
+        const info = await call<SessionInfo>('start_session', { request: { ...request, cols: 100, rows: 30 } });
+        if (!info.active || (sessions.get(info.id)?.generation ?? -1) < info.generation) receiveSession(info);
+        setActive(info.id);
+        queueResize(info.id);
+        return info;
+      } catch (error) {
+        if (!native) throw error;
+        try {
+          // The cleanup event can arrive after the rejected IPC. Reconcile owned cards before allowing retry.
+          const latest = await call<SessionInfo[]>('list_sessions');
+          for (const info of latest) if (sessions.has(info.id)) receiveSession(info);
+        } catch (refreshError) { throw new Error(`${message(error)} · 세션 상태 확인 실패: ${message(refreshError)}`); }
+        throw error;
+      }
+    } finally { if (reserved) pendingStarts--; if (request.threadId) pendingThreads.delete(request.threadId); }
+  });
   if (request.threadId) pendingThreads.set(request.threadId, operation);
   return operation;
 }
@@ -426,7 +452,7 @@ function seedDemo() {
     { title: '회귀 테스트', cwd: 'C:\\workspace\\orbit-api', state: 'running', lines: ['\x1b[38;5;141m╭─ agent · local workspace\x1b[0m', '', '\x1b[90m›\x1b[0m 변경된 API의 회귀 테스트를 확인해 주세요.', '', '\x1b[38;5;110m●\x1b[0m 테스트 시나리오를 검토하고 있습니다.', '', '  \x1b[90mInspect\x1b[0m  tests/project.test.ts', '  \x1b[90mInspect\x1b[0m  tests/auth.test.ts', '', '\x1b[38;5;114m✓\x1b[0m 권한 경계와 잘못된 입력 사례 확인', '\x1b[38;5;110m◌\x1b[0m 타임아웃 경로 분석 중…'] },
     { title: '릴리스 노트', cwd: 'C:\\workspace\\orbit-docs', state: 'waiting', lines: ['\x1b[38;5;141m╭─ agent · local workspace\x1b[0m', '', '\x1b[90m›\x1b[0m 이번 변경의 릴리스 노트를 준비해 주세요.', '', '\x1b[38;5;179m●\x1b[0m 확인이 필요합니다.', '', '  공개 문서에 포함할 변경 범위를 선택해 주세요.', '', '  \x1b[38;5;179m1.\x1b[0m 사용자에게 보이는 변경만 포함', '  \x1b[90m2.\x1b[0m 개발자 변경 내역도 포함', '', '\x1b[90m  응답을 기다리고 있습니다…\x1b[0m'] },
   ];
-  examples.forEach((example, index) => { const id = `demo-${index}`; receiveSession({ ...example, id, generation: 1 }, false); terminals.get(id)!.terminal.write(example.lines.join('\r\n')); });
+  examples.forEach((example, index) => { const id = `demo-${index}`; receiveSession({ ...example, id, generation: 1, active: true }, false); terminals.get(id)!.terminal.write(example.lines.join('\r\n')); });
   setActive('demo-0', false);
 }
 

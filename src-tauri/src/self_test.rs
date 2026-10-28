@@ -166,10 +166,11 @@ impl Harness {
         let script = if cfg!(windows) { "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::WriteLine('input-ready; encodings=' + [Console]::InputEncoding.CodePage + '/' + [Console]::OutputEncoding.CodePage + ';term=' + $env:TERM + ';color=' + $env:COLORTERM); $line = [Console]::ReadLine(); [Console]::WriteLine('received:' + $line)" } else { "printf 'input-ready;term=%s;color=%s\\n' \"$TERM\" \"$COLORTERM\"; read line; printf 'received:%s\\n' \"$line\"" };
         let session = self.start(script)?;
         self.wait_output(&session, "input-ready", Duration::from_secs(20))?;
+        if !self.engine.list()?.iter().any(|info| info.id == session.id && info.active) { return Err("live PTY has no active ownership".into()); }
         let stale = session.generation + 1;
         if self.engine.write(&session.id, stale, "bad").is_ok() || self.engine.resize(&session.id, stale, 90, 20).is_ok() || self.engine.stop(&session.id, stale).is_ok() || self.engine.acknowledge(&session.id, stale, 1).is_ok() { return Err("stale generation request was accepted".into()); }
         self.engine.write(&session.id, session.generation, &(marker.clone() + "\r\n"))?;
-        self.engine.wait_for_exit(&session.id, session.generation, Duration::from_secs(30))?;
+        if self.engine.wait_for_exit(&session.id, session.generation, Duration::from_secs(30))?.active { return Err("reaped PTY retained active ownership".into()); }
         let output = self.take_output(&session)?;
         if !output.contains("term=xterm-256color;color=truecolor") { return Err(format!("PTY did not override the fixture's dumb terminal capabilities; pure-fixture output tail={}", fixture_tail(&output))); }
         if !output.contains(&("received:".to_string() + &marker)) { return Err(format!("PTY input did not reach the correct process; expected={marker:?}; pure-fixture output tail={}", fixture_tail(&output))); }
@@ -178,11 +179,11 @@ impl Harness {
         self.engine.stop(&slow.id, slow.generation)?; // idempotent cleanup
         let info = self.engine.wait_for_exit(&slow.id, slow.generation, Duration::from_secs(2))?;
         self.take_output(&slow)?;
-        if info.state != "stopped" { return Err("stopped process has an invalid final state".into()); }
+        if info.state != "stopped" || info.active { return Err("stopped process has an invalid final state or active ownership".into()); }
         let failure = self.start("exit 7")?;
         let info = self.engine.wait_for_exit(&failure.id, failure.generation, Duration::from_secs(30))?;
         self.take_output(&failure)?;
-        if info.state != "error" { return Err("nonzero child exit was not reported as an error".into()); }
+        if info.state != "error" || info.active { return Err("nonzero child exit was not reported as an inactive error".into()); }
         Ok(3)
     }
 

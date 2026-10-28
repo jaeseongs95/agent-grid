@@ -2,13 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, updateSession, type SessionInfo } from './model.ts';
 
-const base: SessionInfo = { id: 'owned', generation: 2, title: 'test', cwd: 'C:\\work', state: 'running' };
+const base: SessionInfo = { id: 'owned', generation: 2, title: 'test', cwd: 'C:\\work', state: 'running', active: true };
 
 test('late process generations and duplicate output cannot replace or write to the current terminal', () => {
   const current = { ...base, seq: 10 };
   assert.equal(updateSession(current, { ...base, generation: 1, state: 'stopped' }), current);
   assert.equal(updateSession(current, { ...base, state: 'idle' }).seq, 10);
   assert.equal(updateSession(current, { ...base, generation: 3 }).seq, -1);
+  const finished = updateSession(current, { ...base, state: 'error', active: false });
+  assert.equal(updateSession(finished, { ...base, state: 'idle', active: true }), finished);
+  assert.equal(updateSession(finished, { ...base, generation: 3, state: 'starting', active: true }).active, true);
   for (const output of [
     { id: base.id, generation: 1, seq: 11, data: 'old process' },
     { id: base.id, generation: 3, seq: 11, data: 'future process' },

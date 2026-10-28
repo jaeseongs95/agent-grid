@@ -18,6 +18,8 @@ pub struct SessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub state: String,
+    #[serde(default)]
+    pub active: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,7 +113,12 @@ struct Session {
     store: Arc<Mutex<Store>>,
 }
 impl Session {
-    fn info(&self) -> Result<SessionInfo, String> { self.info.lock().map(|i| i.clone()).map_err(|_| "session metadata lock poisoned".into()) }
+    fn info(&self) -> Result<SessionInfo, String> {
+        let guard = self.info.lock().map_err(|_| "session metadata lock poisoned")?;
+        let mut info = guard.clone();
+        if self.phase.load(Ordering::Acquire) == 3 { info.active = false; }
+        Ok(info)
+    }
 
     fn update(&self, change: impl FnOnce(&mut SessionInfo), status_only: bool) -> Result<(), String> {
         let snapshot = {
@@ -132,7 +139,9 @@ impl Session {
         if result.is_err() {
             // Persistence/delivery failure is surfaced as an error state, never
             // reported as successfully persisted metadata. No token or output logged.
-            let snapshot = if let Ok(mut info) = self.info.lock() { info.state = "error".into(); Some(info.clone()) } else { None };
+            let snapshot = if let Ok(mut info) = self.info.lock() {
+                if self.phase.load(Ordering::Acquire) < 2 { info.state = "error".into(); Some(info.clone()) } else { None }
+            } else { None };
             if let Some(info) = snapshot { let _ = (self.sink)(BackendEvent::Changed(info)); }
         }
     }
@@ -152,8 +161,12 @@ impl Session {
     }
 
     fn finish(&self, state: &str) -> Result<(), String> {
-        self.phase.store(3, Ordering::Release);
-        let result = self.update(|info| info.state = state.into(), false);
+        let result = self.update(|info| {
+            // Publish process ownership and completion together under info's lock.
+            self.phase.store(3, Ordering::Release);
+            info.active = false;
+            info.state = state.into();
+        }, false);
         let mut done = self.done.0.lock().map_err(|_| "session completion lock poisoned")?;
         *done = true;
         self.done.1.notify_all();
@@ -210,7 +223,7 @@ impl Engine {
             if let Some(id) = sessions.iter().find(|(_, session)| session.phase.load(Ordering::Acquire) == 3).map(|(id, _)| id.clone()) { sessions.remove(&id); }
             else { return Err("session metadata limit reached".into()); }
         }
-        let info = SessionInfo { id: Uuid::new_v4().to_string(), generation: 1, title: request.title.clone(), cwd: cwd.to_string_lossy().into_owned(), thread_id: request.thread_id.clone(), state: "starting".into() };
+        let info = SessionInfo { id: Uuid::new_v4().to_string(), generation: 1, title: request.title.clone(), cwd: cwd.to_string_lossy().into_owned(), thread_id: request.thread_id.clone(), state: "starting".into(), active: true };
         {
             let store = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?;
             store.save_session(&info)?;
@@ -440,6 +453,93 @@ impl Engine {
 fn size(cols: u16, rows: u16) -> PtySize { PtySize { cols, rows, pixel_width: 0, pixel_height: 0 } }
 fn validate_size(cols: u16, rows: u16) -> Result<(), String> {
     if !(2..=1000).contains(&cols) || !(1..=1000).contains(&rows) { Err("terminal size must be 2..1000 columns and 1..1000 rows".into()) } else { Ok(()) }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn request() -> StartRequest {
+        StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), thread_id: None, cols: 80, rows: 24 }
+    }
+
+    #[test]
+    fn active_ownership_survives_observation_errors_and_stopping_until_finish() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(move |event| { sender.send(event).map_err(|e| e.to_string()) })).unwrap();
+        let session = engine.allocate(&request()).unwrap();
+        assert_eq!(session.phase.load(Ordering::Acquire), 0);
+        assert!(session.info().unwrap().active);
+        assert_eq!(session.info().unwrap().state, "starting");
+        session.phase.store(1, Ordering::Release); // Adapter observation with a live owner.
+        session.observe(CodexEvent::Status("error".into()));
+        assert_eq!(session.phase.load(Ordering::Acquire), 1);
+        assert!(session.info().unwrap().active);
+        assert_eq!(session.info().unwrap().state, "error");
+
+        let stopping = session.clone();
+        let stopper = thread::spawn(move || stopping.stop());
+        loop {
+            if let BackendEvent::Changed(info) = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
+                if info.state == "stopping" { assert!(info.active); break; }
+            }
+        }
+        assert_eq!(session.phase.load(Ordering::Acquire), 2);
+        assert!(session.info().unwrap().active);
+        session.observe(CodexEvent::Status("idle".into()));
+        assert_eq!(session.info().unwrap().state, "stopping");
+        session.finish("stopped").unwrap();
+        stopper.join().unwrap().unwrap();
+        assert_eq!(session.phase.load(Ordering::Acquire), 3);
+        assert!(!session.info().unwrap().active);
+        session.observe(CodexEvent::Status("error".into()));
+        assert_eq!(session.info().unwrap().state, "stopped");
+        assert!(!engine.list().unwrap()[0].active);
+    }
+
+    #[test]
+    fn failed_start_releases_ownership_and_reaped_projection_is_inactive() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let missing = std::env::temp_dir().join(format!("missing-agent-grid-{}.exe", Uuid::new_v4()));
+        engine.inner.store.lock().unwrap().set_codex_executable(Some(missing.to_str().unwrap())).unwrap();
+        assert!(engine.start(request()).is_err());
+        let failed = engine.list().unwrap().pop().unwrap();
+        assert_eq!(failed.state, "error");
+        assert!(!failed.active);
+        assert_eq!(engine.lookup(&failed.id, failed.generation).unwrap().phase.load(Ordering::Acquire), 3);
+        let preparing = engine.allocate(&request()).unwrap();
+        assert!(preparing.info().unwrap().active);
+        preparing.phase.store(3, Ordering::Release);
+        assert!(!preparing.info().unwrap().active);
+        preparing.finish("error").unwrap();
+    }
+
+    #[test]
+    fn persisted_active_metadata_restores_with_no_process_ownership() {
+        let directory = std::env::temp_dir().join(format!("agent-grid-lifetime-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let database = directory.join("workspace.sqlite3");
+        let id = {
+            let engine = Engine::new(&database, Arc::new(|_| Ok(()))).unwrap();
+            let preparing = engine.allocate(&request()).unwrap();
+            assert!(preparing.info().unwrap().active);
+            preparing.info().unwrap().id
+        };
+        let restored = Engine::new(&database, Arc::new(|_| Ok(()))).unwrap();
+        let session = restored.lookup(&id, 1).unwrap();
+        assert_eq!(session.phase.load(Ordering::Acquire), 3);
+        assert_eq!(session.info().unwrap().state, "restored");
+        assert!(!session.info().unwrap().active);
+        assert!(session.process.lock().unwrap().is_none());
+        assert!(*session.done.0.lock().unwrap());
+        drop(session);
+        drop(restored);
+        for file in ["workspace.sqlite3-wal", "workspace.sqlite3-shm", "workspace.sqlite3"] {
+            let path = directory.join(file);
+            if path.exists() { std::fs::remove_file(path).unwrap(); }
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
 }
 
 #[cfg(all(test, windows))]

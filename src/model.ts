@@ -7,6 +7,7 @@ export interface SessionInfo {
   cwd: string;
   threadId?: string;
   state: string;
+  active: boolean;
 }
 
 export interface Output {
@@ -21,6 +22,8 @@ export interface Session extends SessionInfo { seq: number }
 // A stale generation must never overwrite a newer process or feed its terminal.
 export function updateSession(previous: Session | undefined, next: SessionInfo): Session {
   if (previous && next.generation < previous.generation) return previous;
+  // Cleanup is terminal for this generation; a delayed status snapshot cannot revive ownership.
+  if (previous?.generation === next.generation && previous.active === false && next.active) return previous;
   return { ...next, seq: previous?.generation === next.generation ? previous.seq : -1 };
 }
 

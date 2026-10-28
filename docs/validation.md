@@ -39,6 +39,12 @@ admission guard. Native executable-selection checks run separately against an
 isolated packaged app through `AGENT_GRID_NATIVE_EXECUTABLE_PICKER=1`; final
 native results and source identifiers belong in the release notes.
 
+Runtime ownership is separate from the observed Codex status: a live error or
+stopping session remains active, while a reaped failed start is inactive and can
+be retried. Cleanup is terminal within a generation; delayed status events cannot
+reactivate it. A rejected start reconciles native ownership before releasing its
+pending slot, including when the cleanup event arrives after the rejection.
+
 ## Earlier core baseline
 
 The results below describe the baseline packaged application at

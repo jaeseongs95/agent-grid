@@ -3,21 +3,32 @@ import { test, expect, type Page } from '@playwright/test';
 const alpha = { id: '01900000-0000-7000-8000-000000000001', title: 'API 구조 개선', cwd: 'D:\\프로젝트\\api', createdAt: 1700000000, updatedAt: 1700000200, status: 'idle' };
 const beta = { ...alpha, id: '01900000-0000-7000-8000-000000000002', title: '회귀 테스트 점검', updatedAt: 1700000300 };
 
-async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; holdStart?: boolean; failStartOnce?: boolean; owned?: boolean; ownedState?: string; saved?: boolean; pages?: boolean; titleOverride?: string } = {}) {
+async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; holdStart?: boolean; failStartOnce?: boolean; holdInitialEvent?: boolean; holdOwnershipRefresh?: boolean; holdFailureEvent?: boolean; failStatusRefresh?: boolean; finishStartEarly?: boolean; owned?: boolean; ownedState?: string; saved?: boolean; pages?: boolean; titleOverride?: string } = {}) {
   await page.addInitScript(({ alpha, beta, options }) => {
     const state = window as any;
     state.isTauri = true;
-    state.fixture = { calls: [], active: 0, maxActive: 0, chooseCount: 0, created: 0, releaseSearch: () => {}, releasePreview: () => {}, releaseStart: () => {} };
+    state.fixture = { calls: [], events: [], active: 0, maxActive: 0, chooseCount: 0, created: 0, ownershipReads: 0, releaseOwnership: () => {}, releaseStarting: () => {}, releaseSearch: () => {}, releasePreview: () => {}, releaseStart: () => {}, releaseFailure: () => {} };
     let callback = 0;
+    const callbacks = new Map<number, (event: any) => void>();
+    const listeners = new Map<string, (event: any) => void>();
+    state.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     state.__TAURI_INTERNALS__ = {
-      transformCallback: () => ++callback,
+      transformCallback(handler: (event: any) => void) { callbacks.set(++callback, handler); return callback; },
       unregisterCallback() {},
       async invoke(command: string, args: any = {}) {
         const fixture = state.fixture;
         fixture.calls.push({ command, args });
+        if (command === 'plugin:event|listen') { listeners.set(args.event, callbacks.get(args.handler)!); return callback; }
         if (command.startsWith('plugin:event|')) return callback;
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: options.saved ? [{ title: alpha.title, cwd: alpha.cwd, threadId: alpha.id }] : [] };
-        if (command === 'list_sessions') return options.owned ? [{ id: 'owned-alpha', generation: 1, title: alpha.title, cwd: alpha.cwd, threadId: alpha.id, state: options.ownedState ?? 'idle' }] : [];
+        if (command === 'list_sessions') {
+          if (fixture.created === 1 && options.failStartOnce) {
+            if (fixture.ownershipReads++ > 0 && options.holdOwnershipRefresh) await new Promise<void>(resolve => { fixture.releaseOwnership = resolve; });
+            if (options.failStatusRefresh) throw new Error('상태 조회 연결 오류');
+            return [{ id: 'created-1', generation: 1, title: alpha.title, cwd: alpha.cwd, threadId: alpha.id, state: 'error', active: false }];
+          }
+          return options.owned ? [{ id: 'owned-alpha', generation: 1, title: alpha.title, cwd: alpha.cwd, threadId: alpha.id, state: options.ownedState ?? 'idle', active: true }] : [];
+        }
         if (command === 'list_projects') return JSON.parse(localStorage.getItem('fixture-projects') || '[]');
         if (command === 'choose_project') {
           fixture.chooseCount++;
@@ -47,9 +58,28 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
         if (command === 'start_session') {
           if (new TextEncoder().encode(args.request.title).byteLength > 512 || /\p{Cc}/u.test(args.request.title)) throw new Error('title must be at most 512 bytes without control characters');
           const created = ++fixture.created;
-          if (options.failStartOnce && created === 1) throw new Error('실행 파일을 시작하지 못했습니다');
+          if (options.finishStartEarly) {
+            const payload = { ...args.request, id: 'created-' + created, generation: 1, state: 'starting', active: true };
+            listeners.get('session-changed')!({ event: 'session-changed', id: 1, payload });
+            return { ...payload, state: 'exited', active: false };
+          }
+          if (options.failStartOnce && created === 1) {
+            const emit = (sessionState: string, active: boolean) => {
+              const payload = { ...args.request, id: 'created-1', generation: 1, state: sessionState, active };
+              fixture.events.push(payload);
+              listeners.get('session-changed')!({ event: 'session-changed', id: 1, payload });
+            };
+            fixture.releaseStarting = () => emit('starting', true);
+            if (!options.holdInitialEvent) emit('starting', true);
+            fixture.releaseFailure = () => emit('error', false);
+            if (!options.holdFailureEvent) {
+              emit('error', false);
+              emit('idle', true); // An earlier status snapshot arrives after the cleanup event.
+            }
+            throw new Error('실행 파일을 시작하지 못했습니다');
+          }
           if (options.holdStart && created === 1) await new Promise<void>(resolve => { fixture.releaseStart = resolve; });
-          return { ...args.request, id: 'created-' + created, generation: 1, state: 'idle', threadId: args.request.threadId || '01900000-0000-7000-8000-000000000003' };
+          return { ...args.request, id: 'created-' + created, generation: 1, state: 'idle', active: true, threadId: args.request.threadId || '01900000-0000-7000-8000-000000000003' };
         }
         return null;
       },
@@ -173,6 +203,7 @@ for (const state of ['error', 'stopping'] as const) {
   test(`already owned ${state} session is focused without starting a duplicate`, async ({ page }) => {
     await mockNative(page, { owned: true, ownedState: state });
     await expect(page.locator('.terminal-card')).toHaveCount(1);
+    await expect(page.locator('#running-count')).toHaveText('1');
     await page.locator('#catalog-open').click();
     await expect(page.locator('#catalog-messages')).toContainText('ALPHA ONLY');
     await page.locator('#catalog-resume').click();
@@ -180,6 +211,10 @@ for (const state of ['error', 'stopping'] as const) {
     expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session'))).toEqual([]);
     await expect(page.locator('.terminal-card')).toHaveCount(1);
     await expect(page.locator('.terminal-card[data-id="owned-alpha"]')).toHaveClass(/focused/);
+    if (state === 'error') {
+      await page.locator('.xterm-helper-textarea').press('x');
+      await expect.poll(() => page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'session_write').length)).toBe(1);
+    }
   });
 }
 
@@ -200,21 +235,98 @@ test('saved workspace and catalog share the owned-thread guard across repeated r
   await expect(page.locator('.terminal-card[data-id="owned-alpha"]')).toHaveClass(/focused/);
 });
 
-test('failed resume releases the pending thread so the same UUID can be retried', async ({ page }) => {
-  await mockNative(page, { failStartOnce: true });
+for (const holdFailureEvent of [false, true]) test(`failed resume events ${holdFailureEvent ? 'delayed until after rejection' : 'before rejection'} release active ownership so the same UUID can be retried`, async ({ page }) => {
+  await mockNative(page, { failStartOnce: true, holdFailureEvent });
   await page.locator('#catalog-open').click();
   await expect(page.locator('#catalog-resume')).toBeEnabled();
   await page.locator('#catalog-resume').click();
   await expect(page.locator('#catalog-resume-error')).toContainText('실행 파일을 시작하지 못했습니다');
   await expect(page.locator('#catalog-resume')).toBeEnabled();
-  await expect(page.locator('.terminal-card')).toHaveCount(0);
+  await expect(page.locator('.terminal-card')).toHaveCount(1);
+  await expect(page.locator('.terminal-card[data-id="created-1"] .session-state')).toHaveText('오류');
+  expect(await page.evaluate(() => (window as any).fixture.events.map((event: any) => [event.state, event.active]))).toEqual(holdFailureEvent ? [['starting', true]] : [['starting', true], ['error', false], ['idle', true]]);
   await page.locator('#catalog-resume').click();
   await expect(page.locator('#catalog-dialog')).toBeHidden();
-  await expect(page.locator('.terminal-card')).toHaveCount(1);
   const requests = await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session').map((call: any) => call.args.request));
   expect(requests).toHaveLength(2);
   expect(requests.map((request: any) => request.threadId)).toEqual([alpha.id, alpha.id]);
   expect(requests.map((request: any) => request.cwd)).toEqual([alpha.cwd, alpha.cwd]);
+  await expect(page.locator('.terminal-card')).toHaveCount(2);
+  await expect(page.locator('.terminal-card[data-id="created-2"]')).toHaveClass(/focused/);
+  if (holdFailureEvent) await page.evaluate(() => (window as any).fixture.releaseFailure());
+  await expect(page.locator('.terminal-card[data-id="created-1"] .session-state')).toHaveText('오류');
+});
+
+test('failed startup reports a failed authoritative refresh and preserves ownership until a cleanup event arrives', async ({ page }) => {
+  await mockNative(page, { failStartOnce: true, holdFailureEvent: true, failStatusRefresh: true });
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-resume')).toBeEnabled();
+  await page.locator('#catalog-resume').click();
+  await expect(page.locator('#catalog-resume-error')).toContainText('실행 파일을 시작하지 못했습니다');
+  await expect(page.locator('#catalog-resume-error')).toContainText('상태 조회 연결 오류');
+  await expect(page.locator('.terminal-card[data-id="created-1"] .session-state')).toHaveText('시작 중');
+  await page.locator('#catalog-resume').click();
+  await expect(page.locator('#catalog-dialog')).toBeVisible();
+  await expect(page.locator('#catalog-resume-error')).toContainText('실행 중 세션 확인 실패');
+  expect(await page.evaluate(() => (window as any).fixture.created)).toBe(1);
+  await page.evaluate(() => (window as any).fixture.releaseFailure());
+  await expect(page.locator('#catalog-resume')).toBeEnabled();
+  await page.locator('#catalog-resume').click();
+  await expect(page.locator('#catalog-dialog')).toBeHidden();
+  expect(await page.evaluate(() => (window as any).fixture.created)).toBe(2);
+});
+
+test('late starting after a rejected startup is checked against native ownership and that check is shared across popup reopen', async ({ page }) => {
+  await mockNative(page, { failStartOnce: true, holdInitialEvent: true, holdFailureEvent: true, holdOwnershipRefresh: true });
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-resume')).toBeEnabled();
+  await page.locator('#catalog-resume').click();
+  await expect(page.locator('#catalog-resume-error')).toContainText('실행 파일을 시작하지 못했습니다');
+  await expect(page.locator('.terminal-card')).toHaveCount(0);
+  await page.evaluate(() => (window as any).fixture.releaseStarting());
+  await expect(page.locator('.terminal-card[data-id="created-1"] .session-state')).toHaveText('시작 중');
+  await page.locator('#catalog-resume').click();
+  await expect.poll(() => page.evaluate(() => (window as any).fixture.ownershipReads)).toBe(2);
+  await page.locator('#catalog-close').click();
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-resume')).toBeEnabled();
+  await page.locator('#catalog-resume').click();
+  expect(await page.evaluate(() => (window as any).fixture.ownershipReads)).toBe(2);
+  expect(await page.evaluate(() => (window as any).fixture.created)).toBe(1);
+  await page.evaluate(() => (window as any).fixture.releaseOwnership());
+  await expect(page.locator('#catalog-dialog')).toBeHidden();
+  const requests = await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session').map((call: any) => call.args.request));
+  expect(requests).toHaveLength(2);
+  expect(requests.map((request: any) => request.threadId)).toEqual([alpha.id, alpha.id]);
+  expect(requests.map((request: any) => request.cwd)).toEqual([alpha.cwd, alpha.cwd]);
+  await page.evaluate(() => (window as any).fixture.releaseFailure());
+  await expect(page.locator('.terminal-card[data-id="created-1"] .session-state')).toHaveText('오류');
+  await expect(page.locator('.terminal-card[data-id="created-2"]')).toHaveClass(/focused/);
+});
+
+test('a finished error card is excluded from live counts and cannot write or resize a reaped process', async ({ page }) => {
+  await mockNative(page, { failStartOnce: true });
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-resume')).toBeEnabled();
+  await page.locator('#catalog-resume').click();
+  await expect(page.locator('#catalog-resume-error')).toBeVisible();
+  await page.locator('#catalog-close').click();
+  await expect(page.locator('#running-count')).toHaveText('0');
+  await page.locator('.xterm-helper-textarea').press('x');
+  await page.setViewportSize({ width: 1300, height: 900 });
+  // Observe beyond the known 60ms resize debounce to prove no deferred native operation is sent.
+  await page.waitForTimeout(120);
+  expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => ['session_write', 'session_resize'].includes(call.command)))).toEqual([]);
+});
+
+test('a rapid exit in the start response finalizes an earlier starting event of the same generation', async ({ page }) => {
+  await mockNative(page, { finishStartEarly: true });
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-resume')).toBeEnabled();
+  await page.locator('#catalog-resume').click();
+  await expect(page.locator('#catalog-dialog')).toBeHidden();
+  await expect(page.locator('.terminal-card[data-id="created-1"] .session-state')).toHaveText('종료됨');
+  await expect(page.locator('#running-count')).toHaveText('0');
 });
 
 test('pending resume is reused when the popup closes and reopens before startup completes', async ({ page }) => {

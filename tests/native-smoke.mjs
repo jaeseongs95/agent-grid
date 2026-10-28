@@ -372,8 +372,9 @@ try {
       for (const previous of screens) await previous.screen?.dispose();
     }
   } else report.limitations.push('Native executable picker/settings were not tested: AGENT_GRID_NATIVE_EXECUTABLE_PICKER=1 was not supplied.');
-  await check('nonexistent resume thread fails visibly without fresh fallback and error tile closes', async () => {
+  await check('nonexistent resume can retry as a distinct inactive session and both error tiles close', async () => {
     const title = `native-smoke-${token}-invalid-resume`;
+    const retryTitle = `native-smoke-${token}-retry-resume`;
     const requestedThreadId = randomUUID();
     assert(!report.sessions.some(session => session.threadId === requestedThreadId));
     ownedTitles.add(title);
@@ -391,15 +392,49 @@ try {
     const card = tile(title);
     await until(() => card.locator('.session-state').getAttribute('class'), state => /\berror\b/.test(state ?? ''), 'failed resume has an error tile');
     assert.equal(await card.locator('.terminal-identity').getAttribute('title'), requestedThreadId, 'Invalid resume was replaced with another thread ID');
+    const originalId = await card.getAttribute('data-id');
+    assert(originalId && uuid.test(originalId), 'Original failed resume has no exact session ID');
+    const original = await until(async () => (await nativeCall('list_sessions')).find(session => session.id === originalId), session => session?.active === false, 'first failed resume releases its live ownership');
+    assert.equal(original.threadId, requestedThreadId);
+    assert.equal(original.state, 'error');
+    assert.equal(await page.locator('#session-thread').inputValue(), requestedThreadId);
+    assert.equal(await page.locator('#session-cwd').inputValue(), cwd);
+    ownedTitles.add(retryTitle);
+    await page.locator('#session-title').fill(retryTitle);
+    await page.locator('#create-submit').click();
+    const retryCard = tile(retryTitle);
+    await retryCard.waitFor({ state: 'visible', timeout: sessionTimeout });
+    const retryId = await retryCard.getAttribute('data-id');
+    assert(retryId && uuid.test(retryId), 'Retry did not create a new exact session ID');
+    assert.notEqual(retryId, originalId, 'Retry focused or reused the original failed card');
+    const retry = await until(async () => (await nativeCall('list_sessions')).find(session => session.id === retryId), session => session?.active === false, 'retry failed resume releases its live ownership', sessionTimeout);
+    assert.equal(retry.threadId, requestedThreadId);
+    assert.equal(retry.cwd, original.cwd);
+    assert.equal(retry.state, 'error');
+    await until(() => retryCard.locator('.session-state').getAttribute('class'), state => /\berror\b/.test(state ?? ''), 'distinct retry card reaches error');
+    assert.equal(await retryCard.locator('.terminal-identity').getAttribute('title'), requestedThreadId, 'Retry fell back to a fresh thread');
+    assert.notEqual(await page.locator('#create-dialog').getAttribute('open'), null, 'Retry unexpectedly succeeded or closed the error form');
+    assert.equal(await card.count(), 1, 'Retry unexpectedly removed the first error card');
     await page.locator('#create-dialog').getByRole('button', { name: '취소', exact: true }).click();
-    expectedStopTitle = title;
-    try {
-      await card.locator('.stop').click();
-      await card.waitFor({ state: 'detached', timeout: 45_000 });
-    } finally { expectedStopTitle = ''; }
+    for (const failedTitle of [title, retryTitle]) {
+      expectedStopTitle = failedTitle;
+      try {
+        const failedCard = tile(failedTitle);
+        await failedCard.locator('.stop').click();
+        await failedCard.waitFor({ state: 'detached', timeout: 45_000 });
+      } finally { expectedStopTitle = ''; }
+    }
     await assertOnlyOurs();
-    assert.equal(await page.locator('.terminal-card').count(), 2, 'Failed resume left a tile or created an extra session');
-    return { requestedThreadId, errorDisplayed: true, errorSha256: hash(errorText), freshFallbackOccurred: false, errorTileRemovedAfterNativeStop: true };
+    assert.equal(await page.locator('.terminal-card').count(), 2, 'Failed resume or retry left a tile or created an extra session');
+    const remaining = await nativeCall('list_sessions');
+    assert.equal(remaining.filter(session => session.active).length, 2, 'Retry cleanup left an extra live session');
+    assert(remaining.filter(session => [originalId, retryId].includes(session.id)).every(session => session.active === false), 'Closed error card still owns a live session');
+    for (const live of report.sessions) {
+      const preserved = remaining.find(session => session.id === live.id);
+      assert(preserved && preserved.active === true, 'Retry cleanup removed or stopped an original real CLI session');
+      assert.equal(preserved.threadId, live.threadId);
+    }
+    return { requestedThreadId, originalSessionId: originalId, retrySessionId: retryId, distinctSessionIds: true, exactRequestedThreadRetainedBoth: true, originalActive: original.active, retryActive: retry.active, errorDisplayed: true, errorSha256: hash(errorText), retryCompletionOracle: 'new unique card ID plus backend inactive error metadata; existing error text is not a completion signal', freshFallbackOccurred: false, bothErrorTilesRemovedAfterNativeStop: true, originalRealSessionsPreserved: true };
   });
   await check('native terminal focus, layout resize and reorder', async () => {
     await assertOnlyOurs();

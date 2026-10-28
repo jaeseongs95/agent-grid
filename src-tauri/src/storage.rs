@@ -55,6 +55,7 @@ impl Store {
             let mut info: SessionInfo = serde_json::from_str(&row.map_err(|e| e.to_string())?).map_err(|e| format!("invalid stored session metadata: {e}"))?;
             // Metadata is a restore suggestion, never evidence of a running process.
             info.state = "restored".into();
+            info.active = false;
             infos.push(info);
         }
         Ok(infos)
@@ -123,17 +124,31 @@ impl Store {
 mod tests {
     use super::*;
     #[test]
-    fn executable_setting_reopens_and_reset_preserves_workspace_records() {
+    fn legacy_database_migrates_and_executable_reset_preserves_other_records() {
         let directory = std::env::temp_dir().join(format!("agent-grid-setting-store-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let database = directory.join("workspace.sqlite3");
         let layout = serde_json::json!({"version":1,"sessions":[],"columns":2});
-        let project;
+        let project = crate::project::directory(directory.to_str().unwrap()).unwrap();
+        {
+            // The previous schema had no settings table and metadata had no active flag.
+            let legacy = Connection::open(&database).unwrap();
+            legacy.execute_batch("CREATE TABLE session_metadata (id TEXT PRIMARY KEY NOT NULL, generation INTEGER NOT NULL CHECK (generation > 0), metadata TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
+                CREATE TABLE workspace_layout (id INTEGER PRIMARY KEY CHECK (id = 1), layout TEXT NOT NULL);
+                CREATE TABLE projects (id TEXT PRIMARY KEY NOT NULL, canonical_cwd TEXT UNIQUE NOT NULL, cwd TEXT NOT NULL, name TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()));").unwrap();
+            let metadata = serde_json::json!({"id":"existing-session","generation":3,"title":"existing title","cwd":directory.to_string_lossy(),"state":"idle"});
+            legacy.execute("INSERT INTO session_metadata(id,generation,metadata) VALUES('existing-session',3,?1)", [metadata.to_string()]).unwrap();
+            legacy.execute("INSERT INTO workspace_layout(id,layout) VALUES(1,?1)", [layout.to_string()]).unwrap();
+            legacy.execute("INSERT INTO projects(id,canonical_cwd,cwd,name) VALUES('existing-project',?1,?2,?3)", params![project.identity, project.cwd, project.name]).unwrap();
+            let settings_tables: usize = legacy.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='app_settings'", [], |row| row.get(0)).unwrap();
+            assert_eq!(settings_tables, 0);
+        }
         {
             let store = Store::open(&database).unwrap();
-            store.save_layout(&layout).unwrap();
-            store.save_session(&SessionInfo { id: "existing-session".into(), generation: 3, title: "existing title".into(), cwd: directory.to_string_lossy().into_owned(), thread_id: None, state: "idle".into() }).unwrap();
-            project = store.import_project(&crate::project::directory(directory.to_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(store.load_layout().unwrap(), layout);
+            assert!(!store.sessions().unwrap()[0].active);
+            assert_eq!(store.projects().unwrap()[0].id, "existing-project");
+            store.connection.execute("INSERT INTO app_settings(key,value) VALUES('unrelated','keep-me')", []).unwrap();
             store.set_codex_executable(Some("C:\\native\\codex.exe")).unwrap();
         }
         {
@@ -141,7 +156,7 @@ mod tests {
             assert_eq!(store.codex_executable().unwrap().as_deref(), Some("C:\\native\\codex.exe"));
             assert_eq!(store.load_layout().unwrap(), layout);
             assert_eq!(store.sessions().unwrap()[0].generation, 3);
-            assert_eq!(store.projects().unwrap()[0].id, project.id);
+            assert_eq!(store.projects().unwrap()[0].id, "existing-project");
             store.set_codex_executable(Some("C:\\other\\codex.exe")).unwrap();
             assert_eq!(store.codex_executable().unwrap().as_deref(), Some("C:\\other\\codex.exe"));
             store.set_codex_executable(None).unwrap();
@@ -151,7 +166,9 @@ mod tests {
             assert!(store.codex_executable().unwrap().is_none());
             assert_eq!(store.load_layout().unwrap(), layout);
             assert_eq!(store.sessions().unwrap()[0].id, "existing-session");
-            assert_eq!(store.projects().unwrap()[0].id, project.id);
+            assert_eq!(store.projects().unwrap()[0].id, "existing-project");
+            let unrelated: String = store.connection.query_row("SELECT value FROM app_settings WHERE key='unrelated'", [], |row| row.get(0)).unwrap();
+            assert_eq!(unrelated, "keep-me");
         }
         for file in ["workspace.sqlite3-wal", "workspace.sqlite3-shm", "workspace.sqlite3"] {
             let path = directory.join(file);
@@ -162,7 +179,7 @@ mod tests {
     #[test]
     fn metadata_restores_without_running_and_layout_replaces_atomically() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        let mut info = SessionInfo { id: "test".into(), generation: 2, title: "title".into(), cwd: "directory".into(), thread_id: None, state: "running".into() };
+        let mut info = SessionInfo { id: "test".into(), generation: 2, title: "title".into(), cwd: "directory".into(), thread_id: None, state: "running".into(), active: true };
         store.save_session(&info).unwrap();
         info.generation = 1;
         info.title = "stale".into();
@@ -171,6 +188,7 @@ mod tests {
         assert_eq!(restored[0].generation, 2);
         assert_eq!(restored[0].title, "title");
         assert_eq!(restored[0].state, "restored");
+        assert!(!restored[0].active);
         assert!(store.load_layout().unwrap().is_null());
         let layout = serde_json::json!({"panels":[{"id":"test"}],"columns":2});
         store.save_layout(&layout).unwrap();
@@ -183,7 +201,7 @@ mod tests {
     fn metadata_retention_preserves_active_sessions_without_unbounded_history() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         for index in 0..600 {
-            store.save_session(&SessionInfo { id: format!("session-{index:04}"), generation: 1, title: "fixture".into(), cwd: ".".into(), thread_id: None, state: "exited".into() }).unwrap();
+            store.save_session(&SessionInfo { id: format!("session-{index:04}"), generation: 1, title: "fixture".into(), cwd: ".".into(), thread_id: None, state: "exited".into(), active: false }).unwrap();
         }
         store.prune_sessions(&["session-0000".into()]).unwrap();
         let count: usize = store.connection.query_row("SELECT COUNT(*) FROM session_metadata", [], |r| r.get(0)).unwrap();
@@ -210,7 +228,7 @@ mod tests {
             assert_eq!(first.name, "한글 프로젝트");
             assert_eq!(store.projects().unwrap().len(), 1);
             store.save_layout(&serde_json::json!({"version":1,"sessions":[]})).unwrap();
-            store.save_session(&SessionInfo { id: "existing".into(), generation: 1, title: "Existing session".into(), cwd: first.cwd.clone(), thread_id: None, state: "exited".into() }).unwrap();
+            store.save_session(&SessionInfo { id: "existing".into(), generation: 1, title: "Existing session".into(), cwd: first.cwd.clone(), thread_id: None, state: "exited".into(), active: false }).unwrap();
         }
         {
             let reopened = Store::open(&database).unwrap();
