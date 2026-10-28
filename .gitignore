@@ -5,3 +5,5 @@ src-tauri/target/
 .DS_Store
 artifacts/
 THIRD_PARTY_NOTICES.md
+test-results/
+playwright-report/

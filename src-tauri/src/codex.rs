@@ -1,0 +1,518 @@
+//! Official Codex app-server protocol adapter. User config/auth remain owned by Codex.
+use portable_pty::CommandBuilder;
+use serde::Serialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{
+    env, ffi::OsString,
+    io::{self, Read, Write},
+    net::{Shutdown, TcpListener, TcpStream},
+    path::Path,
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+use tungstenite::{client::IntoClientRequest, Message, WebSocket};
+use uuid::Uuid;
+use crate::process_job::ProcessJob;
+
+const TOKEN_ENV: &str = "AGENT_GRID_REMOTE_TOKEN";
+const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+pub enum CodexEvent { ThreadId(String), Status(String) }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalSession {
+    pub id: String,
+    pub title: String,
+    pub cwd: String,
+    pub status: String,
+    /// Unix milliseconds, represented as a string to preserve precision in clients.
+    pub observed_at: String,
+}
+
+pub struct CodexSession {
+    pub command: CommandBuilder,
+    server: Child,
+    job: Option<ProcessJob>,
+    stopped: Arc<AtomicBool>,
+    socket: Option<TcpStream>,
+    observer: Option<JoinHandle<()>>,
+}
+
+impl Drop for CodexSession {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+        if let Some(socket) = self.socket.take() { let _ = socket.shutdown(Shutdown::Both); }
+        if let Some(job) = self.job.take() { let _ = job.terminate(); }
+        // kill may report that the owned process already exited; wait still reaps it.
+        let _ = self.server.kill();
+        let _ = self.server.wait();
+        if let Some(observer) = self.observer.take() { let _ = observer.join(); }
+    }
+}
+
+fn executable() -> Result<OsString, String> {
+    if let Some(value) = env::var_os("AGENT_GRID_CODEX") {
+        if value.is_empty() { return Err("AGENT_GRID_CODEX is empty".into()); }
+        return Ok(value);
+    }
+    // Resolve the native executable rather than a shell shim; never invoke a shell.
+    let names: &[&str] = if cfg!(windows) { &["codex.exe"] } else { &["codex"] };
+    for dir in env::split_paths(&env::var_os("PATH").unwrap_or_default()) {
+        for name in names {
+            let path = dir.join(name);
+            if path.is_file() { return Ok(path.into_os_string()); }
+        }
+    }
+    Err("Codex executable was not found on PATH; set AGENT_GRID_CODEX to its native executable".into())
+}
+
+fn hidden(command: &mut Command) {
+    #[cfg(windows)] {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW, background protocol process only.
+    }
+    #[cfg(not(windows))] let _ = command;
+}
+
+fn server_args(endpoint: &str, verifier: &str) -> Vec<String> {
+    ["app-server", "--listen", endpoint, "--ws-auth", "capability-token", "--ws-token-sha256", verifier]
+        .into_iter().map(str::to_owned).collect()
+}
+
+fn tui_command(exe: &OsString, cwd: &Path, endpoint: &str, token: &str, id: Option<&str>) -> CommandBuilder {
+    let mut command = CommandBuilder::new(exe);
+    if let Some(id) = id {
+        command.arg("resume");
+        command.arg(id);
+    }
+    command.arg("--remote");
+    command.arg(endpoint);
+    command.arg("--remote-auth-token-env");
+    command.arg(TOKEN_ENV);
+    command.arg("--cd");
+    command.arg(cwd.as_os_str());
+    command.cwd(cwd);
+    command.env(TOKEN_ENV, token);
+    // No model override: the official TUI discovers its model catalog dynamically.
+    command
+}
+
+fn initialize() -> Value {
+    json!({"clientInfo":{"name":"agent_grid","title":"Agent Grid","version":env!("CARGO_PKG_VERSION")}})
+}
+
+fn response(message: &Value, id: u64) -> Option<Result<Value, String>> {
+    if message.get("id") != Some(&json!(id)) { return None; }
+    if let Some(error) = message.get("error") {
+        return Some(Err(format!("Codex RPC error {}: {}", error["code"], error["message"])));
+    }
+    Some(message.get("result").cloned().ok_or_else(|| "Codex returned an invalid RPC response".into()))
+}
+
+fn timed_out(error: &tungstenite::Error) -> bool {
+    matches!(error, tungstenite::Error::Io(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+}
+
+struct Rpc<S: Read + Write> {
+    ws: WebSocket<S>,
+    next_id: u64,
+}
+
+fn adopt_root(threads: &[Value], cwd: &Path) -> Result<Option<Value>, String> {
+    let mut roots = threads.iter().filter(|thread| {
+        thread["parentThreadId"].is_null()
+            && thread["forkedFromId"].is_null()
+            && thread["threadSource"].as_str().map_or(true, |s| s == "user")
+            && thread["id"].as_str().is_some_and(|id| verified_thread(thread, id, cwd).is_ok())
+    });
+    let root = roots.next().cloned();
+    if roots.next().is_some() { return Err("Dedicated Codex server has multiple root threads; active thread is unknown".into()); }
+    Ok(root)
+}
+
+fn read_state(rpc: &mut Rpc<TcpStream>, selected: Option<&str>, cwd: &Path) -> Result<Option<Value>, String> {
+    if let Some(id) = selected {
+        let result = rpc.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
+        verified_thread(&result["thread"], id, cwd)?;
+        return Ok(Some(result["thread"].clone()));
+    }
+    let loaded = rpc.call("thread/loaded/list", json!({}))?;
+    let ids = loaded["data"].as_array().ok_or("Codex loaded thread list has no data array")?;
+    if ids.len() > 100 { return Err("Dedicated Codex server has too many loaded threads to identify its root".into()); }
+    let mut threads = Vec::new();
+    for id in ids {
+        let id = id.as_str().ok_or("Invalid Codex loaded thread ID")?;
+        let result = rpc.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
+        threads.push(result["thread"].clone());
+    }
+    adopt_root(&threads, cwd)
+}
+impl<S: Read + Write> Rpc<S> {
+    fn send(&mut self, value: Value) -> Result<(), String> {
+        self.ws.send(Message::Text(value.to_string().into())).map_err(|e| format!("Codex transport write failed: {e}"))
+    }
+    fn read(&mut self) -> Result<Option<Value>, String> {
+        match self.ws.read() {
+            Ok(Message::Text(text)) => {
+                if text.len() > MAX_FRAME { return Err("Codex protocol frame exceeded limit".into()); }
+                serde_json::from_str(&text).map(Some).map_err(|e| format!("Invalid Codex JSON: {e}"))
+            }
+            Ok(Message::Close(_)) => Err("Codex app-server disconnected".into()),
+            Ok(_) => Ok(None),
+            Err(error) if timed_out(&error) => Ok(None),
+            Err(error) => Err(format!("Codex transport read failed: {error}")),
+        }
+    }
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.send(json!({"id":id,"method":method,"params":params}))?;
+        let deadline = Instant::now() + RPC_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Some(message) = self.read()? {
+                if let Some(result) = response(&message, id) { return result; }
+            }
+        }
+        // A lost mutation reply is an unknown result, never a reason to create a fresh thread.
+        Err(format!("Codex {method} timed out; its result is unknown"))
+    }
+}
+
+fn connect(endpoint: &str, token: &str, server: &mut Child) -> Result<Rpc<TcpStream>, String> {
+    let address = endpoint.trim_start_matches("ws://").parse().map_err(|e| format!("Invalid loopback endpoint: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Some(status) = server.try_wait().map_err(|e| format!("Cannot inspect Codex server: {e}"))? {
+            return Err(format!("Codex app-server exited before connecting ({status}); verify the CLI supports authenticated WebSockets"));
+        }
+        if let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_millis(300)) {
+            stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
+            stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
+            let mut request = endpoint.into_client_request().map_err(|e| e.to_string())?;
+            request.headers_mut().insert("Authorization", format!("Bearer {token}").parse().map_err(|_| "Invalid capability token")?);
+            // Do not include handshake errors: an error can contain the authorization header.
+            let mut config = tungstenite::protocol::WebSocketConfig::default();
+            config.max_message_size = Some(MAX_FRAME);
+            config.max_frame_size = Some(MAX_FRAME);
+            let (ws, _) = tungstenite::client_with_config(request, stream, Some(config))
+                .map_err(|_| "Codex authenticated WebSocket handshake failed".to_string())?;
+            return Ok(Rpc {ws, next_id:0});
+        }
+        if Instant::now() >= deadline { return Err("Codex app-server did not become ready within 12 seconds".into()); }
+        thread::sleep(Duration::from_millis(80));
+    }
+}
+
+fn verified_thread(thread: &Value, requested: &str, cwd: &Path) -> Result<(), String> {
+    if thread["id"].as_str() != Some(requested) { return Err("Codex returned a different thread ID; refusing to resume".into()); }
+    let stored = thread["cwd"].as_str().ok_or("Codex thread has no verified working directory")?;
+    let stored_path = Path::new(stored).canonicalize().map_err(|e| format!("Cannot verify saved thread directory: {e}"))?;
+    if stored_path != cwd { return Err("Saved thread directory differs from the selected directory; refusing to resume".into()); }
+    Ok(())
+}
+
+fn status(value: &Value) -> String {
+    match value["type"].as_str() {
+        Some("active") => {
+            let flags = value["activeFlags"].as_array();
+            if flags.is_some_and(|f| f.iter().any(|v| v == "waitingOnApproval" || v == "waitingOnUserInput")) { "waiting".into() }
+            else { "running".into() }
+        }
+        Some("idle") => "idle".into(),
+        Some("systemError") => "error".into(),
+        Some("notLoaded") => "notLoaded".into(),
+        _ => "unknown".into(),
+    }
+}
+
+fn event_status(message: &Value, selected: &str) -> Option<String> {
+    let params = &message["params"];
+    let id = params["threadId"].as_str().or_else(|| params["thread"]["id"].as_str());
+    if id != Some(selected) { return None; }
+    match message["method"].as_str()? {
+        "thread/status/changed" => Some(status(&params["status"])),
+        "turn/started" => Some("running".into()),
+        "turn/completed" => Some(match params["turn"]["status"].as_str() {
+            Some("failed") => "error", Some("completed" | "interrupted") => "idle", _ => "unknown",
+        }.into()),
+        "thread/closed" => Some("notLoaded".into()),
+        _ => None,
+    }
+}
+
+pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEvent) + Send + Sync>) -> Result<CodexSession, String> {
+    let cwd = cwd.canonicalize().map_err(|e| format!("Cannot open working directory: {e}"))?;
+    if !cwd.is_dir() { return Err("Working directory must be a directory".into()); }
+    if let Some(id) = thread_id { Uuid::parse_str(id).map_err(|_| "Saved Codex thread ID is not a UUID; refusing ambiguous name-based resume")?; }
+    let exe = executable()?;
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let endpoint = format!("ws://{}", listener.local_addr().map_err(|e| e.to_string())?);
+    drop(listener);
+    // Two independent OS-random UUIDs provide 244 unpredictable bits; raw token stays in memory/child environment.
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let verifier = format!("{:x}", Sha256::digest(token.as_bytes()));
+    let mut process = Command::new(&exe);
+    process.args(server_args(&endpoint, &verifier)).current_dir(&cwd)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    hidden(&mut process);
+    let server = process.spawn().map_err(|e| format!("Cannot start Codex app-server: {e}"))?;
+    let mut session = CodexSession {
+        command: CommandBuilder::new(&exe), server, job:None,
+        stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None,
+    };
+    session.job = Some(ProcessJob::assign_std(&session.server)?);
+    let mut rpc = connect(&endpoint, &token, &mut session.server)?;
+    rpc.call("initialize", initialize())?;
+    rpc.send(json!({"method":"initialized","params":{}}))?;
+    if let Some(id) = thread_id {
+        let existing = rpc.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
+        verified_thread(&existing["thread"], id, &cwd)?;
+        on_event(CodexEvent::ThreadId(id.to_owned()));
+        on_event(CodexEvent::Status(status(&existing["thread"]["status"])));
+    }
+    // Fresh TUI owns thread/start; an empty pre-created thread may not have a resumable rollout.
+    // The observer uses only read RPCs and never claims the TUI's writer/approval ownership.
+    session.command = tui_command(&exe, &cwd, &endpoint, &token, thread_id);
+    session.socket = Some(rpc.ws.get_ref().try_clone().map_err(|e| e.to_string())?);
+    let stopped = session.stopped.clone();
+    let mut selected = thread_id.map(str::to_owned);
+    session.observer = Some(thread::spawn(move || {
+        let mut next_poll = Instant::now();
+        let mut last_state: Option<String> = None;
+        let mut failures = 0;
+        while !stopped.load(Ordering::Acquire) {
+            if Instant::now() >= next_poll {
+                let snapshot = read_state(&mut rpc, selected.as_deref(), &cwd);
+                if stopped.load(Ordering::Acquire) { break; }
+                match snapshot {
+                    Ok(Some(thread)) => {
+                        failures = 0;
+                        if selected.is_none() {
+                            let Some(id) = thread["id"].as_str().filter(|id| Uuid::parse_str(id).is_ok()) else {
+                                on_event(CodexEvent::Status("unknown".into()));
+                                break;
+                            };
+                            selected = Some(id.to_owned());
+                            on_event(CodexEvent::ThreadId(id.to_owned()));
+                        }
+                        let state = status(&thread["status"]);
+                        if last_state.as_ref() != Some(&state) {
+                            on_event(CodexEvent::Status(state.clone()));
+                            last_state = Some(state);
+                        }
+                    }
+                    Ok(None) => { failures = 0; }
+                    Err(_) => {
+                        failures += 1;
+                        on_event(CodexEvent::Status("unknown".into()));
+                        // Only bounded read-only retries; never resume/start from the observer.
+                        if failures >= 3 { break; }
+                    }
+                }
+                next_poll = Instant::now() + Duration::from_secs(1);
+            }
+            let incoming = rpc.read();
+            if stopped.load(Ordering::Acquire) { break; }
+            match incoming {
+                Ok(Some(message)) => if let Some(id) = selected.as_deref() {
+                    if let Some(state) = event_status(&message, id) { on_event(CodexEvent::Status(state)); }
+                },
+                Ok(None) => {},
+                Err(_) => {
+                    if !stopped.load(Ordering::Acquire) { on_event(CodexEvent::Status("unknown".into())); }
+                    break;
+                }
+            }
+        }
+    }));
+    Ok(session)
+}
+
+/// `app-server proxy` relays raw bytes, including the control socket's WebSocket handshake.
+/// A bounded reader bridges the blocking pipe to synchronous tungstenite with read deadlines.
+struct ProxyStream {
+    input: ChildStdin,
+    receiver: Option<mpsc::Receiver<io::Result<Vec<u8>>>>,
+    pending: Vec<u8>,
+    offset: usize,
+    timeout: Duration,
+}
+impl Read for ProxyStream {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() { return Ok(0); }
+        if self.offset == self.pending.len() {
+            self.pending = match self.receiver.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "proxy closed"))?.recv_timeout(self.timeout) {
+                Ok(result) => result?,
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(io::Error::new(io::ErrorKind::TimedOut, "proxy read timed out")),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+            };
+            self.offset = 0;
+        }
+        let count = output.len().min(self.pending.len() - self.offset);
+        output[..count].copy_from_slice(&self.pending[self.offset..self.offset + count]);
+        self.offset += count;
+        Ok(count)
+    }
+}
+impl Write for ProxyStream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { self.input.write(bytes) }
+    fn flush(&mut self) -> io::Result<()> { self.input.flush() }
+}
+
+/// A short-lived connection to an *existing* official daemon. Never starts/stops it.
+struct Proxy {
+    child: Child,
+    rpc: Option<Rpc<ProxyStream>>,
+    reader: Option<JoinHandle<()>>,
+}
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.rpc.take(); // Drop stdin/receiver, unblocking a reader waiting to send.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() { let _ = reader.join(); }
+    }
+}
+impl Proxy {
+    fn open() -> Result<Self, String> {
+        let mut command = Command::new(executable()?);
+        command.args(["app-server", "proxy"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        hidden(&mut command);
+        let mut child = command.spawn().map_err(|e| format!("Cannot open existing Codex daemon proxy: {e}"))?;
+        let input = child.stdin.take().expect("piped stdin");
+        let mut output = child.stdout.take().expect("piped stdout");
+        let (sender, receiver) = mpsc::sync_channel(32);
+        let reader = thread::spawn(move || {
+            loop {
+                let mut bytes = vec![0; 16 * 1024];
+                let value = match output.read(&mut bytes) {
+                    Ok(0) => break,
+                    Ok(count) => { bytes.truncate(count); Ok(bytes) },
+                    Err(error) => Err(error),
+                };
+                let failed = value.is_err();
+                if sender.send(value).is_err() || failed { break; }
+            }
+        });
+        let mut proxy = Self {child,rpc:None,reader:Some(reader)};
+        let stream = ProxyStream {input,receiver:Some(receiver),pending:Vec::new(),offset:0,timeout:Duration::from_secs(8)};
+        let mut config = tungstenite::protocol::WebSocketConfig::default();
+        config.max_message_size = Some(MAX_FRAME);
+        config.max_frame_size = Some(MAX_FRAME);
+        // The URL supplies HTTP Upgrade metadata only; bytes travel through the official proxy.
+        let handshake = tungstenite::client_with_config("ws://localhost/", stream, Some(config));
+        match handshake {
+            Ok((mut ws, _)) => {
+                ws.get_mut().timeout = Duration::from_millis(500);
+                proxy.rpc = Some(Rpc {ws,next_id:0});
+                Ok(proxy)
+            }
+            Err(error) => {
+                // Drop the interrupted stream/receiver before Proxy joins its reader.
+                drop(error);
+                Err("Existing Codex daemon WebSocket handshake failed; no daemon was started".into())
+            }
+        }
+    }
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.rpc.as_mut().unwrap().call(method, params)
+            .map_err(|e| format!("Existing Codex daemon request failed: {e}; no daemon was started"))
+    }
+}
+
+fn external(thread: &Value, observed_at: &str) -> Result<ExternalSession, String> {
+    let id = thread["id"].as_str().ok_or("Codex thread list entry has no ID")?.to_owned();
+    let cwd = thread["cwd"].as_str().ok_or("Codex thread list entry has no working directory")?.to_owned();
+    let title = thread["name"].as_str().filter(|s| !s.is_empty())
+        .or_else(|| thread["preview"].as_str().filter(|s| !s.is_empty())).unwrap_or(&id).to_owned();
+    Ok(ExternalSession {id,title,cwd,status:status(&thread["status"]),observed_at:observed_at.into()})
+}
+
+pub fn list_external() -> Result<Vec<ExternalSession>, String> {
+    let mut proxy = Proxy::open()?;
+    proxy.call("initialize", initialize())?;
+    proxy.rpc.as_mut().unwrap().send(json!({"method":"initialized","params":{}}))?;
+    let observed = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis().to_string();
+    let mut sessions = Vec::new();
+    let mut cursor: Option<String> = None;
+    // Bound discovery work and fail explicitly rather than silently truncating a large history.
+    for _ in 0..100 {
+        let page = proxy.call("thread/list", json!({"limit":100,"cursor":cursor,"useStateDbOnly":true}))?;
+        let data = page["data"].as_array().ok_or("Codex thread/list response has no data array")?;
+        for thread in data { sessions.push(external(thread, &observed)?); }
+        match page["nextCursor"].as_str() {
+            None => return Ok(sessions),
+            Some(next) if cursor.as_deref() == Some(next) => return Err("Codex thread/list repeated its pagination cursor".into()),
+            Some(next) => cursor = Some(next.to_owned()),
+        }
+    }
+    Err("Codex thread discovery exceeded 100 pages; results were not returned partially".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rpc_replies_require_exact_numeric_id_and_preserve_errors() {
+        assert!(response(&json!({"id":2,"result":{}}), 1).is_none());
+        assert!(response(&json!({"id":"1","result":{}}), 1).is_none());
+        assert!(response(&json!({"method":"thread/started","params":{}}), 1).is_none());
+        assert!(response(&json!({"id":1,"error":{"code":-32602,"message":"missing thread"}}), 1).unwrap().unwrap_err().contains("missing thread"));
+    }
+    #[test]
+    fn notifications_cannot_change_another_threads_status() {
+        let event = json!({"method":"thread/status/changed","params":{"threadId":"a","status":{"type":"active","activeFlags":["waitingOnApproval"]}}});
+        assert_eq!(event_status(&event, "a").as_deref(), Some("waiting"));
+        assert_eq!(event_status(&event, "b"), None);
+        assert_eq!(status(&json!({})), "unknown");
+        assert_eq!(status(&json!({"type":"notLoaded"})), "notLoaded");
+    }
+    #[test]
+    fn resume_validates_exact_id_and_existing_canonical_directory() {
+        let cwd = env::current_dir().unwrap().canonicalize().unwrap();
+        let value = json!({"id":"a","cwd":cwd});
+        assert!(verified_thread(&value, "a", &cwd).is_ok());
+        assert!(verified_thread(&value, "b", &cwd).is_err());
+        assert!(verified_thread(&json!({"id":"a"}), "a", &cwd).is_err());
+        assert!(verified_thread(&json!({"id":"a","cwd":cwd.join("missing-grid-test-directory")}), "a", &cwd).is_err());
+    }
+    #[test]
+    fn command_keeps_bearer_out_of_argv_and_preserves_exact_resume() {
+        let token = "secret-capability";
+        let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let args = server_args("ws://127.0.0.1:1234", &digest);
+        assert!(!args.iter().any(|a| a.contains(token)));
+        assert!(args.contains(&digest));
+        let cmd = tui_command(&OsString::from("codex"), Path::new("."), "ws://127.0.0.1:1234", token, Some("exact-id"));
+        let args: Vec<_> = cmd.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(&args[1..3], ["resume", "exact-id"]);
+        assert!(!args.iter().any(|a| a.contains(token)));
+        assert!(args.contains(&TOKEN_ENV.into()));
+    }
+    #[test]
+    fn fresh_tui_creates_thread_and_observer_adopts_only_unambiguous_root() {
+        let cwd = env::current_dir().unwrap().canonicalize().unwrap();
+        let cmd = tui_command(&OsString::from("codex"), &cwd, "ws://127.0.0.1:1234", "token", None);
+        assert!(!cmd.get_argv().iter().any(|arg| arg == "resume"));
+        let root = json!({"id":"root","cwd":cwd,"threadSource":"user"});
+        let child = json!({"id":"child","cwd":cwd,"parentThreadId":"root","threadSource":"subagent"});
+        assert_eq!(adopt_root(&[root.clone(), child], &cwd).unwrap().unwrap()["id"], "root");
+        assert!(adopt_root(&[], &cwd).unwrap().is_none());
+        assert!(adopt_root(&[root.clone(), json!({"id":"other","cwd":cwd})], &cwd).is_err());
+    }
+    #[test]
+    fn external_status_is_observed_and_missing_status_stays_unknown() {
+        let entry = external(&json!({"id":"a","cwd":"/repo","preview":"hello"}), "123").unwrap();
+        assert_eq!(entry.status, "unknown");
+        assert_eq!(entry.title, "hello");
+        assert_eq!(entry.observed_at, "123");
+        let serialized = serde_json::to_value(entry).unwrap();
+        assert_eq!(serialized["observedAt"], "123");
+    }
+}

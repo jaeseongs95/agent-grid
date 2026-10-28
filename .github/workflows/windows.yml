@@ -1,0 +1,52 @@
+name: Windows validation and package
+on:
+  push:
+    branches: [main, 'feat/**', 'fix/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
+      - run: node scripts/notices.mjs
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install chromium
+      - run: npm run test:e2e
+      - run: cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
+      - run: npm run tauri -- build --bundles nsis
+      - name: Prepare portable executable and checksums
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          Copy-Item src-tauri/target/release/agent-grid.exe artifacts/agent-grid.exe
+          Copy-Item src-tauri/target/release/bundle/nsis/*.exe artifacts/
+          Copy-Item LICENSE artifacts/
+          Copy-Item THIRD_PARTY_NOTICES.md artifacts/
+          Copy-Item src-tauri/Cargo.lock artifacts/Cargo.lock
+          $probe = Start-Process -FilePath (Resolve-Path 'artifacts/agent-grid.exe') -ArgumentList @('--self-test','--duration-seconds','60','--report',"$PWD/artifacts/self-test.json") -WindowStyle Hidden -Wait -PassThru
+          if ($probe.ExitCode -ne 0) { throw "Packaged PTY self-test failed: $($probe.ExitCode)" }
+          Get-ChildItem artifacts -File | ForEach-Object { '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(), $_.Name } | Set-Content -Encoding utf8NoBOM artifacts/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-grid-windows-x64
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
