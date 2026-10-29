@@ -1,6 +1,6 @@
 //! Executable-level PTY checks. This runs before Tauri/WebView initialization and
 //! never invokes the vendor adapter, model APIs, user configuration or real apps.
-use crate::{flow::{MAX_PENDING_BYTES, MAX_PENDING_FRAMES}, process_job, session::{BackendEvent, Engine, EventSink, SessionInfo, StartRequest}};
+use crate::{flow::{MAX_PENDING_BYTES, MAX_PENDING_FRAMES}, process_job, session::{BackendEvent, Engine, EventSink, SessionInfo, StartRequest, MAX_ACTIVE_SESSIONS}};
 use portable_pty::CommandBuilder;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -686,7 +686,7 @@ pub fn run_codex_smoke() -> i32 {
             }
             index += 1;
         }
-        if !(1..=16).contains(&count) { return Err("smoke sessions must be in 1..16".into()); }
+        if !(1..=MAX_ACTIVE_SESSIONS).contains(&count) { return Err(format!("smoke sessions must be in 1..{MAX_ACTIVE_SESSIONS}")); }
         let report = report.ok_or("Codex smoke requires --report <absolute-path>")?;
         if !report.is_absolute() || !report.parent().is_some_and(Path::is_dir) { return Err("Codex smoke report must be absolute with an existing parent directory".into()); }
         if let Some(cwd) = &existing_cwd {
@@ -700,7 +700,7 @@ pub fn run_codex_smoke() -> i32 {
     let (count, destination, diagnostic_terminal, existing_cwd) = match options { Ok(options) => options, Err(error) => { eprintln!("{error}"); return 2; } };
     let start = Instant::now();
     let directory = destination.parent().expect("report parent was validated").join(format!("agent-grid-codex-smoke-{}", Uuid::new_v4().simple()));
-    let mut report = SmokeReport { schema: "agent-grid-codex-smoke-v1", pass: false, duration_seconds: 0.0, test_directory: directory.to_string_lossy().into_owned(), startup_mode: if existing_cwd.is_some() { "preexisting-cwd-read-only-startup" } else { "isolated-fresh-cwd-startup" }, preexisting_cwd: existing_cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned()), sessions: Vec::new(), memory: Vec::new(), errors: Vec::new(), scope: "Actual owned Codex app-server/remote TUI startup and observed thread/status binding only. Only terminal protocol negotiation replies; no user text, model turns, approval decisions, user config writes, or GUI validation. A provided cwd is used for read-only startup; the harness writes artifacts only to its separate report/test directory. The report saves PTY hashes only; --diagnostic-terminal explicitly saves a separate bounded redacted startup prefix locally." };
+    let mut report = SmokeReport { schema: "agent-grid-codex-smoke-v1", pass: false, duration_seconds: 0.0, test_directory: directory.to_string_lossy().into_owned(), startup_mode: if existing_cwd.is_some() { "preexisting-cwd-read-only-startup" } else { "isolated-fresh-cwd-startup" }, preexisting_cwd: existing_cwd.as_ref().map(|cwd| cwd.to_string_lossy().into_owned()), sessions: Vec::new(), memory: Vec::new(), errors: Vec::new(), scope: "Actual Codex app-server/remote TUI startup and observed thread/status binding only. Only terminal protocol negotiation replies; no user text, model turns, approval decisions, user config writes, or GUI validation. A provided cwd is used for read-only startup; the harness writes artifacts only to its separate report/test directory. The report saves PTY hashes only; --diagnostic-terminal explicitly saves a separate bounded redacted startup prefix locally." };
     let outcome = (|| -> Result<(), String> {
         process_job::install_app_job()?;
         let baseline = process_job::app_owned_processes()?;

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, io::{Read, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU8, Ordering}, Arc, Condvar, Mutex}, thread, time::{Duration, Instant}};
 use uuid::Uuid;
 
-const MAX_ACTIVE_SESSIONS: usize = 32;
+pub(crate) const MAX_ACTIVE_SESSIONS: usize = 32;
 const MAX_METADATA_SESSIONS: usize = 512;
 const MAX_WRITE_BYTES: usize = 64 * 1024;
 
