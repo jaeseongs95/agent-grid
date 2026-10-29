@@ -384,11 +384,11 @@ function createTerminal(session: Session) {
   terminal.onResize(() => queueResize(session.id));
   terminal.attachCustomKeyEventHandler(event => {
     if (event.key === 'Enter' && event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
-      // xterm does not distinguish Shift+Enter. The CLI decodes this CSI-u key
-      // on Windows too; keep it in the same bounded, generation-pinned queue.
+      // Windows 콘솔에서도 줄바꿈으로 해석되는 Alt+Enter를 보낸다.
+      // 용량 제한과 세션 세대 검사를 거치는 기존 입력 대기열을 사용한다.
       if (event.isComposing || event.keyCode === 229) return false;
       event.preventDefault();
-      if (event.type === 'keydown') sendInput(session.id, '\u001b[13;2u');
+      if (event.type === 'keydown') sendInput(session.id, '\u001b\r');
       return false;
     }
     return !(event.type === 'keydown' && ((event.altKey && /^[1-9]$/.test(event.key)) || (event.ctrlKey && event.key === 'Tab') || (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'f')));

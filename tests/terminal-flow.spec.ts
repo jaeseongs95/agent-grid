@@ -56,14 +56,14 @@ async function workspace(page: Page) {
 test('Shift+Enter sends the CLI newline key once while plain Enter and IME keep their own input', async ({ page }) => {
   await workspace(page);
   await input(page).press('Shift+Enter');
-  await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b[13;2u']);
+  await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b\r']);
   await input(page).press('Enter');
-  await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b[13;2u', '\r']);
+  await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b\r', '\r']);
   await input(page).evaluate(element => {
     element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229, shiftKey: true, isComposing: true, bubbles: true }));
   });
   await input(page).press('a');
-  await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b[13;2u', '\r', 'a']);
+  await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b\r', '\r', 'a']);
 });
 
 test('held native input retains at most128 operations, preserves order and resumes stdin after drain', async ({ page }) => {
