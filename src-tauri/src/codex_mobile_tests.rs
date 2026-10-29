@@ -60,14 +60,18 @@ fn real_owned_mobile_connection_pins_peer_and_does_not_keep_the_server_job_alive
     let result = connection.request(MobileAction::Status).unwrap();
     assert_eq!(result.status.unwrap().status, "connected");
     assert_eq!(Arc::strong_count(owned.job.as_ref().unwrap()), 1, "management must not own the server Job");
-    let clone = connection.clone();
+    let mut clone = connection.clone();
     owned.job.take(); // KILL_ON_JOB_CLOSE must work while management clones still exist.
     owned.child.wait().unwrap();
     assert!(clone.0.job.upgrade().is_none());
     assert!(clone.request(MobileAction::Status).is_err());
 
-    // A replacement listener must receive no bearer bytes from a stale handle.
-    let replacement = TcpListener::bind(address).unwrap();
+    // A stale handle must send no bearer bytes to an unrelated listener, even
+    // if its address were replaced. A fresh fixture port avoids Windows'
+    // TIME_WAIT rebind delay; the production endpoint remains immutable.
+    drop(connection);
+    let replacement = TcpListener::bind("127.0.0.1:0").unwrap();
+    Arc::get_mut(&mut clone.0).unwrap().endpoint = format!("ws://{}", replacement.local_addr().unwrap());
     let worker = thread::spawn(move || {
         let (mut stream, _) = replacement.accept().unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();

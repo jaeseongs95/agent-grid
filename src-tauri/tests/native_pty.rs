@@ -12,5 +12,20 @@ fn executable_uses_real_ptys_with_generation_fencing_and_bounded_cleanup() {
     assert_eq!(result["fail"], 0, "{text}");
     assert_eq!(result["pass"], if cfg!(windows) { 8 } else { 6 }, "{text}");
     assert_eq!(result["sessionsStarted"], if cfg!(windows) { 32 } else { 31 }, "{text}");
+    #[cfg(windows)] {
+        let tree = &result["processTree"];
+        for field in ["baselineOwnedProcesses", "liveOwnedProcesses", "finalOwnedProcesses"] {
+            assert!(tree[field].as_u64().is_some(), "프로세스 수 계측 누락: {field}; {text}");
+        }
+        let processes = tree["processes"].as_array().expect("fixture 프로세스 관측 필요");
+        assert_eq!(processes.len(), 2, "{text}");
+        for (process, role) in processes.iter().zip(["shell", "grandchild"]) {
+            assert_eq!(process["role"], role, "{text}");
+            assert!(process["pid"].as_u64().is_some_and(|pid| pid > 0), "{text}");
+            assert!(process["createdFiletime"].as_u64().is_some_and(|time| time > 0), "{text}");
+            assert_eq!(process["aliveBeforeStop"], true, "{text}");
+            assert_eq!(process["exitSignaled"], true, "{text}");
+        }
+    }
     std::fs::remove_file(report).expect("remove only the owned test report");
 }

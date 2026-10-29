@@ -11,6 +11,70 @@ use uuid::Uuid;
 #[serde(rename_all = "camelCase")]
 struct MemorySample { elapsed_seconds: f64, working_set_bytes: Option<usize>, private_bytes: Option<usize>, handles: Option<u32>, owned_processes: Option<u32> }
 
+#[derive(Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProcessTreeEvidence {
+    baseline_owned_processes: Option<u32>,
+    live_owned_processes: Option<u32>,
+    final_owned_processes: Option<u32>,
+    processes: Vec<FixtureProcessEvidence>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FixtureProcessEvidence {
+    role: &'static str,
+    pid: u32,
+    created_filetime: u64,
+    alive_before_stop: bool,
+    exit_signaled: Option<bool>,
+}
+
+#[cfg(windows)]
+struct FixtureProcess {
+    handle: std::os::windows::io::OwnedHandle,
+    pid: u32,
+    created_filetime: u64,
+}
+
+#[cfg(windows)]
+impl FixtureProcess {
+    fn open(pid: u32) -> Result<Self, String> {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::{Foundation::FILETIME, System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION}};
+        // 조회와 종료 대기 권한만 연다. 이 PID로 종료하거나 권한을 넓히지 않는다.
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | 0x00100000, 0, pid) };
+        if raw.is_null() { return Err(format!("fixture PID {pid} 핸들 조회 실패: {}", std::io::Error::last_os_error())); }
+        let handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
+        let mut created: FILETIME = unsafe { std::mem::zeroed() };
+        let (mut exited, mut kernel, mut user): (FILETIME, FILETIME, FILETIME) = unsafe { std::mem::zeroed() };
+        if unsafe { GetProcessTimes(raw, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+            return Err(format!("fixture PID {pid} 생성 시각 조회 실패: {}", std::io::Error::last_os_error()));
+        }
+        Ok(Self { handle, pid, created_filetime: ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64 })
+    }
+
+    fn exited(&self) -> Result<bool, String> {
+        use std::os::windows::io::AsRawHandle;
+        match unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(self.handle.as_raw_handle(), 0) } {
+            0 => Ok(true),
+            258 => Ok(false),
+            status => Err(format!("fixture PID {} 종료 신호 조회 실패: status={status}, {}", self.pid, std::io::Error::last_os_error())),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_fixture_processes(processes: &[FixtureProcess], evidence: &mut ProcessTreeEvidence, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        for (process, observed) in processes.iter().zip(&mut evidence.processes) { observed.exit_signaled = Some(process.exited()?); }
+        if evidence.processes.len() == processes.len() && !processes.is_empty() && evidence.processes.iter().all(|process| process.exit_signaled == Some(true)) { return Ok(()); }
+        if Instant::now() >= deadline { return Err("세션 정지 뒤 fixture 자식 또는 손자 프로세스가 종료되지 않았습니다".into()); }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Report {
@@ -24,6 +88,7 @@ struct Report {
     output_frames: u64,
     output_bytes: u64,
     blocked_input_observed: Option<bool>,
+    process_tree: Option<ProcessTreeEvidence>,
     sample_memory: Vec<MemorySample>,
     errors: Vec<String>,
     scope: &'static str,
@@ -223,27 +288,41 @@ impl Harness {
         Ok(count)
     }
 
-    fn process_tree_cleanup(&self) -> Result<u64, String> {
+    fn process_tree_cleanup(&self, evidence: &mut ProcessTreeEvidence) -> Result<u64, String> {
         #[cfg(windows)] {
-            let baseline = process_job::app_owned_processes()?.ok_or("Windows job accounting is unavailable")?;
-            let session = self.start("$p = Start-Process -FilePath ($env:SystemRoot + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe') -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60') -WindowStyle Hidden -PassThru; [Console]::WriteLine('owned-grandchild:' + $p.Id); Start-Sleep -Seconds 60")?;
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !self.output.lock().unwrap().get(&session.id).is_some_and(|text| text.contains("owned-grandchild:")) {
-                if Instant::now() >= deadline { return Err("grandchild fixture never started".into()); }
-                thread::sleep(Duration::from_millis(20));
-            }
-            let live = process_job::app_owned_processes()?.ok_or("Windows job accounting is unavailable")?;
-            if live < baseline + 3 { return Err("the helper, shell, and grandchild were not all observed as owned processes".into()); }
-            self.engine.stop(&session.id, session.generation)?;
-            self.take_output(&session)?;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while process_job::app_owned_processes()? != Some(baseline) {
-                if Instant::now() >= deadline { return Err("stopping a session left an owned grandchild running".into()); }
-                thread::sleep(Duration::from_millis(20));
-            }
-            Ok(1)
+            let result = (|| -> Result<u64, String> {
+                evidence.baseline_owned_processes = Some(process_job::app_owned_processes()?.ok_or("Windows job accounting is unavailable")?);
+                let session = self.start("$p = Start-Process -FilePath ($env:SystemRoot + '\\System32\\WindowsPowerShell\\v1.0\\powershell.exe') -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Seconds 60') -WindowStyle Hidden -PassThru; [Console]::WriteLine(('owned-tree:{0}:{1}:{2}:{3}:owned-tree-ready' -f $PID, ([Diagnostics.Process]::GetCurrentProcess().StartTime.ToFileTimeUtc()), $p.Id, $p.StartTime.ToFileTimeUtc())); Start-Sleep -Seconds 60")?;
+                self.wait_output(&session, "owned-tree-ready", Duration::from_secs(20))?;
+                let values: Vec<u64> = {
+                    let output = self.output.lock().unwrap();
+                    let text = output.get(&session.id).ok_or("fixture 프로세스 식별 출력 누락")?;
+                    text.split("owned-tree:").nth(1).ok_or("fixture 프로세스 식별 표식 누락")?.split(':').take(4)
+                        .map(|value| value.parse().map_err(|_| "fixture PID 또는 생성 시각 형식 오류".to_string())).collect::<Result<_, _>>()?
+                };
+                if values.len() != 4 { return Err("fixture 프로세스 식별값 누락".into()); }
+                let mut processes = Vec::new();
+                for (role, pair) in ["shell", "grandchild"].into_iter().zip(values.chunks_exact(2)) {
+                    let pid = u32::try_from(pair[0]).map_err(|_| "fixture PID 범위 오류")?;
+                    let process = FixtureProcess::open(pid)?;
+                    if process.created_filetime != pair[1] { return Err(format!("fixture PID {pid} 재사용 또는 생성 시각 불일치: expected={}, actual={}", pair[1], process.created_filetime)); }
+                    let exited = process.exited()?;
+                    evidence.processes.push(FixtureProcessEvidence { role, pid, created_filetime: process.created_filetime, alive_before_stop: !exited, exit_signaled: None });
+                    if exited { return Err(format!("fixture {role} PID {pid}가 정지 검증 전에 종료됐습니다")); }
+                    processes.push(process);
+                }
+                evidence.live_owned_processes = Some(process_job::app_owned_processes()?.ok_or("Windows job accounting is unavailable")?);
+                self.engine.stop(&session.id, session.generation)?;
+                self.take_output(&session)?;
+                // 전체 수는 다른 시험의 지연 정산으로 변할 수 있다. 같은 생성 시각의
+                // 핸들을 유지해 이번 fixture 두 프로세스의 실제 종료를 확인한다.
+                wait_for_fixture_processes(&processes, evidence, Duration::from_secs(5))?;
+                Ok(1)
+            })();
+            evidence.final_owned_processes = process_job::app_owned_processes()?;
+            result.map_err(|error| format!("{error}; process_tree={}", serde_json::to_string(evidence).unwrap_or_else(|error| format!("진단 직렬화 실패: {error}"))))
         }
-        #[cfg(not(windows))] { Ok(0) }
+        #[cfg(not(windows))] { let _ = evidence; Ok(0) }
     }
 
     fn blocked_input_stop(&self) -> Result<(u64, bool), String> {
@@ -457,7 +536,7 @@ fn unrelated_listener_receives_no_authentication() -> Result<(), String> {
 
 fn suite(duration: Duration) -> Report {
     let start = Instant::now();
-    let mut report = Report { schema: "agent-grid-self-test-v1", tests: 0, pass: 0, fail: 0, duration_seconds: 0.0, iterations: 0, sessions_started: 0, output_frames: 0, output_bytes: 0, blocked_input_observed: None, sample_memory: vec![memory_sample(start)], errors: Vec::new(), scope: "Headless native PTY fixtures only. No GUI, vendor protocol, model API, or user-config validation. blockedInputObserved=false means the host did not demonstrate input backpressure; that case verifies bounded write/stop completion without claiming a blocked-write boundary." };
+    let mut report = Report { schema: "agent-grid-self-test-v1", tests: 0, pass: 0, fail: 0, duration_seconds: 0.0, iterations: 0, sessions_started: 0, output_frames: 0, output_bytes: 0, blocked_input_observed: None, process_tree: None, sample_memory: vec![memory_sample(start)], errors: Vec::new(), scope: "Headless native PTY fixtures only. No GUI, vendor protocol, model API, or user-config validation. blockedInputObserved=false means the host did not demonstrate input backpressure; that case verifies bounded write/stop completion without claiming a blocked-write boundary." };
     let mut counters = None;
     let result = (|| -> Result<(), String> {
         process_job::install_app_job()?;
@@ -486,7 +565,8 @@ fn suite(duration: Duration) -> Report {
         report.pass += 1;
         #[cfg(windows)] {
             report.tests += 1;
-            report.sessions_started += harness.process_tree_cleanup()?;
+            report.process_tree = Some(ProcessTreeEvidence::default());
+            report.sessions_started += harness.process_tree_cleanup(report.process_tree.as_mut().expect("프로세스 관측 초기화"))?;
             report.pass += 1;
         }
         report.sample_memory.push(memory_sample(start));
@@ -710,6 +790,31 @@ fn redact_terminal(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn process_cleanup_requires_every_original_handle_to_signal_even_when_total_counts_match() {
+        use super::{FixtureProcess, FixtureProcessEvidence, ProcessTreeEvidence, wait_for_fixture_processes};
+        use std::{os::windows::process::CommandExt, process::{Child, Command, Stdio}, time::Duration};
+        struct OwnedFixture(Child);
+        impl Drop for OwnedFixture { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let executable = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let spawn = || OwnedFixture(Command::new(&executable).args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 60"])
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(0x08000000).spawn().unwrap());
+        let mut first = spawn(); let mut last = spawn();
+        let processes = [FixtureProcess::open(first.0.id()).unwrap(), FixtureProcess::open(last.0.id()).unwrap()];
+        let mut evidence = ProcessTreeEvidence { baseline_owned_processes: Some(1), live_owned_processes: Some(4), final_owned_processes: Some(1), processes: processes.iter().map(|process| FixtureProcessEvidence {
+            role: "표적 fixture", pid: process.pid, created_filetime: process.created_filetime, alive_before_stop: true, exit_signaled: None,
+        }).collect() };
+        first.0.kill().unwrap(); first.0.wait().unwrap();
+        // 전체 수가 같다는 가짜 정상값으로도 마지막 살아 있는 표적은 통과하지 않는다.
+        assert!(wait_for_fixture_processes(&processes, &mut evidence, Duration::ZERO).is_err());
+        assert_eq!(evidence.processes.iter().map(|process| process.exit_signaled).collect::<Vec<_>>(), [Some(true), Some(false)]);
+        last.0.kill().unwrap(); last.0.wait().unwrap();
+        evidence.baseline_owned_processes = Some(8);
+        // 이전 시험 정산으로 전체 수가 줄어도 이번 표적 둘의 종료는 직접 확정한다.
+        wait_for_fixture_processes(&processes, &mut evidence, Duration::ZERO).unwrap();
+        assert!(evidence.processes.iter().all(|process| process.exit_signaled == Some(true)));
+    }
     #[test]
     fn explicit_terminal_diagnostics_redact_credentials_and_keep_control_text() {
         let result = super::redact_terminal("\x1b[31mError\x1b[0m Bearer abc.def token=secret sk-example-token AGENT_GRID_REMOTE_TOKEN=capability\nnext");
