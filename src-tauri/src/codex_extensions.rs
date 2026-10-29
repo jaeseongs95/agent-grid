@@ -572,48 +572,109 @@ mod tests {
     }
     #[test]
     #[cfg(windows)]
-    fn owned_cli_runner_preserves_argv_drains_both_pipes_and_reaps_timeout_descendants() {
-        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::{OpenProcess, WaitForSingleObject}};
+    fn owned_cli_runner_preserves_argv_and_drains_both_pipes() {
         let root = env::temp_dir().join(format!("agent-grid-cli-test-{}", Uuid::new_v4()));
         fs::create_dir(&root).unwrap();
         let script = root.join("fixture.ps1");
-        fs::write(&script, r#"param([string]$Mode,[string]$Value,[string]$PidFile)
+        fs::write(&script, r#"param([string]$Mode,[string]$Value,[string]$StageFile)
+[IO.File]::WriteAllText($StageFile,$Mode + ':entered')
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 switch ($Mode) {
- 'argv' { @{ value=$Value } | ConvertTo-Json -Compress; exit 0 }
- 'pipes' { [Console]::Error.Write(('diagnostic ' * 65536)); [Console]::Out.Write('{"ok":true}'); exit 0 }
+ 'argv' { [Console]::Out.Write($Value) }
+ 'pipes' { [Console]::Error.Write(('diagnostic ' * 65536)); [Console]::Out.Write('{"ok":true}') }
  'nonzero' { [Console]::Error.Write('fixture failure'); exit 23 }
- 'invalid' { [Console]::Out.Write('{partial'); exit 0 }
- 'flood' { for($i=0;$i -lt 20;$i++){ [Console]::Out.Write(('x' * 1048576)) }; Start-Sleep 120 }
- 'timeout' {
-  $child=Start-Process -FilePath "$PSHOME/powershell.exe" -ArgumentList @('-NoProfile','-NonInteractive','-Command','Start-Sleep 120') -WindowStyle Hidden -PassThru
-  [IO.File]::WriteAllText($PidFile,"$PID,$($child.Id)")
-  Start-Sleep 120
- }
+ 'invalid' { [Console]::Out.Write('{partial') }
 }
+[IO.File]::WriteAllText($StageFile,$Mode + ':complete')
 "#).unwrap();
         let exe = OsString::from(env::var_os("SystemRoot").map(PathBuf::from).unwrap().join("System32/WindowsPowerShell/v1.0/powershell.exe"));
-        let arguments = |mode: &str, value: &str| vec!["-NoProfile".into(), "-NonInteractive".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-File".into(), script.to_string_lossy().into_owned(), "-Mode".into(), mode.into(), "-Value".into(), value.into()];
+        let stage = root.join("stage.txt");
+        let arguments = |mode: &str, value: &str| vec!["-NoProfile".into(), "-NonInteractive".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-File".into(), script.to_string_lossy().into_owned(), "-Mode".into(), mode.into(), "-Value".into(), value.into(), "-StageFile".into(), stage.to_string_lossy().into_owned()];
+        // 정상 명령은 실제 조회와 같은 30초 한도를 쓴다. 아래 별도 시험이
+        // 짧은 timeout과 자손의 파이프 보유를 직접 검증한다.
+        let run = |mode: &str, value: &str| {
+            if stage.exists() { fs::remove_file(&stage).unwrap(); }
+            let started = Instant::now();
+            let result = command_stdout(&exe, &root, &arguments(mode, value), Duration::from_secs(30));
+            let observed = fs::read_to_string(&stage).unwrap_or_else(|_| "script-not-entered".into());
+            println!("정상 CLI 시험: mode={mode}, elapsed={:?}, phase={observed}, succeeded={}", started.elapsed(), result.is_ok());
+            (result, observed)
+        };
         let value = "한글 space; & $(not-executed) \"quote\" @market";
-        assert_eq!(cli(&exe, &root, &arguments("argv", value), Duration::from_secs(10)).unwrap()["value"], value);
-        assert_eq!(cli(&exe, &root, &arguments("pipes", ""), Duration::from_secs(10)).unwrap()["ok"], true);
-        let nonzero = cli(&exe, &root, &arguments("nonzero", ""), Duration::from_secs(10)).unwrap_err();
+        let (argv, phase) = run("argv", value);
+        assert_eq!(String::from_utf8(argv.unwrap_or_else(|error| panic!("argv: {error}; phase={phase}"))).unwrap(), value);
+        assert_eq!(phase, "argv:complete");
+        let (pipes, phase) = run("pipes", "");
+        assert_eq!(serde_json::from_slice::<Value>(&pipes.unwrap_or_else(|error| panic!("pipes: {error}; phase={phase}"))).unwrap()["ok"], true);
+        assert_eq!(phase, "pipes:complete");
+        let nonzero = run("nonzero", "").0.unwrap_err();
         assert!(nonzero.contains("23") && nonzero.contains("fixture failure"), "{nonzero}");
-        assert!(cli(&exe, &root, &arguments("invalid", ""), Duration::from_secs(10)).unwrap_err().contains("invalid JSON"));
-        assert!(cli(&exe, &root, &arguments("flood", ""), Duration::from_secs(10)).unwrap_err().contains("exceeded"));
-        let pids = root.join("pids.txt");
-        let mut args = arguments("timeout", "");
-        args.extend(["-PidFile".into(), pids.to_string_lossy().into_owned()]);
-        let started = Instant::now();
-        assert!(cli(&exe, &root, &args, Duration::from_secs(6)).unwrap_err().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(12), "pipe readers must not survive the timeout");
-        for pid in fs::read_to_string(&pids).expect("fixture parent and descendant PID evidence").split(',').map(|pid| pid.parse::<u32>().unwrap()) {
-            let process = unsafe { OpenProcess(0x00100000, 0, pid) }; // SYNCHRONIZE only; never terminate by external PID.
-            if !process.is_null() {
-                let status = unsafe { WaitForSingleObject(process, 1000) };
-                unsafe { CloseHandle(process); }
-                assert_eq!(status, 0, "owned fixture process {pid} must be reaped");
+        assert!(serde_json::from_slice::<Value>(&run("invalid", "").0.unwrap()).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "소유 CLI 자식 시험에서만 명시적으로 실행하는 순수 Rust fixture"]
+    fn owned_cli_runner_fixture_child() {
+        let root = env::current_dir().unwrap();
+        let mode = fs::read_to_string(root.join("mode.txt")).unwrap();
+        fs::write(root.join("entered.txt"), std::process::id().to_string()).unwrap();
+        if mode == "flood" {
+            for _ in 0..20 { io::stdout().write_all(&vec![b'x';1024*1024]).unwrap(); }
+        } else if mode == "timeout" || mode == "pipe-leak" {
+            let child_root=root.join("child"); fs::create_dir(&child_root).unwrap();
+            fs::write(child_root.join("mode.txt"), "sleep").unwrap();
+            let mut command=Command::new(env::current_exe().unwrap());
+            command.args(["--exact","codex::extensions::tests::owned_cli_runner_fixture_child","--ignored","--nocapture"]).current_dir(&child_root).stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+            hidden(&mut command); let child=command.spawn().unwrap();
+            let deadline=Instant::now()+Duration::from_secs(30);
+            while !child_root.join("entered.txt").exists() { assert!(Instant::now()<deadline,"자손 fixture 시작 실패"); thread::sleep(Duration::from_millis(2)); }
+            fs::write(root.join("pids.tmp"), format!("{},{}",std::process::id(),child.id())).unwrap();
+            fs::rename(root.join("pids.tmp"),root.join("pids.txt")).unwrap();
+            while !root.join("release.txt").exists() { assert!(Instant::now()<deadline,"부모 시험의 핸들 관측 실패"); thread::sleep(Duration::from_millis(2)); }
+            if mode == "pipe-leak" { std::process::exit(0); }
+        }
+        thread::sleep(Duration::from_secs(120));
+        std::process::exit(0);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn owned_cli_runner_enforces_overflow_timeout_and_descendant_pipe_cleanup() {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::{OpenProcess, WaitForSingleObject}};
+        struct Probe(*mut std::ffi::c_void);
+        impl Drop for Probe { fn drop(&mut self) { unsafe { CloseHandle(self.0); } } }
+        let root=env::temp_dir().join(format!("agent-grid-cli-lifetime-{}",Uuid::new_v4())); fs::create_dir(&root).unwrap();
+        let exe=env::current_exe().unwrap().into_os_string();
+        let args=vec!["--exact".into(),"codex::extensions::tests::owned_cli_runner_fixture_child".into(),"--ignored".into(),"--nocapture".into()];
+        fs::write(root.join("mode.txt"),"flood").unwrap();
+        assert!(command_stdout(&exe,&root,&args,Duration::from_secs(6)).unwrap_err().contains("exceeded"));
+        for mode in ["timeout","pipe-leak"] {
+            let directory=root.join(mode); fs::create_dir(&directory).unwrap(); fs::write(directory.join("mode.txt"),mode).unwrap();
+            let (send,receive)=std::sync::mpsc::channel();
+            let (worker_exe,worker_root,worker_args)=(exe.clone(),directory.clone(),args.clone());
+            let started=Instant::now();
+            let worker=thread::spawn(move || { let result=command_stdout(&worker_exe,&worker_root,&worker_args,Duration::from_secs(6)); let _=send.send(result); });
+            let deadline=Instant::now()+Duration::from_secs(10);
+            let pids=directory.join("pids.txt");
+            while !pids.exists() {
+                if let Ok(result)=receive.try_recv() { panic!("{mode} fixture 준비 전 종료: {result:?}"); }
+                assert!(Instant::now()<deadline,"{mode} fixture가 준비되지 않음"); thread::sleep(Duration::from_millis(2));
             }
+            // 완료 후 PID를 다시 조회하지 않고, 살아 있는 동안 연 원래 핸들로 확인한다.
+            let processes=fs::read_to_string(pids).unwrap().split(',').map(|pid| {
+                let pid=pid.parse::<u32>().unwrap();
+                let process=unsafe { OpenProcess(0x00100000,0,pid) }; assert!(!process.is_null(),"fixture {pid} 핸들 없음");
+                (pid,Probe(process))
+            }).collect::<Vec<_>>();
+            for (pid,process) in &processes { assert_eq!(unsafe { WaitForSingleObject(process.0,0) },258,"소유 fixture {pid}가 관측 전에 종료됨"); }
+            fs::write(directory.join("release.txt"),"observed").unwrap();
+            let result=receive.recv_timeout(Duration::from_secs(15)).expect("자손의 pipe가 명령 완료를 막음"); worker.join().unwrap();
+            if mode=="timeout" { assert!(result.unwrap_err().contains("timed out")); } else { result.unwrap(); }
+            for (pid,process) in processes {
+                let status=unsafe { WaitForSingleObject(process.0,1000) };
+                assert_eq!(status,0,"소유 fixture {pid}가 종료되지 않음");
+            }
+            println!("CLI 자원 수명 시험: mode={mode}, ready=true, originalHandlesExited=true, elapsed={:?}",started.elapsed());
         }
         fs::remove_dir_all(root).unwrap();
     }
