@@ -1,5 +1,8 @@
 # Agent Grid
 
+Long-term product goal: replace the ChatGPT desktop app with Agent Grid.
+For plugin/skill management, the current Codex desktop app is the functional reference; registration, installation and activation must actually integrate with the Codex CLI.
+
 Independent MIT implementation. Never copy Claudes source, assets, or UI text.
 Windows-first Tauri 2, Rust portable-pty, TypeScript/Vite/xterm.js.
 Keep vendor protocols in the Codex adapter; do not hardcode model names.

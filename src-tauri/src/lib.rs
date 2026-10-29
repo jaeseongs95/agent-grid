@@ -24,8 +24,16 @@ struct UiSettings {
 }
 
 #[tauri::command]
-fn set_ui_language(settings: State<'_, UiSettings>, language: ui_language::UiLanguage) -> Result<serde_json::Value, String> {
+async fn get_ui_language(engine: State<'_, Engine>) -> Result<ui_language::UiLanguage, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.get_ui_language()).await.map_err(|e| format!("Read app language worker: {e}"))?
+}
 
+#[tauri::command]
+async fn set_ui_language(settings: State<'_, UiSettings>, engine: State<'_, Engine>, language: ui_language::UiLanguage) -> Result<serde_json::Value, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.set_ui_language(language)).await.map_err(|e| format!("Save app language worker: {e}"))??;
+    // The store lock has been released before dispatching native menu updates.
     settings.show.set_text(language.text("Agent Grid 열기", "Open Agent Grid")).map_err(|e| format!("Update tray open label: {e}"))?;
     settings.exit.set_text(language.text("종료…", "Exit…")).map_err(|e| format!("Update tray exit label: {e}"))?;
     settings.english.store(language == ui_language::UiLanguage::En, Ordering::Release);
@@ -192,7 +200,7 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![set_ui_language, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, complete_exit])
+        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, complete_exit])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<ExitState>().0.load(Ordering::Acquire) {

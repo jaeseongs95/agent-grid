@@ -1,11 +1,12 @@
 //! Language for app-owned native controls; never changes the CLI or OS locale.
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum UiLanguage { #[default] Ko, En }
 
 impl UiLanguage {
+    pub fn as_str(self) -> &'static str { match self { Self::Ko => "ko", Self::En => "en" } }
     pub fn text(self, ko: &'static str, en: &'static str) -> &'static str {
         match self { Self::Ko => ko, Self::En => en }
     }

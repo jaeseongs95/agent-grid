@@ -22,7 +22,7 @@ modification or redistribution. See the [reference license](https://github.com/p
 
 Select **한국어** or **English** from **언어 / Language** in the sidebar.
 Changes apply immediately to the app interface and native tray/chooser labels,
-and the selection is saved for the next launch in this app's WebView storage.
+and the desktop app saves the selection in its own SQLite settings for the next launch.
 The default is Korean. Session titles, paths, conversations and terminal output
 stay exactly as provided. CLI diagnostics and Windows system buttons can remain
 in their original language; the app does not change the CLI or OS locale.
@@ -112,8 +112,8 @@ Closing the window hides it to the tray. Complete exit terminates owned
 processes after confirmation. Restoring after a complete exit starts new
 processes against the saved conversation ID, rather than reviving an old PID.
 Authentication tokens are not stored in the application database.
-Layout, session metadata, imported projects and the executable choice are stored
-in the app's own SQLite database. Language is stored separately in app WebView storage.
+Layout, session metadata, imported projects, the executable choice and language
+are stored in the app's own SQLite database. Browser previews use WebView local storage.
 Terminal transcripts and Codex authentication files are not copied there.
 
 ## Validation and releases

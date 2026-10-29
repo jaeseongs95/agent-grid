@@ -20,6 +20,8 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
         fixture.calls.push({ command, args });
         if (command === 'plugin:event|listen') { listeners.set(args.event, callbacks.get(args.handler)!); return callback; }
         if (command.startsWith('plugin:event|')) return callback;
+        if (command === 'get_ui_language') return 'ko';
+        if (command === 'set_ui_language') return { show: args.language === 'en' ? 'Open Agent Grid' : 'Agent Grid 열기', exit: args.language === 'en' ? 'Exit…' : '종료…' };
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: options.saved ? [{ title: alpha.title, cwd: alpha.cwd, threadId: alpha.id }] : [] };
         if (command === 'list_sessions') {
           if (fixture.created === 1 && options.failStartOnce) {

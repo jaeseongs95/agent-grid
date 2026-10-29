@@ -392,6 +392,14 @@ impl Engine {
         self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.import_project(&directory)
     }
 
+    pub fn get_ui_language(&self) -> Result<crate::ui_language::UiLanguage, String> {
+        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.ui_language()
+    }
+
+    pub fn set_ui_language(&self, language: crate::ui_language::UiLanguage) -> Result<(), String> {
+        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.set_ui_language(language)
+    }
+
     pub fn get_codex_settings(&self) -> Result<crate::codex_settings::CodexSettings, String> {
         // Read one setting snapshot, then release SQLite before filesystem I/O.
         let saved = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.codex_executable()?;

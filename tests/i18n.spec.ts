@@ -5,19 +5,23 @@ const session = { id: 'owned-i18n', generation: 9, title: '사용자 지정 제�
 const catalogRows = [0, 1].map(index => ({ id: `catalog-${index}`, title: `사용자 대화 ${index}`, cwd: project.cwd, createdAt: 1700000000, updatedAt: 1700000300, status: 'idle' }));
 const savedPath = 'D:\\사용자\\CLI\\codex.exe';
 
-async function nativeFixture(page: Page, options: { stored?: string; empty?: boolean; holdSettings?: boolean; holdChooser?: boolean; holdList?: boolean; holdPreview?: boolean } = {}) {
+async function nativeFixture(page: Page, options: { stored?: string; nativeLanguage?: 'ko' | 'en'; holdLanguageRead?: boolean; failLanguageRead?: boolean; empty?: boolean; holdSettings?: boolean; holdChooser?: boolean; holdList?: boolean; holdPreview?: boolean } = {}) {
   await page.addInitScript(({ project, session, catalogRows, savedPath, options }) => {
     const state = window as any;
     // Seed only the first load so a real reload must use the app's saved preference.
     if (!sessionStorage.getItem('i18n-fixture-seeded')) {
       if (options.stored !== undefined) localStorage.setItem('agent-grid-language', options.stored);
+      // Native-storage substitute is deliberately separate from the WebView cache.
+      // This is a browser integration fixture, not evidence of SQLite durability.
+      sessionStorage.setItem('fixture-native-language', options.nativeLanguage ?? 'ko');
       sessionStorage.setItem('i18n-fixture-seeded', '1');
     }
     state.isTauri = true;
     let callback = 0;
     const callbacks = new Map<number, (value: any) => void>();
     const listeners = new Map<string, (value: any) => void>();
-    state.i18nFixture = { calls: [], releaseSettings: () => {}, releaseChooser: () => {}, releaseList: () => {}, releasePreview: () => {},
+    state.i18nFixture = { calls: [], releaseSettings: () => {}, releaseChooser: () => {}, releaseList: () => {}, releasePreview: () => {}, releaseLanguageRead: () => {}, holdLanguageSaves: false, pendingLanguageSaves: [], completedLanguageSaves: [], activeLanguageSaves: 0, maxLanguageSaves: 0, holdCompleteExit: false, releaseCompleteExit: () => {},
+      finishLanguageSave(fail = false) { const pending = this.pendingLanguageSaves.shift(); if (!pending) throw new Error('No pending language save'); if (fail) pending.reject(new Error('Fixture language database write failed')); else pending.resolve(); },
       emit(event: string, payload: any) { listeners.get(event)!({ event, id: 1, payload }); },
     };
     const settings = { savedPath, resolvedPath: savedPath, source: 'saved', error: null };
@@ -32,7 +36,21 @@ async function nativeFixture(page: Page, options: { stored?: string; empty?: boo
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: [] };
         if (command === 'list_sessions') return options.empty ? [] : [session];
         if (command === 'list_projects') return [project];
-        if (command === 'set_ui_language') { if (!['ko', 'en'].includes(args.language)) throw new Error('Unsupported language'); return null; }
+        if (command === 'get_ui_language') {
+          if (options.holdLanguageRead) await new Promise<void>(resolve => { fixture.releaseLanguageRead = resolve; });
+          if (options.failLanguageRead) throw new Error('Fixture language database read failed');
+          return sessionStorage.getItem('fixture-native-language');
+        }
+        if (command === 'set_ui_language') {
+          if (!['ko', 'en'].includes(args.language)) throw new Error('Unsupported language');
+          fixture.activeLanguageSaves++; fixture.maxLanguageSaves = Math.max(fixture.maxLanguageSaves, fixture.activeLanguageSaves);
+          try {
+            if (fixture.holdLanguageSaves) await new Promise<void>((resolve, reject) => { fixture.pendingLanguageSaves.push({ resolve, reject }); });
+            sessionStorage.setItem('fixture-native-language', args.language); fixture.completedLanguageSaves.push(args.language);
+            return null;
+          } finally { fixture.activeLanguageSaves--; }
+        }
+        if (command === 'complete_exit' && fixture.holdCompleteExit) await new Promise<void>(resolve => { fixture.releaseCompleteExit = resolve; });
         if (command === 'get_codex_settings') { if (options.holdSettings) await new Promise<void>(resolve => { fixture.releaseSettings = resolve; }); return settings; }
         if (command === 'choose_codex_executable') { if (options.holdChooser) await new Promise<void>(resolve => { fixture.releaseChooser = resolve; }); return settings; }
         if (command === 'catalog_list') { if (options.holdList) await new Promise<void>(resolve => { fixture.releaseList = resolve; }); return { sessions: catalogRows, nextCursor: null }; }
@@ -42,7 +60,12 @@ async function nativeFixture(page: Page, options: { stored?: string; empty?: boo
     };
   }, { project, session, catalogRows, savedPath, options });
   await page.goto('/');
-  await expect(page.locator('#connection')).toHaveText(options.stored === 'en' ? /connected/i : '로컬 연결됨');
+  if (options.holdLanguageRead) {
+    await expect.poll(() => page.evaluate(() => (window as any).i18nFixture.calls.filter((call: any) => call.command === 'get_ui_language').length)).toBe(1);
+    return;
+  }
+  const language = options.failLanguageRead ? options.stored === 'en' ? 'en' : 'ko' : options.nativeLanguage ?? 'ko';
+  await expect(page.locator('#connection')).toHaveText(language === 'en' ? /connected/i : '로컬 연결됨');
   await expect(page.locator('#projects')).toContainText(project.name);
 }
 
@@ -68,11 +91,13 @@ test('switch applies immediately and the selected language survives a real reloa
   await switchLanguage(page, 'en');
   await expect(page.locator('#new-session')).toContainText(/new session/i);
   expect(await page.evaluate(() => localStorage.getItem('agent-grid-language'))).toBe('en');
+  await expect(page.locator('#language-error')).toBeHidden();
   await page.reload();
   await expect(page.locator('#language-select')).toHaveValue('en');
   await expect(page.locator('#connection')).toHaveText(/connected/i);
   await expect(page.locator('#new-session')).toContainText(/new session/i);
   await switchLanguage(page, 'ko');
+  await expect(page.locator('#language-error')).toBeHidden();
   await page.reload();
   await expect(page.locator('#new-session')).toContainText('새 세션');
   expect(await page.evaluate(() => localStorage.getItem('agent-grid-language'))).toBe('ko');
@@ -139,6 +164,100 @@ test('empty state and open new-session labels change while all user form values 
   await expect(page.locator('#session-cwd')).toHaveValue(project.cwd);
   await expect(page.locator('#session-thread')).toHaveValue('사용자-스레드-초안');
   expect(await commands(page, processActions)).toEqual([]);
+});
+
+for (const nativeLanguage of ['en', 'ko'] as const) test(`native language ${nativeLanguage} wins over a stale WebView cache before the first native save`, async ({ page }) => {
+  const stale = nativeLanguage === 'en' ? 'ko' : 'en';
+  await nativeFixture(page, { stored: stale, nativeLanguage });
+  await expect(page.locator('#language-select')).toHaveValue(nativeLanguage);
+  await expect(page.locator('html')).toHaveAttribute('lang', nativeLanguage);
+  expect(await page.evaluate(() => localStorage.getItem('agent-grid-language'))).toBe(nativeLanguage);
+  const calls = await commands(page, ['get_ui_language', 'set_ui_language']);
+  expect(calls[0].command).toBe('get_ui_language');
+  expect(calls.filter((call: any) => call.command === 'set_ui_language')).toEqual([{ command: 'set_ui_language', args: { language: nativeLanguage } }]);
+});
+
+test('pending native startup language read cannot overwrite the durable preference with the cached default', async ({ page }) => {
+  await nativeFixture(page, { stored: 'ko', nativeLanguage: 'en', holdLanguageRead: true });
+  await expect(page.locator('#language-select')).toBeDisabled();
+  expect(await commands(page, ['set_ui_language'])).toEqual([]);
+  expect(await page.evaluate(() => sessionStorage.getItem('fixture-native-language'))).toBe('en');
+  await page.evaluate(() => (window as any).i18nFixture.releaseLanguageRead());
+  await expect(page.locator('#connection')).toHaveText(/connected/i);
+  await expect(page.locator('#language-select')).toHaveValue('en');
+  await expect(page.locator('#language-error')).toBeHidden();
+  expect(await commands(page, ['set_ui_language'])).toEqual([{ command: 'set_ui_language', args: { language: 'en' } }]);
+});
+
+test('failed native startup language read is visible and does not automatically write; a deliberate selection recovers', async ({ page }) => {
+  await nativeFixture(page, { stored: 'ko', nativeLanguage: 'en', failLanguageRead: true });
+  await expect(page.locator('#language-error')).toBeVisible();
+  await expect(page.locator('#language-error')).toContainText('Fixture language database read failed');
+  await expect(page.locator('#language-select')).toBeEnabled();
+  expect(await commands(page, ['set_ui_language'])).toEqual([]);
+  expect(await page.evaluate(() => sessionStorage.getItem('fixture-native-language'))).toBe('en');
+  await switchLanguage(page, 'en');
+  await expect(page.locator('#language-error')).toBeHidden();
+  expect(await commands(page, ['set_ui_language'])).toEqual([{ command: 'set_ui_language', args: { language: 'en' } }]);
+  await expect(page.locator('#new-session')).toBeEnabled();
+});
+
+test('rapid English then Korean changes save captured values serially and leave the latest native preference', async ({ page }) => {
+  await nativeFixture(page);
+  await page.evaluate(() => { (window as any).i18nFixture.holdLanguageSaves = true; });
+  await switchLanguage(page, 'en');
+  await expect.poll(async () => (await commands(page, ['set_ui_language'])).length).toBe(2);
+  await switchLanguage(page, 'ko');
+  await expect(page.locator('#language-error')).toBeVisible();
+  expect((await commands(page, ['set_ui_language'])).map((call: any) => call.args.language)).toEqual(['ko', 'en']);
+  await page.evaluate(() => (window as any).i18nFixture.finishLanguageSave());
+  await expect.poll(async () => (await commands(page, ['set_ui_language'])).length).toBe(3);
+  expect((await commands(page, ['set_ui_language'])).map((call: any) => call.args.language)).toEqual(['ko', 'en', 'ko']);
+  await expect(page.locator('#language-error')).toBeVisible();
+  await page.evaluate(() => (window as any).i18nFixture.finishLanguageSave());
+  await expect(page.locator('#language-error')).toBeHidden();
+  expect(await page.evaluate(() => sessionStorage.getItem('fixture-native-language'))).toBe('ko');
+  expect(await page.evaluate(() => (window as any).i18nFixture.maxLanguageSaves)).toBe(1);
+  expect(await commands(page, processActions)).toEqual([]);
+});
+
+test('failed native language save remains visible and the next explicit change can recover without restarting sessions', async ({ page }) => {
+  await nativeFixture(page);
+  await page.evaluate(() => { (window as any).i18nFixture.holdLanguageSaves = true; });
+  await switchLanguage(page, 'en');
+  await expect.poll(async () => (await commands(page, ['set_ui_language'])).length).toBe(2);
+  await page.evaluate(() => (window as any).i18nFixture.finishLanguageSave(true));
+  await expect(page.locator('#language-error')).toHaveAttribute('role', 'alert');
+  await expect(page.locator('#language-error')).toContainText('Fixture language database write failed');
+  expect(await page.evaluate(() => sessionStorage.getItem('fixture-native-language'))).toBe('ko');
+  await switchLanguage(page, 'ko');
+  await expect.poll(async () => (await commands(page, ['set_ui_language'])).length).toBe(3);
+  await page.evaluate(() => (window as any).i18nFixture.finishLanguageSave());
+  await expect(page.locator('#language-error')).toBeHidden();
+  await expect(page.locator('.terminal-card')).toHaveCount(1);
+  expect(await commands(page, processActions)).toEqual([]);
+});
+
+test('confirmed exit waits for the latest serialized language save and keeps selection disabled until native exit settles', async ({ page }) => {
+  await nativeFixture(page);
+  await page.evaluate(() => { const fixture = (window as any).i18nFixture; fixture.holdLanguageSaves = true; fixture.holdCompleteExit = true; });
+  await switchLanguage(page, 'en');
+  await expect.poll(async () => (await commands(page, ['set_ui_language'])).length).toBe(2);
+  await switchLanguage(page, 'ko');
+  await page.locator('#exit').click();
+  await page.locator('#confirm-exit').click();
+  await expect.poll(async () => (await commands(page, ['save_layout'])).length).toBe(1);
+  expect(await commands(page, ['complete_exit'])).toEqual([]);
+  await page.evaluate(() => (window as any).i18nFixture.finishLanguageSave());
+  await expect.poll(async () => (await commands(page, ['set_ui_language'])).length).toBe(3);
+  expect(await commands(page, ['complete_exit'])).toEqual([]);
+  await page.evaluate(() => (window as any).i18nFixture.finishLanguageSave());
+  await expect.poll(async () => (await commands(page, ['complete_exit'])).length).toBe(1);
+  expect(await page.evaluate(() => sessionStorage.getItem('fixture-native-language'))).toBe('ko');
+  await expect(page.locator('#language-select')).toBeDisabled();
+  await expect(page.locator('#confirm-exit')).toBeDisabled();
+  await page.evaluate(() => (window as any).i18nFixture.releaseCompleteExit());
+  await expect(page.locator('#confirm-exit')).toBeEnabled();
 });
 
 test('pending settings response and pending native picker finish in the current language without another request', async ({ page }) => {

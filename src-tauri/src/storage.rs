@@ -86,6 +86,21 @@ impl Store {
         Ok(())
     }
 
+    pub fn ui_language(&self) -> Result<crate::ui_language::UiLanguage, String> {
+        let saved: Option<String> = self.connection.query_row("SELECT value FROM app_settings WHERE key='ui_language'", [], |row| row.get(0))
+            .optional().map_err(|e| format!("Read app language setting: {e}"))?;
+        match saved.as_deref() {
+            None | Some("ko") => Ok(crate::ui_language::UiLanguage::Ko),
+            Some("en") => Ok(crate::ui_language::UiLanguage::En),
+            Some(_) => Err("Stored app language is unsupported; choose Korean or English again".into()),
+        }
+    }
+
+    pub fn set_ui_language(&self, language: crate::ui_language::UiLanguage) -> Result<(), String> {
+        self.connection.execute("INSERT INTO app_settings(key,value) VALUES('ui_language',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [language.as_str()])
+            .map(|_| ()).map_err(|e| format!("Save app language setting: {e}"))
+    }
+
     pub fn codex_executable(&self) -> Result<Option<String>, String> {
         self.connection.query_row("SELECT value FROM app_settings WHERE key='codex_executable'", [], |row| row.get(0))
             .optional().map_err(|e| format!("Read app executable setting: {e}"))
@@ -123,6 +138,31 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn language_survives_database_reopen_and_preserves_other_preferences() {
+        use crate::ui_language::UiLanguage;
+        let directory = std::env::temp_dir().join(format!("agent-grid-language-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let database = directory.join("workspace.sqlite3");
+        {
+            let store = Store::open(&database).unwrap();
+            assert_eq!(store.ui_language().unwrap(), UiLanguage::Ko);
+            store.set_codex_executable(Some("C:\\tools\\codex.exe")).unwrap();
+            store.set_ui_language(UiLanguage::En).unwrap();
+        }
+        {
+            let store = Store::open(&database).unwrap();
+            assert_eq!(store.ui_language().unwrap(), UiLanguage::En);
+            assert_eq!(store.codex_executable().unwrap().as_deref(), Some("C:\\tools\\codex.exe"));
+            store.set_ui_language(UiLanguage::Ko).unwrap();
+            store.connection.execute("UPDATE app_settings SET value='unsupported' WHERE key='ui_language'", []).unwrap();
+            assert!(store.ui_language().is_err());
+            store.set_ui_language(UiLanguage::En).unwrap();
+            assert_eq!(store.ui_language().unwrap(), UiLanguage::En);
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn legacy_database_migrates_and_executable_reset_preserves_other_records() {
         let directory = std::env::temp_dir().join(format!("agent-grid-setting-store-{}", uuid::Uuid::new_v4()));

@@ -39,6 +39,7 @@ let importedProjects: ProjectInfo[] = [];
 let selectedProject = '';
 let projectSelectionVersion = 0;
 
+if (native) $('#app').hidden = true;
 $('#app').innerHTML = `
   <aside class="sidebar">
     <a class="brand" href="#" aria-label="Agent Grid 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span>Agent Grid<span class="version">0.3</span></a>
@@ -181,14 +182,63 @@ function localizeMarkup(root: Element) {
 }
 localizeMarkup($('#app'));
 const languageSelect = $<HTMLSelectElement>('#language-select'); languageSelect.value = getLanguage();
-function showLanguageError(error: unknown) {
-  const node = $('#language-error'); node.hidden = false;
-  bindText(node, `언어 설정을 저장할 수 없습니다. 이번 실행에는 적용됩니다. ${message(error)}`, `Cannot save the language setting. It applies for this session. ${message(error)}`);
+let nativeLanguageReady = false;
+let nativeLanguageQueue: Promise<void> = Promise.resolve();
+let nativeLanguageRevision = 0;
+function showLanguageStatus(ko: string, en: string, pending = false) {
+  const node = $('#language-error'); node.hidden = false; node.dataset.state = pending ? 'pending' : 'error'; node.setAttribute('role', pending ? 'status' : 'alert');
+  bindText(node, ko, en);
 }
-languageSelect.onchange = () => { $('#language-error').hidden = true; try { setLanguage(languageSelect.value as 'ko' | 'en'); } catch (error) { showLanguageError(error); } };
-onLanguageChange(() => { languageSelect.value = getLanguage(); for (const field of createFields) if (field.validity.customError) validateRequired(field); if (native) void syncNativeLanguage(); });
-if (languageStorageError() !== undefined) showLanguageError(languageStorageError());
-async function syncNativeLanguage() { try { await call('set_ui_language', { language: getLanguage() }); } catch (error) { notify(`기본 메뉴 언어 변경 실패: ${message(error)}`, true, `Could not update native menu language: ${message(error)}`); } }
+function showLanguageError(error: unknown) {
+  showLanguageStatus(`언어 설정을 저장할 수 없습니다. 이번 실행에는 적용됩니다. ${message(error, 'ko')}`, `Cannot save the language setting. It applies for this session. ${message(error, 'en')}`);
+}
+function showNativeCacheStatus() {
+  const error = languageStorageError();
+  if (error === undefined) $('#language-error').hidden = true;
+  else showLanguageStatus(`앱의 언어 설정은 저장됐지만 로컬 캐시는 저장하지 못했습니다. ${message(error, 'ko')}`, `The app language is saved, but its local cache could not be updated. ${message(error, 'en')}`);
+}
+languageSelect.disabled = native;
+languageSelect.onchange = () => {
+  const previous = getLanguage(); $('#language-error').hidden = true;
+  try { setLanguage(languageSelect.value as 'ko' | 'en'); }
+  catch (error) { if (!native) showLanguageError(error); }
+  // An explicit choice can replace an unreadable setting; startup never does so automatically.
+  if (native && !nativeLanguageReady) { nativeLanguageReady = true; void syncNativeLanguage(getLanguage()); }
+  else if (native && previous === getLanguage()) void syncNativeLanguage(getLanguage());
+};
+onLanguageChange(() => {
+  languageSelect.value = getLanguage();
+  for (const field of createFields) if (field.validity.customError) validateRequired(field);
+  if (native && nativeLanguageReady) void syncNativeLanguage(getLanguage());
+});
+if (!native && languageStorageError() !== undefined) showLanguageError(languageStorageError());
+function syncNativeLanguage(language: 'ko' | 'en'): Promise<void> {
+  const revision = ++nativeLanguageRevision;
+  showLanguageStatus('언어 설정 저장 중…', 'Saving language setting…', true);
+  // Capture the requested language and serialize durable saves, including rapid toggles.
+  const operation = nativeLanguageQueue.catch(() => {}).then(async () => { await call('set_ui_language', { language }); });
+  nativeLanguageQueue = operation;
+  void operation.then(() => { if (revision === nativeLanguageRevision) showNativeCacheStatus(); }, error => {
+    if (revision === nativeLanguageRevision) showLanguageError(error);
+    notifyError('언어 설정 저장 실패', 'Could not save language setting', error);
+  });
+  return operation;
+}
+async function initializeNativeLanguage() {
+  showLanguageStatus('언어 설정 확인 중…', 'Loading language setting…', true);
+  try {
+    const savedLanguage = await call<unknown>('get_ui_language');
+    if (savedLanguage !== 'ko' && savedLanguage !== 'en') throw new UiError('저장된 언어 설정이 올바르지 않습니다.', 'The saved language setting is invalid.');
+    if (savedLanguage === 'ko' || savedLanguage === 'en') {
+      try { setLanguage(savedLanguage); } catch { /* Native storage is authoritative; report a cache failure after the durable save. */ }
+    }
+    nativeLanguageReady = true;
+  } catch (error) {
+    showLanguageStatus(`저장된 언어를 확인하지 못했습니다. 기존 설정을 덮어쓰지 않습니다. ${message(error, 'ko')}`, `Could not read the saved language. The existing setting will not be overwritten. ${message(error, 'en')}`);
+    notifyError('언어 설정 조회 실패', 'Could not load language setting', error);
+  } finally { languageSelect.disabled = false; $('#app').hidden = false; }
+  if (nativeLanguageReady) await syncNativeLanguage(getLanguage()).catch(() => {}); // A failed save remains visible while the rest of the app starts.
+}
 
 class UiError extends Error { constructor(readonly ko: string, readonly en: string) { super(t(ko, en)); } }
 function message(error: unknown, language = getLanguage()) { return error instanceof UiError ? language === 'ko' ? error.ko : error.en : error instanceof Error ? error.message : String(error); }
@@ -583,7 +633,16 @@ $('#external-toggle').onclick = () => { $<HTMLDialogElement>('#external-dialog')
 $('#external-refresh').onclick = () => void refreshExternal();
 $('#notifications').onclick = () => { notificationCount = 0; $('#notification-count').hidden = true; $<HTMLDialogElement>('#notification-dialog').showModal(); };
 $('#exit').onclick = () => $<HTMLDialogElement>('#exit-dialog').showModal();
-$('#confirm-exit').onclick = async () => { const button = $<HTMLButtonElement>('#confirm-exit'); button.disabled = true; try { clearTimeout(saveTimer); scheduleSave(); await new Promise(resolve => setTimeout(resolve, 450)); await saveQueue; await call('complete_exit', { confirmed: true }); } catch (error) { notifyError('앱 종료 실패', 'Could not exit app', error); } finally { button.disabled = false; } };
+$('#confirm-exit').onclick = async () => {
+  const button = $<HTMLButtonElement>('#confirm-exit'); const languageWasDisabled = languageSelect.disabled; let completed = false;
+  button.disabled = true; if (native) languageSelect.disabled = true;
+  try {
+    clearTimeout(saveTimer); scheduleSave(); await new Promise(resolve => setTimeout(resolve, 450)); await saveQueue;
+    if (native) await nativeLanguageQueue;
+    await call('complete_exit', { confirmed: true }); completed = true;
+  } catch (error) { notifyError('앱 종료 실패', 'Could not exit app', error); }
+  finally { button.disabled = false; if (native && !completed) languageSelect.disabled = languageWasDisabled; }
+};
 
 function toggleSearch(force?: boolean) { searchVisible = force ?? !searchVisible; $('#search-bar').hidden = !searchVisible; if (searchVisible) $<HTMLInputElement>('#terminal-search').focus(); }
 function find(previous = false) { const value = $<HTMLInputElement>('#terminal-search').value; const search = terminals.get(active)?.search; const found = !!value && search && (previous ? search.findPrevious(value) : search.findNext(value)); bindText($('#search-result'), !value ? '' : found ? '결과 찾음' : '결과 없음', !value ? '' : found ? 'Match found' : 'No matches'); }
@@ -607,7 +666,7 @@ async function initialize() {
     if (demo) seedDemo(); renderAll(); return;
   }
   try {
-    await syncNativeLanguage();
+    await initializeNativeLanguage();
     unlisteners.push(await listen<Output>('terminal-output', event => receiveOutput(event.payload)));
     unlisteners.push(await listen<SessionInfo>('session-changed', event => receiveSession(event.payload)));
     unlisteners.push(await listen<string>('application-error', event => notify(event.payload, true)));
