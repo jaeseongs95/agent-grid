@@ -165,8 +165,13 @@ fn initialize() -> Value {
     json!({"clientInfo":{"name":"agent_grid","title":"OpenDIY Desktop","version":env!("CARGO_PKG_VERSION")}})
 }
 
+fn is_response_for(message: &Value, id: u64) -> bool {
+    // Server requests have their own ID sequence and must remain with the TUI.
+    message.get("method").is_none() && message.get("id") == Some(&json!(id))
+}
+
 fn response(message: &Value, id: u64) -> Option<Result<Value, String>> {
-    if message.get("id") != Some(&json!(id)) { return None; }
+    if !is_response_for(message, id) { return None; }
     if let Some(error) = message.get("error") {
         return Some(Err(format!("Codex RPC error {}: {}", error["code"], error["message"])));
     }
@@ -697,6 +702,7 @@ mod tests {
         assert!(response(&json!({"id":2,"result":{}}), 1).is_none());
         assert!(response(&json!({"id":"1","result":{}}), 1).is_none());
         assert!(response(&json!({"method":"thread/started","params":{}}), 1).is_none());
+        assert!(response(&json!({"id":1,"method":"item/commandExecution/requestApproval","params":{}}), 1).is_none());
         assert!(response(&json!({"id":1,"error":{"code":-32602,"message":"missing thread"}}), 1).unwrap().unwrap_err().contains("missing thread"));
     }
     #[test]

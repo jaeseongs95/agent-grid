@@ -149,7 +149,7 @@ impl MobileConnection {
         while Instant::now() < deadline {
             self.live()?;
             if let Some(message) = rpc.read().map_err(|_| "모바일 관리 응답을 읽을 수 없습니다. 요청 결과는 확인되지 않았습니다.")? {
-                if message.get("id") != Some(&json!(id)) { continue; }
+                if !is_response_for(&message, id) { continue; }
                 if let Some(error) = message.get("error") {
                     return Err(match error["code"].as_i64() {
                         Some(-32601) => "현재 CLI는 모바일 원격제어를 지원하지 않습니다.",

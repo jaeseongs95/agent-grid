@@ -230,3 +230,22 @@ fn response_shape_bounds_and_ownership_preflight_are_fail_closed() {
     for endpoint in ["ws://example.com:80","ws://192.168.1.1:80","wss://127.0.0.1:80","ws://127.0.0.1:0","ws://127.0.0.1:80/path"] { assert!(owned_address(endpoint).is_err()); }
     assert!(owned_address("ws://127.0.0.1:80").is_ok());
 }
+
+#[test]
+fn server_requests_with_matching_ids_do_not_complete_management_calls() {
+    let (connection, stream, worker) = fixture(|mut ws| {
+        let init = read(&mut ws);
+        assert_eq!(init["method"], "initialize");
+        ws.send(Message::Text(json!({"id":init["id"],"method":"item/commandExecution/requestApproval","params":{}}).to_string().into())).unwrap();
+        reply(&mut ws, &init, json!({}));
+        assert_eq!(read(&mut ws)["method"], "initialized", "관리 연결이 승인을 대신 응답하면 안 된다");
+        let status = read(&mut ws);
+        assert_eq!(status["method"], "remoteControl/status/read");
+        ws.send(Message::Text(json!({"id":status["id"],"method":"item/commandExecution/requestApproval","params":{}}).to_string().into())).unwrap();
+        reply(&mut ws, &status, status_value());
+        assert!(ws.read().is_err(), "관리 연결은 승인 응답을 보내지 않고 닫아야 한다");
+    });
+    let result = connection.run_stream(MobileAction::Status, stream, Duration::from_secs(2));
+    worker.join().unwrap();
+    assert_eq!(result.unwrap().status.unwrap().status, "connected");
+}
