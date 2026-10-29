@@ -299,14 +299,15 @@ impl Engine {
         // Bound metadata in memory as well as output. Remove oldest terminal
         // entries only from the live registry; persisted restore metadata survives.
         let retired_id = if sessions.len() >= MAX_METADATA_SESSIONS {
-            if let Some(id) = sessions.iter().find(|(_, session)| session.phase.load(Ordering::Acquire) == 3).map(|(id, _)| id.clone()) { Some(id) }
+            if let Some(id) = sessions.iter().find(|(_, session)| session.phase.load(Ordering::Acquire) == 3 && !session.cleanup_failed.load(Ordering::Acquire)).map(|(id, _)| id.clone()) { Some(id) }
             else { return Err("session metadata limit reached".into()); }
         } else { None };
         let info = SessionInfo { id: Uuid::new_v4().to_string(), generation: 1, title: request.title.clone(), cwd: cwd.to_string_lossy().into_owned(), project_id: request.project_id.clone(), project_assigned: request.project_assigned || request.project_id.is_some(), project_revision: 0, thread_id: request.thread_id.clone(), state: "starting".into(), active: true };
         {
             let store = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?;
             store.save_session(&info)?;
-            let mut live_ids: Vec<_> = sessions.iter().filter(|(_, session)| session.phase.load(Ordering::Acquire) < 3).map(|(id, _)| id.clone()).collect();
+            // 완료된 원격 중단 불명도 보존한다. 상한 정리는 사용자 동의가 아니다.
+            let mut live_ids: Vec<_> = sessions.iter().filter(|(_, session)| session.phase.load(Ordering::Acquire) < 3 || session.cleanup_failed.load(Ordering::Acquire)).map(|(id, _)| id.clone()).collect();
             live_ids.push(info.id.clone());
             store.prune_sessions(&live_ids)?;
         }
