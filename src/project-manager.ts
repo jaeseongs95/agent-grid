@@ -40,8 +40,9 @@ export function createProjectManager(host: ProjectHost) {
   const remove = button(actions, 'project-delete', '프로젝트 삭제', 'Delete project', () => { if (!current) return; deleteName.textContent = current.name; deleteError.hidden = true; deletion.dialog.showModal(); }); remove.className = 'danger-button';
   const save = button(actions, 'project-save', '저장', 'Save'); save.type = 'submit'; save.className = 'primary-button';
   let current: ProjectInfo | undefined; let busy = false; let deleteError: HTMLElement;
+  const nameValue = () => name.value === current?.name ? name.value : name.value.trim();
   function validName() {
-    const value = name.value.trim(); name.setCustomValidity(!value ? t('프로젝트 이름을 입력하세요.', 'Enter a project name.') : [...value].length > 120 || /\p{Cc}/u.test(value) ? t('제어문자 없이 120자 이하로 입력하세요.', 'Use at most 120 characters without control characters.') : '');
+    const value = nameValue(); name.setCustomValidity(current?.name === value ? '' : !value ? t('프로젝트 이름을 입력하세요.', 'Enter a project name.') : [...value].length > 120 || /\p{Cc}/u.test(value) ? t('제어문자 없이 120자 이하로 입력하세요.', 'Use at most 120 characters without control characters.') : '');
   }
   name.oninput = validName; name.oninvalid = validName;
   function setBusy(value: boolean) {
@@ -59,8 +60,8 @@ export function createProjectManager(host: ProjectHost) {
     event.preventDefault(); validName(); if (!form.reportValidity()) return;
     void work(async () => {
       let project = current;
-      if (!project) project = await host.call<ProjectInfo>('create_project', { name: name.value.trim(), cwd: folder.value || null });
-      else if (project.name !== name.value.trim()) { project = await host.call<ProjectInfo>('rename_project', { id: project.id, name: name.value.trim() }); current = project; }
+      if (!project) project = await host.call<ProjectInfo>('create_project', { name: nameValue(), cwd: folder.value || null });
+      else if (project.name !== nameValue()) { project = await host.call<ProjectInfo>('rename_project', { id: project.id, name: nameValue() }); current = project; }
       current = project;
       if (!!project.favorite !== favorite.checked) { project = await host.call<ProjectInfo>('set_project_favorite', { id: project.id, favorite: favorite.checked }); current = project; }
       // 생성 성공 뒤 갱신이 실패해도 재시도에서 중복 생성하지 않는다.
