@@ -201,7 +201,16 @@ impl Session {
     }
 
     fn finish(&self, state: &str) -> Result<(), String> {
+        self.finish_reaped(state, false)
+    }
+
+    fn finish_reaped(&self, state: &str, shared_unconfirmed: bool) -> Result<(), String> {
         let result = self.update(|info| {
+            // adapter 인계 뒤의 취소도 완료와 같은 metadata 락에서 판정한다.
+            // TUI 연결 회수는 공유 turn의 중단 확인이 아니다.
+            if shared_unconfirmed && self.stop_requested.load(Ordering::Acquire) {
+                self.cleanup_failed.store(true, Ordering::Release);
+            }
             // Publish process ownership and completion together under info's lock.
             self.phase.store(3, Ordering::Release);
             info.active = false;
@@ -242,6 +251,7 @@ impl Session {
         let remaining = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(35));
         let (_done_guard, timeout) = self.done.1.wait_timeout_while(done, remaining, |done| !*done).map_err(|_| "session completion lock poisoned")?;
         if timeout.timed_out() { return Err("owned session cleanup has not completed within 35 seconds".into()); }
+        if self.cleanup_failed.load(Ordering::Acquire) { return Err("공유 작업 중단 결과가 확인되지 않았습니다. 중단 요청을 재전송하지 않았습니다.".into()); }
         termination_result.and(status_result)
     }
 }
@@ -255,6 +265,9 @@ struct EngineInner {
 
 #[derive(Clone)]
 pub struct Engine { inner: Arc<EngineInner> }
+
+#[path = "session_exit.rs"]
+mod exit;
 
 impl Engine {
     pub fn new(database: &Path, sink: EventSink) -> Result<Self, String> {
@@ -396,8 +409,9 @@ impl Engine {
             let waited = child.wait();
             // 공유 turn의 중단 판정 전에 PTY 종료를 세션 중단 완료로 발표하지 않는다.
             let termination = process.termination.lock().unwrap_or_else(|e| e.into_inner());
-            waiting.cleanup_failed.store(process.shared_cleanup_failed.load(Ordering::Acquire), Ordering::Release);
+            waiting.cleanup_failed.fetch_or(process.shared_cleanup_failed.load(Ordering::Acquire), Ordering::AcqRel);
             let adapter = process.adapter.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let shared = adapter.as_ref().and_then(CodexSession::shared_control).is_some();
             drop(termination);
             // Kill any descendants retaining the terminal after their leader exits.
             let job = process.job.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -405,11 +419,15 @@ impl Engine {
             process.close_io();
             drop(adapter); // No registry/metadata lock is held across observer join.
             let read_result = reader_thread.join();
+            let termination = process.termination.lock().unwrap_or_else(|e| e.into_inner());
+            waiting.cleanup_failed.fetch_or(process.shared_cleanup_failed.load(Ordering::Acquire), Ordering::AcqRel);
             waiting.process.lock().unwrap_or_else(|e| e.into_inner()).take();
             let stopped = waiting.stop_requested.load(Ordering::Acquire);
             let failed = !matches!(waited, Ok(ref status) if status.success()) || !matches!(read_result, Ok(Ok(())));
             let state = if stopped { "stopped" } else if failed { "error" } else { "exited" };
-            let _ = waiting.finish(state);
+            let shared_unconfirmed = shared && !process.shared_stop_attempted.load(Ordering::Acquire);
+            drop(termination);
+            let _ = waiting.finish_reaped(state, shared_unconfirmed);
         }).map_err(|e| format!("start PTY reaper: {e}"))?;
         guard.armed = false;
         session.info()
@@ -615,36 +633,47 @@ impl Engine {
         // permit. All shutdown callees below only drain terminal resources and
         // must not reacquire this permit. It is released after their cleanup.
         let _extensions = codex::extension_admission().map_err(|error| format!("Cannot exit while extension management is busy: {error}"))?;
-        self.inner.exiting.store(true, Ordering::Release);
-        let sessions: Vec<_> = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?.values().cloned().collect();
-        // Send every cancellation before waiting, so one slow session cannot
-        // prevent the others from receiving their stop signal.
-        let mut failures = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(43);
-        for session in &sessions {
-            if session.phase.load(Ordering::Acquire) < 3 {
-                if let Err(error) = session.request_stop() { failures.push(error); }
-            }
-        }
-        // 활성 세션은 기존 상한 32개뿐이다. 별도 대기열 없이 같은 전체 기한으로
-        // 각 소유 TUI와 공유 작업을 정리하여 느린 RPC가 다음 세션의 취소를 막지 않는다.
-        thread::scope(|scope| {
-            let mut workers = Vec::new();
-            for session in sessions.into_iter().filter(|session| session.phase.load(Ordering::Acquire) < 3) {
-                match thread::Builder::new().name("session-shutdown".into()).spawn_scoped(scope, move || session.stop_until(deadline)) {
-                    Ok(worker) => workers.push(worker),
-                    Err(error) => failures.push(format!("세션 정리 작업자를 시작할 수 없습니다: {error}")),
+        let was_exiting = self.inner.exiting.swap(true, Ordering::AcqRel);
+        let result = (|| {
+            let sessions: Vec<_> = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?.values().cloned().collect();
+            // Send every cancellation before waiting, so one slow session cannot
+            // prevent the others from receiving their stop signal.
+            let mut failures = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(43);
+            for session in &sessions {
+                if session.phase.load(Ordering::Acquire) < 3 {
+                    if let Err(error) = session.request_stop() { failures.push(error); }
                 }
             }
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(())) => {},
-                    Ok(Err(error)) => failures.push(error),
-                    Err(_) => failures.push("세션 정리 작업자가 비정상 종료되었습니다.".into()),
+            // 활성 세션은 기존 상한 32개뿐이다. 별도 대기열 없이 같은 전체 기한으로
+            // 각 소유 TUI와 공유 작업을 정리하여 느린 RPC가 다음 세션의 취소를 막지 않는다.
+            thread::scope(|scope| {
+                let mut workers = Vec::new();
+                for session in sessions {
+                    // 완료 세션의 불명도 합산한다. 완료 분기는 원격 요청을 재전송하지 않는다.
+                    if session.phase.load(Ordering::Acquire) == 3 {
+                        if let Err(error) = session.stop_until(deadline) { failures.push(error); }
+                        continue;
+                    }
+                    match thread::Builder::new().name("session-shutdown".into()).spawn_scoped(scope, move || session.stop_until(deadline)) {
+                        Ok(worker) => workers.push(worker),
+                        Err(error) => failures.push(format!("세션 정리 작업자를 시작할 수 없습니다: {error}")),
+                    }
                 }
-            }
-        });
-        if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
+                for worker in workers {
+                    match worker.join() {
+                        Ok(Ok(())) => {},
+                        Ok(Err(error)) => failures.push(error),
+                        Err(_) => failures.push("세션 정리 작업자가 비정상 종료되었습니다.".into()),
+                    }
+                }
+            });
+            if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
+        })();
+        // 같은 admission permit 안에서 복원하므로 다른 shutdown의 성공을
+        // 실패한 호출이 덮거나 새 세션이 정리 목록에서 빠질 수 없다.
+        if result.is_err() { self.inner.exiting.store(was_exiting, Ordering::Release); }
+        result
     }
 
     pub(crate) fn wait_for_exit(&self, id: &str, generation: u64, timeout: Duration) -> Result<SessionInfo, String> {
@@ -665,6 +694,10 @@ fn validate_size(cols: u16, rows: u16) -> Result<(), String> {
 #[path = "session_launch_guard_tests.rs"]
 mod launch_guard_tests;
 
+#[cfg(all(test, windows))]
+#[path = "session_shutdown_race_tests.rs"]
+mod shutdown_race_tests;
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
@@ -681,7 +714,7 @@ mod lifecycle_tests {
         assert!(session.stop().unwrap_err().contains("재전송하지 않았습니다"));
     }
     // 서로 다른 Engine도 같은 전역 확장 관리 입장권을 사용한다.
-    static EXTENSION_ADMISSION_TEST: Mutex<()> = Mutex::new(());
+    pub(super) static EXTENSION_ADMISSION_TEST: Mutex<()> = Mutex::new(());
 
     fn request() -> StartRequest {
         StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 80, rows: 24 }

@@ -82,7 +82,7 @@ $('#app').innerHTML = `
   <dialog id="restore-dialog"><div class="dialog-heading"><span class="eyebrow">SAVED WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>저장된 세션</h2><p>버튼을 누른 세션만 시작합니다. 스레드 ID가 있으면 해당 대화를 재개합니다.</p><div id="restore-list" class="restore-list"></div></dialog>
   <dialog id="external-dialog"><div class="dialog-heading"><span class="eyebrow">READ ONLY</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>외부 세션</h2><p>다른 앱에서 발견한 기록입니다. 관측 정보이며 현재 실행 상태는 미확인입니다. 입력하거나 종료할 수 없습니다.</p><button id="external-refresh" class="quiet-button">새로 고침</button><div id="external-list" class="external-list"></div></dialog>
   <dialog id="notification-dialog"><div class="dialog-heading"><span class="eyebrow">ACTIVITY</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>알림</h2><div id="notification-list" class="notification-list"><p class="muted">새로운 알림이 없습니다.</p></div></dialog>
-  <dialog id="exit-dialog"><div class="dialog-heading"><span class="eyebrow">EXIT WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>OpenDIY Desktop를 종료할까요?</h2><p>앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.</p><div class="dialog-actions"><button class="quiet-button" data-close>계속 작업</button><button id="confirm-exit" class="danger-button">세션 종료 후 앱 닫기</button></div></dialog>
+  <dialog id="exit-dialog"><div class="dialog-heading"><span class="eyebrow">EXIT WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>OpenDIY Desktop를 종료할까요?</h2><p>앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.</p><p id="unconfirmed-exit-warning" class="inline-error" role="alert" hidden>원격 작업의 중단을 확인하지 못했습니다. 앱을 닫아도 원격 작업이 계속 실행될 수 있습니다. 로컬 자원은 정리되었습니다.</p><div class="dialog-actions"><button class="quiet-button" data-close>계속 작업</button><button id="confirm-unconfirmed-exit" class="danger-button" aria-describedby="unconfirmed-exit-warning" hidden>중단 미확인 상태로 앱 닫기</button><button id="confirm-exit" class="danger-button">세션 종료 후 앱 닫기</button></div></dialog>
 `;
 
 // Register only app-owned templates, before any terminal or user content is inserted.
@@ -166,6 +166,8 @@ const markupLabels: Record<string, [string, string]> = {
   "앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.": ["앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.", "All running sessions owned by this app will stop. Sessions in other apps are unaffected. The window close button hides the app to the tray."],
   "계속 작업": ["계속 작업", "Keep working"],
   "세션 종료 후 앱 닫기": ["세션 종료 후 앱 닫기", "Stop sessions and exit"],
+  "원격 작업의 중단을 확인하지 못했습니다. 앱을 닫아도 원격 작업이 계속 실행될 수 있습니다. 로컬 자원은 정리되었습니다.": ["원격 작업의 중단을 확인하지 못했습니다. 앱을 닫아도 원격 작업이 계속 실행될 수 있습니다. 로컬 자원은 정리되었습니다.", "The remote stop could not be confirmed. Remote work may continue running after the app closes. Local resources have been cleaned up."],
+  "중단 미확인 상태로 앱 닫기": ["중단 미확인 상태로 앱 닫기", "Close app with unconfirmed remote stop"],
   "앞으로 이동": ["앞으로 이동", "Move earlier"],
   "뒤로 이동": ["뒤로 이동", "Move later"],
   "세션 최대화": ["세션 최대화", "Maximize session"],
@@ -689,28 +691,42 @@ $('#external-toggle').onclick = () => { $<HTMLDialogElement>('#external-dialog')
 $('#external-refresh').onclick = () => void refreshExternal();
 $('#notifications').onclick = () => { notificationCount = 0; $('#notification-count').hidden = true; $<HTMLDialogElement>('#notification-dialog').showModal(); };
 const exitDialog = $<HTMLDialogElement>('#exit-dialog');
-$('#exit').onclick = () => exitDialog.showModal();
+const unconfirmedExitButton = $<HTMLButtonElement>('#confirm-unconfirmed-exit');
+function resetExitRecovery() { unconfirmedExitButton.hidden = true; $('#unconfirmed-exit-warning').hidden = true; }
+function openExitDialog() { if (!exitDialog.open) { resetExitRecovery(); exitDialog.showModal(); } }
+$('#exit').onclick = openExitDialog;
+exitDialog.onclose = resetExitRecovery;
 exitDialog.oncancel = event => { if ($<HTMLButtonElement>('#confirm-exit').disabled) event.preventDefault(); };
-$('#confirm-exit').onclick = async () => {
-  const button = $<HTMLButtonElement>('#confirm-exit'); if (button.disabled) return;
+async function requestExit(allowUnconfirmedRemote = false) {
+  const button = $<HTMLButtonElement>('#confirm-exit'); if (button.disabled || (allowUnconfirmedRemote && unconfirmedExitButton.hidden)) return;
+  resetExitRecovery();
   const extensionsButton = $<HTMLButtonElement>('#extensions-open');
   const dismissButtons = [...exitDialog.querySelectorAll<HTMLButtonElement>('[data-close]')];
   const dismissStates = dismissButtons.map(control => control.disabled);
   const languageWasDisabled = languageSelect.disabled; const extensionsWasDisabled = extensionsButton.disabled; let completed = false;
-  button.disabled = true; extensionsButton.disabled = true; for (const control of dismissButtons) control.disabled = true; if (native) languageSelect.disabled = true;
+  button.disabled = true; unconfirmedExitButton.disabled = true; extensionsButton.disabled = true; for (const control of dismissButtons) control.disabled = true; if (native) languageSelect.disabled = true;
   try {
     bindText(button, '확장 작업 완료를 기다리는 중…', 'Waiting for extension work to finish…');
     await Promise.all([extensionsManager.beginExit(), mobileControl.beginExit(), weeklyUsage.beginExit()]);
     bindText(button, '종료 중…', 'Exiting…');
     clearTimeout(saveTimer); scheduleSave(); await new Promise(resolve => setTimeout(resolve, 450)); await saveQueue;
     if (native) await nativeLanguageQueue;
-    await call('complete_exit', { confirmed: true }); completed = true;
-  } catch (error) { extensionsManager.cancelExit(); mobileControl.cancelExit(); weeklyUsage.cancelExit(); notifyError('앱 종료 실패', 'Could not exit app', error); }
+    await call('complete_exit', { confirmed: true, ...(allowUnconfirmedRemote ? { allowUnconfirmedRemote: true } : {}) }); completed = true;
+  } catch (error) {
+    extensionsManager.cancelExit(); mobileControl.cancelExit(); weeklyUsage.cancelExit();
+    if (native) {
+      try { if (await call<boolean>('unconfirmed_exit_available') === true) { unconfirmedExitButton.hidden = false; $('#unconfirmed-exit-warning').hidden = false; } }
+      catch { /* 복구 선택은 숨긴 채 원래 종료 오류를 보존한다. */ }
+    }
+    notifyError('앱 종료 실패', 'Could not exit app', error);
+  }
   finally {
-    button.disabled = false; dismissButtons.forEach((control, index) => { control.disabled = dismissStates[index]; }); bindText(button, '세션 종료 후 앱 닫기', 'Stop sessions and exit');
+    button.disabled = false; unconfirmedExitButton.disabled = false; dismissButtons.forEach((control, index) => { control.disabled = dismissStates[index]; }); bindText(button, '세션 종료 후 앱 닫기', 'Stop sessions and exit');
     if (!completed) { extensionsButton.disabled = extensionsWasDisabled; if (native) languageSelect.disabled = languageWasDisabled; }
   }
-};
+}
+$('#confirm-exit').onclick = () => void requestExit();
+unconfirmedExitButton.onclick = () => void requestExit(true);
 
 function toggleSearch(force?: boolean) { searchVisible = force ?? !searchVisible; $('#search-bar').hidden = !searchVisible; if (searchVisible) $<HTMLInputElement>('#terminal-search').focus(); }
 function find(previous = false) { const value = $<HTMLInputElement>('#terminal-search').value; const search = terminals.get(active)?.search; const found = !!value && search && (previous ? search.findPrevious(value) : search.findNext(value)); bindText($('#search-result'), !value ? '' : found ? '결과 찾음' : '결과 없음', !value ? '' : found ? 'Match found' : 'No matches'); }
@@ -739,7 +755,7 @@ async function initialize() {
     unlisteners.push(await listen<SessionInfo>('session-changed', event => receiveSession(event.payload)));
     unlisteners.push(await listen<string>('application-error', event => notify(event.payload, true)));
     unlisteners.push(await listen<boolean>('application-visibility', event => weeklyUsage.setVisible(event.payload)));
-    unlisteners.push(await listen('exit-requested', () => { const dialog = $<HTMLDialogElement>('#exit-dialog'); if (!dialog.open) dialog.showModal(); }));
+    unlisteners.push(await listen('exit-requested', openExitDialog));
     const [layoutValue, existing] = await Promise.all([call<unknown>('load_layout'), call<SessionInfo[]>('list_sessions')]);
     const wrapper = layoutValue as { layout?: unknown; sessions?: SessionInfo[] } | null;
     const layout = parseLayout(wrapper && 'layout' in wrapper ? wrapper.layout : layoutValue);

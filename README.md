@@ -123,6 +123,10 @@ mutations are allowed. The popup explains the connection scope and limitations.
 Stopping a shared session pins its original turn ID before closing its terminal;
 it never retargets a later mobile turn. Unconfirmed stops remain unknown and are
 not automatically resent. The shared daemon and registration survive app exit.
+If normal exit fails because a remote stop is unconfirmed, a separate **Close app
+with unconfirmed remote stop** action becomes available only after all local resources have
+been reaped. Remote work may continue. This action neither marks it stopped nor
+resends the stop request.
 Pairing codes are not saved. Physical phone pairing and control remain unvalidated.
 The development branch still requires CLI integration validation: the original
 R28 runtime cannot resume a newly started empty thread, and its default proxy
