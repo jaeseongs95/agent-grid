@@ -128,9 +128,11 @@ with unconfirmed remote stop** action becomes available only after all local res
 been reaped. Remote work may continue. This action neither marks it stopped nor
 resends the stop request.
 Pairing codes are not saved. Physical phone pairing and control remain unvalidated.
-The development branch still requires CLI integration validation: the original
-R28 runtime cannot resume a newly started empty thread, and its default proxy
-protection needs the companion CLI fix before this feature is released.
+Shared connections require the companion CLI fixes for newly started empty threads
+and default-proxy protection. The original R28 binary has remote APIs but lacks
+these fixes. Check the release notes for the compatible executable and checksum.
+A history-unavailable warning preserves live session input; it does not mean that
+all previous messages have loaded.
 
 ## Weekly usage
 
