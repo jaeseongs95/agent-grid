@@ -89,7 +89,9 @@ impl Drop for LaunchGuard {
         self.session.flow.cancel();
         let process = self.session.process.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(process) = process {
+            let shared_cleanup_failed = process.shared_cleanup_failed.load(Ordering::Acquire);
             let _ = process.terminate();
+            self.session.cleanup_failed.fetch_or(shared_cleanup_failed || process.shared_cleanup_failed.load(Ordering::Acquire), Ordering::AcqRel);
             process.close_io();
             let adapter = process.adapter.lock().unwrap_or_else(|e| e.into_inner()).take();
             drop(adapter);
@@ -658,6 +660,10 @@ fn size(cols: u16, rows: u16) -> PtySize { PtySize { cols, rows, pixel_width: 0,
 fn validate_size(cols: u16, rows: u16) -> Result<(), String> {
     if !(2..=1000).contains(&cols) || !(1..=1000).contains(&rows) { Err("terminal size must be 2..1000 columns and 1..1000 rows".into()) } else { Ok(()) }
 }
+
+#[cfg(all(test, windows))]
+#[path = "session_launch_guard_tests.rs"]
+mod launch_guard_tests;
 
 #[cfg(test)]
 mod lifecycle_tests {
