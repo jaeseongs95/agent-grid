@@ -8,11 +8,13 @@ import './style.css';
 import { MAX_WORKSPACE_SESSIONS, acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, projectKey, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo } from './model';
 import { createSessionBrowser, type ProjectInfo } from './session-browser';
 import { createExecutableSettings } from './executable-settings';
+import { bindAttribute, bindText, getLanguage, languageStorageError, onLanguageChange, setLanguage, t } from './i18n';
 
 const native = isTauri();
 const demo = !native && new URLSearchParams(location.search).has('demo');
 const $ = <T extends HTMLElement = HTMLElement>(selector: string) => document.querySelector<T>(selector)!;
-const states: Record<string, string> = { restored: '저장됨 · 미실행', notLoaded: '상태 미확인', starting: '시작 중', running: '실행 중', idle: '입력 가능', waiting: '응답 대기', stopping: '종료 중', stopped: '종료됨', exited: '종료됨', error: '오류', unknown: '상태 미확인' };
+const states: Record<string, [string, string]> = { restored: ['저장됨 · 미실행', 'Saved · not started'], notLoaded: ['상태 미확인', 'Unknown state'], starting: ['시작 중', 'Starting'], running: ['실행 중', 'Running'], idle: ['입력 가능', 'Ready'], waiting: ['응답 대기', 'Waiting for response'], stopping: ['종료 중', 'Stopping'], stopped: ['종료됨', 'Stopped'], exited: ['종료됨', 'Exited'], error: ['오류', 'Error'], unknown: ['상태 미확인', 'Unknown state'] };
+function stateLabels(state: string): [string, string] { return states[state] ?? states.unknown; }
 const sessions = new Map<string, Session>();
 const selected = new Set<string>();
 const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; input: Promise<void>; resize: Promise<void>; resizeTimer?: ReturnType<typeof setTimeout> }>();
@@ -39,7 +41,7 @@ let projectSelectionVersion = 0;
 
 $('#app').innerHTML = `
   <aside class="sidebar">
-    <a class="brand" href="#" aria-label="Agent Grid 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span>Agent Grid<span class="version">0.2</span></a>
+    <a class="brand" href="#" aria-label="Agent Grid 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span>Agent Grid<span class="version">0.3</span></a>
     <div class="workspace-label">WORKSPACE <span class="local-pill">LOCAL</span></div>
     <button class="workspace-choice"><span class="folder-icon">▤</span><span>나의 작업 공간<small>독립된 터미널, 하나의 화면</small></span></button>
     <div class="side-heading">프로젝트 <span id="project-count">0</span></div>
@@ -49,6 +51,7 @@ $('#app').innerHTML = `
     <nav id="session-list" aria-label="세션 목록"></nav>
     <button id="external-toggle" class="side-link"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button>
     <button id="codex-settings-open" class="side-link"><span>⚙</span> 실행 파일 설정</button>
+    <div class="language-setting"><label for="language-select">언어 / Language</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div>
     <div class="sidebar-bottom"><span class="connection-dot"></span><span id="connection">연결 확인 중</span><small>Windows · 로컬 실행</small></div>
   </aside>
   <main>
@@ -71,9 +74,129 @@ $('#app').innerHTML = `
   <dialog id="exit-dialog"><div class="dialog-heading"><span class="eyebrow">EXIT WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>Agent Grid를 종료할까요?</h2><p>앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.</p><div class="dialog-actions"><button class="quiet-button" data-close>계속 작업</button><button id="confirm-exit" class="danger-button">세션 종료 후 앱 닫기</button></div></dialog>
 `;
 
-function message(error: unknown) { return error instanceof Error ? error.message : String(error); }
+// Register only app-owned templates, before any terminal or user content is inserted.
+const markupLabels: Record<string, [string, string]> = {
+  "Agent Grid 홈": ["Agent Grid 홈", "Agent Grid home"],
+  "WORKSPACE": ["작업 공간", "WORKSPACE"],
+  "LOCAL": ["로컬", "LOCAL"],
+  "나의 작업 공간": ["나의 작업 공간", "My workspace"],
+  "독립된 터미널, 하나의 화면": ["독립된 터미널, 하나의 화면", "Independent terminals, one view"],
+  "프로젝트": ["프로젝트", "Projects"],
+  "+ 프로젝트 가져오기": ["+ 프로젝트 가져오기", "+ Import project"],
+  "세션": ["세션", "Sessions"],
+  "새 세션 만들기": ["새 세션 만들기", "Create a session"],
+  "세션 목록": ["세션 목록", "Session list"],
+  "외부 세션": ["외부 세션", "External sessions"],
+  "읽기 전용": ["읽기 전용", "Read only"],
+  "실행 파일 설정": ["실행 파일 설정", "Executable settings"],
+  "언어": ["언어", "Language"],
+  "연결 확인 중": ["연결 확인 중", "Checking connection"],
+  "Windows · 로컬 실행": ["Windows · 로컬 실행", "Windows · local execution"],
+  "작업 공간": ["작업 공간", "Workspace"],
+  "세션 그리드": ["세션 그리드", "Session grid"],
+  "LOCAL WORKSPACE": ["로컬 작업 공간", "LOCAL WORKSPACE"],
+  "알림 보기": ["알림 보기", "View notifications"],
+  "앱 종료": ["앱 종료", "Exit app"],
+  "YOUR AGENTS, IN VIEW": ["에이전트 작업을 한눈에", "YOUR AGENTS, IN VIEW"],
+  "흐름을 놓치지 않고, 여러 작업을 함께.": ["흐름을 놓치지 않고, 여러 작업을 함께.", "Keep track of every task, all in one place."],
+  "세션 불러오기": ["세션 불러오기", "Load sessions"],
+  "새 세션": ["새 세션", "New session"],
+  "프로젝트별 세션": ["프로젝트별 세션", "Sessions by project"],
+  "그리드 도구": ["그리드 도구", "Grid tools"],
+  "실행 중": ["실행 중", "running"],
+  "0개 세션": ["0개 세션", "0 sessions"],
+  "활성 터미널 검색 (Ctrl+Shift+F)": ["활성 터미널 검색 (Ctrl+Shift+F)", "Search active terminal (Ctrl+Shift+F)"],
+  "검색": ["검색", "Search"],
+  "열": ["열", "Columns"],
+  "그리드 열 수": ["그리드 열 수", "Grid column count"],
+  "1열": ["1열", "1 column"],
+  "2열": ["2열", "2 columns"],
+  "3열": ["3열", "3 columns"],
+  "4열": ["4열", "4 columns"],
+  "저장된 작업 공간이 있습니다. 프로세스는 자동으로 시작하지 않습니다.": ["저장된 작업 공간이 있습니다. 프로세스는 자동으로 시작하지 않습니다.", "A saved workspace is available. Processes will not start automatically."],
+  "저장 세션 보기 →": ["저장 세션 보기 →", "View saved sessions →"],
+  "활성 터미널 검색": ["활성 터미널 검색", "Search active terminal"],
+  "검색어 입력": ["검색어 입력", "Enter search text"],
+  "이전 검색 결과": ["이전 검색 결과", "Previous match"],
+  "다음 검색 결과": ["다음 검색 결과", "Next match"],
+  "검색 닫기": ["검색 닫기", "Close search"],
+  "다음 작업을 펼쳐 보세요": ["다음 작업을 펼쳐 보세요", "Open your next task"],
+  "프로젝트 경로를 선택해 첫 세션을 시작하세요.": ["프로젝트 경로를 선택해 첫 세션을 시작하세요.", "Choose a project path to start your first session."],
+  "각 세션은 독립된 터미널에서 실행됩니다.": ["각 세션은 독립된 터미널에서 실행됩니다.", "Each session runs in its own terminal."],
+  "+ 첫 세션 만들기": ["+ 첫 세션 만들기", "+ Create first session"],
+  "Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션": ["Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션", "Alt + 1–9 switch sessions · Ctrl + Tab next session"],
+  "선택 전송": ["선택 전송", "Send to selected"],
+  "선택한 세션이 없습니다": ["선택한 세션이 없습니다", "No sessions selected"],
+  "선택 해제": ["선택 해제", "Clear selection"],
+  "선택한 세션에 보낼 메시지": ["선택한 세션에 보낼 메시지", "Message for selected sessions"],
+  "체크한 세션에 같은 메시지를 보냅니다. 대기·미확인 세션은 제외됩니다.": ["체크한 세션에 같은 메시지를 보냅니다. 대기·미확인 세션은 제외됩니다.", "Send the same message to checked sessions. Waiting or unknown sessions are excluded."],
+  "전송": ["전송", "Send"],
+  "로컬 세션만 제어합니다": ["로컬 세션만 제어합니다", "Controlling local sessions only"],
+  "드래그로 순서 변경": ["드래그로 순서 변경", "Drag to reorder"],
+  "경계선으로 크기 조절": ["경계선으로 크기 조절", "Drag borders to resize"],
+  "레이아웃 자동 저장": ["레이아웃 자동 저장", "Layout autosave"],
+  "NEW SESSION": ["새 세션", "NEW SESSION"],
+  "닫기": ["닫기", "Close"],
+  "선택한 프로젝트에서 로컬 에이전트를 시작합니다.": ["선택한 프로젝트에서 로컬 에이전트를 시작합니다.", "Start a local agent in the selected project."],
+  "세션 이름": ["세션 이름", "Session name"],
+  "예: API 개선": ["예: API 개선", "e.g. API improvements"],
+  "프로젝트 경로": ["프로젝트 경로", "Project path"],
+  "실제로 존재하는 로컬 디렉터리의 절대 경로를 입력하세요.": ["실제로 존재하는 로컬 디렉터리의 절대 경로를 입력하세요.", "Enter the absolute path of an existing local directory."],
+  "이어갈 스레드 ID": ["이어갈 스레드 ID", "Thread ID to resume"],
+  "선택": ["선택", "optional"],
+  "비워 두면 새 대화로 시작합니다": ["비워 두면 새 대화로 시작합니다", "Leave blank to start a new conversation"],
+  "취소": ["취소", "Cancel"],
+  "세션 시작 →": ["세션 시작 →", "Start session →"],
+  "SAVED WORKSPACE": ["저장된 작업 공간", "SAVED WORKSPACE"],
+  "저장된 세션": ["저장된 세션", "Saved sessions"],
+  "버튼을 누른 세션만 시작합니다. 스레드 ID가 있으면 해당 대화를 재개합니다.": ["버튼을 누른 세션만 시작합니다. 스레드 ID가 있으면 해당 대화를 재개합니다.", "Only sessions you choose will start. A thread ID resumes its conversation."],
+  "READ ONLY": ["읽기 전용", "READ ONLY"],
+  "다른 앱에서 발견한 기록입니다. 관측 정보이며 현재 실행 상태는 미확인입니다. 입력하거나 종료할 수 없습니다.": ["다른 앱에서 발견한 기록입니다. 관측 정보이며 현재 실행 상태는 미확인입니다. 입력하거나 종료할 수 없습니다.", "Records found in other apps. These observations do not confirm the current runtime state. Input and stopping are unavailable."],
+  "새로 고침": ["새로 고침", "Refresh"],
+  "ACTIVITY": ["활동", "ACTIVITY"],
+  "알림": ["알림", "Notifications"],
+  "새로운 알림이 없습니다.": ["새로운 알림이 없습니다.", "No new notifications."],
+  "EXIT WORKSPACE": ["작업 공간 종료", "EXIT WORKSPACE"],
+  "Agent Grid를 종료할까요?": ["Agent Grid를 종료할까요?", "Exit Agent Grid?"],
+  "앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.": ["앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.", "All running sessions owned by this app will stop. Sessions in other apps are unaffected. The window close button hides the app to the tray."],
+  "계속 작업": ["계속 작업", "Keep working"],
+  "세션 종료 후 앱 닫기": ["세션 종료 후 앱 닫기", "Stop sessions and exit"],
+  "선택 전송 대상": ["선택 전송 대상", "Select for broadcast"],
+  "앞으로 이동": ["앞으로 이동", "Move earlier"],
+  "뒤로 이동": ["뒤로 이동", "Move later"],
+  "세션 최대화": ["세션 최대화", "Maximize session"],
+  "이 세션 종료": ["이 세션 종료", "Stop this session"],
+  "직접 입력 · IME · 붙여넣기": ["직접 입력 · IME · 붙여넣기", "Direct input · IME · paste"],
+};
+function localizeMarkup(root: Element) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = node.textContent ?? ''; const labels = markupLabels[text.trim()];
+    if (labels) { const leading = text.match(/^\s*/)?.[0] ?? ''; const trailing = text.match(/\s*$/)?.[0] ?? ''; bindText(node, leading + labels[0] + trailing, leading + labels[1] + trailing); }
+  }
+  for (const element of [root, ...root.querySelectorAll('*')]) for (const attribute of ['title', 'aria-label', 'placeholder']) {
+    const labels = markupLabels[element.getAttribute(attribute) ?? ''];
+    if (labels) bindAttribute(element, attribute, ...labels);
+  }
+}
+localizeMarkup($('#app'));
+const languageSelect = $<HTMLSelectElement>('#language-select'); languageSelect.value = getLanguage();
+function showLanguageError(error: unknown) {
+  const node = $('#language-error'); node.hidden = false;
+  bindText(node, `언어 설정을 저장할 수 없습니다. 이번 실행에는 적용됩니다. ${message(error)}`, `Cannot save the language setting. It applies for this session. ${message(error)}`);
+}
+languageSelect.onchange = () => { $('#language-error').hidden = true; try { setLanguage(languageSelect.value as 'ko' | 'en'); } catch (error) { showLanguageError(error); } };
+onLanguageChange(() => { languageSelect.value = getLanguage(); for (const field of createFields) if (field.validity.customError) validateRequired(field); if (native) void syncNativeLanguage(); });
+if (languageStorageError() !== undefined) showLanguageError(languageStorageError());
+async function syncNativeLanguage() { try { await call('set_ui_language', { language: getLanguage() }); } catch (error) { notify(`기본 메뉴 언어 변경 실패: ${message(error)}`, true, `Could not update native menu language: ${message(error)}`); } }
+
+class UiError extends Error { constructor(readonly ko: string, readonly en: string) { super(t(ko, en)); } }
+function message(error: unknown, language = getLanguage()) { return error instanceof UiError ? language === 'ko' ? error.ko : error.en : error instanceof Error ? error.message : String(error); }
+function showError(node: Node, error: unknown) { bindText(node, message(error, 'ko'), message(error, 'en')); }
+function notifyError(ko: string, en: string, error: unknown) { notify(`${ko}: ${message(error, 'ko')}`, true, `${en}: ${message(error, 'en')}`); }
+function listStatus(node: Element, ko: string, en: string) { const text = document.createElement('span'); bindText(text, ko, en); node.replaceChildren(text); }
 function resumeTitle(value: string) {
-  const clean = value.replace(/\p{Cc}/gu, ' ').trim() || '이름 없는 세션';
+  const clean = value.replace(/\p{Cc}/gu, ' ').trim() || t('이름 없는 세션', 'Untitled session');
   const encoder = new TextEncoder(); let title = ''; let bytes = 0;
   // Catalog previews can be longer than native session labels. Keep whole Unicode characters.
   for (const character of clean) {
@@ -81,7 +204,7 @@ function resumeTitle(value: string) {
     if (bytes + size > 512) break;
     title += character; bytes += size;
   }
-  return title.trim() || '이름 없는 세션';
+  return title.trim() || t('이름 없는 세션', 'Untitled session');
 }
 function projectPath(cwd: string) { return cwd.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '').replace(/\//g, '\\'); }
 function visibleOrder() { return order.filter(id => !selectedProject || projectKey(sessions.get(id)!.cwd) === projectKey(selectedProject)); }
@@ -92,7 +215,7 @@ function selectProject(cwd: string) {
   for (const id of selected) if (!isVisible(id)) selected.delete(id);
   if (!isVisible(active)) active = visibleOrder()[0] ?? '';
   for (const [id, view] of terminals) { view.terminal.options.disableStdin = !native || !isVisible(id); if (!isVisible(id)) view.terminal.blur(); }
-  $('#search-result').textContent = ''; $('#broadcast-results').hidden = true;
+  bindText($('#search-result'), '', ''); $('#broadcast-results').hidden = true;
   renderAll();
 }
 function focusSession(id: string) {
@@ -101,20 +224,20 @@ function focusSession(id: string) {
   if (maximized) maximized = id;
   renderGrid(); setActive(id);
 }
-function notify(text: string, error = false) {
+function notify(text: string, error = false, english = text) {
   const toast = document.createElement('div');
   toast.className = `toast${error ? ' error' : ''}`;
-  toast.textContent = text;
+  bindText(toast, text, english);
   $('#toast-area').append(toast);
   setTimeout(() => toast.remove(), error ? 12000 : 6000);
-  const item = document.createElement('p'); item.textContent = `${new Date().toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}  ${text}`;
+  const item = document.createElement('p'); const time = new Date(); const stamp = (language: string) => time.toLocaleTimeString(language, { hour: '2-digit', minute: '2-digit' }); bindText(item, `${stamp('ko-KR')}  ${text}`, `${stamp('en-US')}  ${english}`);
   const list = $('#notification-list'); list.querySelector('.muted')?.remove(); list.prepend(item);
   while (list.children.length > 100) list.lastElementChild?.remove();
   $('#notification-count').hidden = false; $('#notification-count').textContent = String(++notificationCount);
 }
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  if (!native) throw new Error(demo ? '디자인 데모에서는 프로세스를 실행하거나 입력할 수 없습니다.' : '데스크톱 앱에서 사용할 수 있는 기능입니다.');
+  if (!native) throw new UiError(demo ? '디자인 데모에서는 프로세스를 실행하거나 입력할 수 없습니다.' : '데스크톱 앱에서 사용할 수 있는 기능입니다.', demo ? 'The design demo cannot run processes or accept input.' : 'This feature is available in the desktop app.');
   return invoke<T>(command, args);
 }
 
@@ -123,8 +246,8 @@ function scheduleSave() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     const layout: Layout = { version: 1, columns, columnSizes: [...columnSizes], rowSizes: [...rowSizes], sessions: order.map(id => sessions.get(id)!).filter(Boolean).map(({ title, cwd, threadId }) => ({ title, cwd, threadId })) };
-    $('#save-status').textContent = '저장 중…';
-    saveQueue = saveQueue.then(() => call('save_layout', { layout })).then(() => { $('#save-status').textContent = '레이아웃 저장됨'; }).catch(error => { $('#save-status').textContent = '레이아웃 저장 실패'; notify(`저장 실패: ${message(error)}`, true); });
+    bindText($('#save-status'), '저장 중…', 'Saving…');
+    saveQueue = saveQueue.then(() => call('save_layout', { layout })).then(() => { bindText($('#save-status'), '레이아웃 저장됨', 'Layout saved'); }).catch(error => { bindText($('#save-status'), '레이아웃 저장 실패', 'Could not save layout'); notifyError('저장 실패', 'Could not save', error); });
   }, 400);
 }
 
@@ -144,7 +267,7 @@ function sendInput(id: string, data: string) {
     const current = sessions.get(id);
     if (selectionVersion !== projectSelectionVersion || !current?.active || !isVisible(id) || current.generation !== generation || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(current.state)) return;
     return call<void>('session_write', { id, generation, data });
-  }).catch(error => notify(`${session.title} 입력 실패: ${message(error)}`, true));
+  }).catch(error => notifyError(`${session.title} 입력 실패`, `${session.title} input failed`, error));
 }
 
 function queueResize(id: string) {
@@ -155,13 +278,14 @@ function queueResize(id: string) {
       const current = sessions.get(id);
       if (!current || !current.active || !isVisible(id) || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(current.state)) return;
       await call('session_resize', { id, generation: current.generation, cols: view.terminal.cols, rows: view.terminal.rows });
-    }).catch(error => notify(`터미널 크기 변경 실패: ${message(error)}`, true));
+    }).catch(error => notifyError('터미널 크기 변경 실패', 'Could not resize terminal', error));
   }, 60);
 }
 
 function createTerminal(session: Session) {
   const card = document.createElement('article'); card.className = 'terminal-card'; card.dataset.id = session.id;
   card.innerHTML = `<header class="terminal-header"><label class="select-session" title="선택 전송 대상"><input type="checkbox" aria-label="선택 전송 대상"/></label><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-state"></span><div class="card-actions"><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">직접 입력 · IME · 붙여넣기</span></div>`;
+  localizeMarkup(card);
   const terminal = new Terminal({ fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.45, cursorBlink: true, scrollback: 10000, disableStdin: !native, allowProposedApi: false, theme: { background: '#141820', foreground: '#ced5e3', cursor: '#a5b4fc', selectionBackground: '#3b4567', black: '#212735', red: '#f78b99', green: '#91d6ad', yellow: '#eac184', blue: '#8eaafb', magenta: '#c4a4f3', cyan: '#87cfd9', white: '#e3e8f0' } });
   const fit = new FitAddon(); const search = new SearchAddon(); terminal.loadAddon(fit); terminal.loadAddon(search);
   $('#grid').append(card); terminal.open(card.querySelector('.terminal-host')!);
@@ -178,12 +302,12 @@ function createTerminal(session: Session) {
   card.querySelector('.stop')!.addEventListener('click', () => {
     const current = sessions.get(session.id)!;
     if (['restored', 'stopped', 'exited'].includes(current.state)) { removeSession(session.id); return; }
-    if (confirm(`“${current.title}” 세션을 종료할까요? 실행 중인 작업이 중단됩니다.`)) {
+    if (confirm(t(`“${current.title}” 세션을 종료할까요? 실행 중인 작업이 중단됩니다.`, `Stop session “${current.title}”? Running work will be interrupted.`))) {
       void call('session_stop', { id: current.id, generation: current.generation }).then(() => {
         // A reaped error may not emit another state event. A live observation error
         // is removed only after the native stop has completed its actual cleanup.
         if (current.state === 'error' && sessions.get(current.id)?.generation === current.generation) removeSession(current.id);
-      }).catch(error => notify(`종료 실패: ${message(error)}`, true));
+      }).catch(error => notifyError('종료 실패', 'Could not stop session', error));
     }
   });
   card.querySelector('.move-left')!.addEventListener('click', () => move(session.id, -1));
@@ -205,7 +329,7 @@ function receiveSession(info: SessionInfo, persist = true) {
   if (!order.includes(session.id)) order.push(session.id);
   const terminal = terminals.get(session.id)?.terminal ?? createTerminal(session);
   if (previous && previous.generation !== session.generation) terminal.reset();
-  if (previous && previous.state !== session.state) notify(`${session.title} · ${states[session.state] ?? '상태 미확인'}`);
+  if (previous && previous.state !== session.state) notify(`${session.title} · ${stateLabels(session.state)[0]}`, false, `${session.title} · ${stateLabels(session.state)[1]}`);
   renderAll();
   if (!previous || previous.state === 'starting') queueResize(session.id);
   const buffered = pending.get(session.id); if (buffered) { pending.delete(session.id); buffered.forEach(receiveOutput); }
@@ -213,7 +337,7 @@ function receiveSession(info: SessionInfo, persist = true) {
   if (persist) scheduleSave();
 }
 
-function ack(output: Output) { if (native) void call('session_output_ack', { id: output.id, generation: output.generation, seq: output.seq }).catch(error => notify(`출력 확인 전송 실패: ${message(error)}`, true)); }
+function ack(output: Output) { if (native) void call('session_output_ack', { id: output.id, generation: output.generation, seq: output.seq }).catch(error => notifyError('출력 확인 전송 실패', 'Could not acknowledge output', error)); }
 async function resolveOrphan(id: string) {
   if (!native || resolving.has(id)) return;
   resolving.add(id);
@@ -223,11 +347,11 @@ async function resolveOrphan(id: string) {
     if (session) receiveSession(session);
     else {
       const queue = pending.get(id); pending.delete(id);
-      if (queue?.length) { queue.forEach(ack); notify('소유 세션을 찾을 수 없는 출력이 도착했습니다.', true); }
+      if (queue?.length) { queue.forEach(ack); notify('소유 세션을 찾을 수 없는 출력이 도착했습니다.', true, 'Output arrived for a session that is no longer owned.'); }
     }
   } catch (error) {
     const queue = pending.get(id); pending.delete(id); queue?.forEach(ack);
-    notify(`터미널 메타데이터 조회 실패: ${message(error)}`, true);
+    notifyError('터미널 메타데이터 조회 실패', 'Could not load terminal metadata', error);
   } finally { resolving.delete(id); }
 }
 function receiveOutput(output: Output) {
@@ -236,7 +360,7 @@ function receiveOutput(output: Output) {
     const queue = pending.get(output.id) ?? [];
     // Bound startup metadata races; do not permit an orphan event to grow memory forever.
     if (pending.size < 32 && queue.reduce((size, part) => size + part.data.length, 0) + output.data.length <= 524288) { queue.push(output); pending.set(output.id, queue); void resolveOrphan(output.id); }
-    else { notify('메타데이터가 없는 터미널 출력이 버퍼 한도를 초과했습니다.', true); ack(output); }
+    else { notify('메타데이터가 없는 터미널 출력이 버퍼 한도를 초과했습니다.', true, 'Terminal output without metadata exceeded the buffer limit.'); ack(output); }
     return;
   }
   if (!acceptOutput(session, output)) { ack(output); return; }
@@ -247,9 +371,9 @@ function receiveOutput(output: Output) {
 
 function renderCounts() {
   const visible = visibleSessions(); const live = visible.filter(session => session.active).length;
-  $('#running-count').textContent = String(live); $('#total-count').textContent = `${visible.length}개 세션`; $('#side-count').textContent = String(visible.length);
+  $('#running-count').textContent = String(live); bindText($('#total-count'), `${visible.length}개 세션`, `${visible.length} session${visible.length === 1 ? '' : 's'}`); $('#side-count').textContent = String(visible.length);
   const targets = broadcastTargets(visible, selected);
-  $('#selected-count').textContent = selected.size ? `${selected.size}개 선택 · 전송 가능 ${targets.length}개` : '선택한 세션이 없습니다';
+  bindText($('#selected-count'), selected.size ? `${selected.size}개 선택 · 전송 가능 ${targets.length}개` : '선택한 세션이 없습니다', selected.size ? `${selected.size} selected · ${targets.length} ready to send` : 'No sessions selected');
   $<HTMLButtonElement>('#broadcast-send').disabled = !native || targets.length === 0 || !$<HTMLInputElement>('#broadcast-input').value.trim();
 }
 
@@ -262,12 +386,12 @@ function renderSide() {
   $('#project-count').textContent = String(projects.size);
   $('#projects').replaceChildren();
   for (const [key, { cwd, name, count }] of projects) { const row = document.createElement('button'); row.className = `project-row${selectedProject && projectKey(selectedProject) === key ? ' active' : ''}`; row.setAttribute('aria-pressed', String(!!selectedProject && projectKey(selectedProject) === key)); const label = document.createElement('span'); label.textContent = name; row.title = cwd; row.dataset.projectCwd = cwd; const total = document.createElement('small'); total.textContent = String(count); row.append(document.createTextNode('▱ '), label, total); row.onclick = () => selectProject(cwd); $('#projects').append(row); }
-  if (!projects.size) { const p = document.createElement('p'); p.className = 'side-empty'; p.textContent = '폴더를 가져와 작업을 시작하세요'; $('#projects').append(p); }
+  if (!projects.size) { const p = document.createElement('p'); p.className = 'side-empty'; bindText(p, '폴더를 가져와 작업을 시작하세요', 'Import a folder to get started'); $('#projects').append(p); }
   const tabs = $('#project-tabs'); const focused = tabs.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.projectCwd : undefined; tabs.replaceChildren();
-  [{ cwd: '', name: '전체', count: sessions.size }, ...projects.values()].forEach(({ cwd, name, count }, index) => {
+  [{ cwd: '', name: '', count: sessions.size }, ...projects.values()].forEach(({ cwd, name, count }, index) => {
     const tab = document.createElement('button'); const chosen = projectKey(cwd) === projectKey(selectedProject);
-    tab.id = `project-tab-${index}`; tab.className = `project-tab${chosen ? ' active' : ''}`; tab.dataset.projectCwd = cwd; tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(chosen)); tab.setAttribute('aria-controls', 'grid-area'); tab.tabIndex = chosen ? 0 : -1; tab.title = cwd || '모든 프로젝트의 세션';
-    const label = document.createElement('span'); label.textContent = name; const total = document.createElement('small'); total.textContent = String(count); tab.append(label, document.createTextNode(' '), total); tab.onclick = () => { selectProject(cwd); $('#project-tabs [aria-selected="true"]').focus(); }; tabs.append(tab);
+    tab.id = `project-tab-${index}`; tab.className = `project-tab${chosen ? ' active' : ''}`; tab.dataset.projectCwd = cwd; tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(chosen)); tab.setAttribute('aria-controls', 'grid-area'); tab.tabIndex = chosen ? 0 : -1; if (cwd) tab.title = cwd; else bindAttribute(tab, 'title', '모든 프로젝트의 세션', 'Sessions from all projects');
+    const label = document.createElement('span'); if (cwd) label.textContent = name; else bindText(label, '전체', 'All'); const total = document.createElement('small'); total.textContent = String(count); tab.append(label, document.createTextNode(' '), total); tab.onclick = () => { selectProject(cwd); $('#project-tabs [aria-selected="true"]').focus(); }; tabs.append(tab);
     if (chosen) $('#grid-area').setAttribute('aria-labelledby', tab.id);
   });
   if (focused !== undefined) [...tabs.querySelectorAll<HTMLElement>('[role="tab"]')].find(tab => projectKey(tab.dataset.projectCwd ?? '') === projectKey(focused))?.focus();
@@ -286,8 +410,8 @@ function renderGrid() {
   grid.style.gridTemplateRows = maximized ? 'minmax(0,1fr)' : rowSizes.slice(0, rows).map(size => `minmax(0,${size}fr)`).join(' ');
   order.forEach((id, index) => { const view = terminals.get(id)!; view.card.hidden = !isVisible(id) || (!!maximized && id !== maximized); view.terminal.options.disableStdin = !native || !isVisible(id); if (grid.children[index] !== view.card) grid.insertBefore(view.card, grid.children[index] ?? null); });
   $('#empty').hidden = visible.length > 0;
-  $('#empty h2').textContent = selectedProject ? '이 프로젝트에 열린 세션이 없습니다' : '다음 작업을 펼쳐 보세요';
-  $('#empty p').textContent = selectedProject ? '새 세션을 만들거나 세션 불러오기에서 기존 대화를 이어가세요. 다른 프로젝트의 세션은 계속 실행됩니다.' : '프로젝트 경로를 선택해 첫 세션을 시작하세요. 각 세션은 독립된 터미널에서 실행됩니다.';
+  bindText($('#empty h2'), selectedProject ? '이 프로젝트에 열린 세션이 없습니다' : '다음 작업을 펼쳐 보세요', selectedProject ? 'No open sessions in this project' : 'Open your next task');
+  bindText($('#empty p'), selectedProject ? '새 세션을 만들거나 세션 불러오기에서 기존 대화를 이어가세요. 다른 프로젝트의 세션은 계속 실행됩니다.' : '프로젝트 경로를 선택해 첫 세션을 시작하세요. 각 세션은 독립된 터미널에서 실행됩니다.', selectedProject ? 'Create a session or load an existing conversation. Sessions in other projects keep running.' : 'Choose a project path to start your first session. Each session runs in its own terminal.');
   for (const button of document.querySelectorAll<HTMLElement>('[data-columns]')) { button.classList.toggle('active', Number(button.dataset.columns) === columns); button.setAttribute('aria-pressed', String(Number(button.dataset.columns) === columns)); }
   renderHandles(count, rows);
 }
@@ -301,7 +425,7 @@ function renderHandles(count: number, rows: number) {
     for (let index = 0; index < length - 1; index++) {
       position += sizes[index]; const boundary = position; const handle = document.createElement('div'); handle.className = `resize-handle ${axis}`;
       handle.style[axis === 'column' ? 'left' : 'top'] = `${position / total * 100}%`;
-      handle.setAttribute('role', 'separator'); handle.setAttribute('aria-orientation', axis === 'column' ? 'vertical' : 'horizontal'); handle.setAttribute('aria-label', `${index + 1}번째 ${axis === 'column' ? '열' : '행'} 크기 조절`); handle.tabIndex = 0;
+      handle.setAttribute('role', 'separator'); handle.setAttribute('aria-orientation', axis === 'column' ? 'vertical' : 'horizontal'); bindAttribute(handle, 'aria-label', `${index + 1}번째 ${axis === 'column' ? '열' : '행'} 크기 조절`, `Resize ${axis} ${index + 1}`); handle.tabIndex = 0;
       const adjust = (delta: number, first: number, second: number) => { const sum = first + second; sizes[index] = Math.max(sum * 0.15, Math.min(sum * 0.85, first + delta)); sizes[index + 1] = sum - sizes[index]; const grid = $('#grid'); grid.style[axis === 'column' ? 'gridTemplateColumns' : 'gridTemplateRows'] = sizes.slice(0, length).map(size => `minmax(0,${size}fr)`).join(' '); };
       handle.onkeydown = event => { if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) return; event.preventDefault(); adjust((event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : -1) * total * 0.03, sizes[index], sizes[index + 1]); renderHandles(count, rows); scheduleSave(); };
       handle.onpointerdown = event => {
@@ -321,10 +445,10 @@ function renderAll() {
     card.querySelector('.terminal-title')!.textContent = session.title;
     card.querySelector('.terminal-path')!.textContent = `▱  ${session.cwd}`;
     const state = card.querySelector('.session-state')!;
-    state.textContent = states[session.state] ?? '상태 미확인';
+    bindText(state, ...stateLabels(session.state));
     state.className = `session-state ${session.state}`;
     const identity = card.querySelector<HTMLElement>('.terminal-identity')!;
-    identity.textContent = `${String(order.indexOf(id) + 1).padStart(2, '0')}  ·  ${demo ? 'DEMO · 실제 세션 아님' : session.threadId ? `스레드 ${session.threadId.slice(0, 12)}` : '로컬 세션'}`;
+    const index = String(order.indexOf(id) + 1).padStart(2, '0'); bindText(identity, `${index}  ·  ${demo ? 'DEMO · 실제 세션 아님' : session.threadId ? `스레드 ${session.threadId.slice(0, 12)}` : '로컬 세션'}`, `${index}  ·  ${demo ? 'DEMO · example session' : session.threadId ? `Thread ${session.threadId.slice(0, 12)}` : 'Local session'}`);
     identity.title = session.threadId ?? '';
     const checkbox = card.querySelector<HTMLInputElement>('input')!;
     checkbox.checked = selected.has(id);
@@ -334,7 +458,10 @@ function renderAll() {
   renderCounts(); renderSide(); renderGrid();
 }
 
-function openCreate(cwd = selectedProject) { $('#create-error').hidden = true; if (cwd) { $<HTMLInputElement>('#session-cwd').value = projectPath(cwd); $<HTMLInputElement>('#session-thread').value = ''; } $<HTMLDialogElement>('#create-dialog').showModal(); $<HTMLInputElement>('#session-title').focus(); }
+function openCreate(cwd = selectedProject) { $('#create-error').hidden = true; if (cwd) { $<HTMLInputElement>('#session-cwd').value = projectPath(cwd); $<HTMLInputElement>('#session-thread').value = ''; } for (const field of createFields) validateRequired(field); $<HTMLDialogElement>('#create-dialog').showModal(); $<HTMLInputElement>('#session-title').focus(); }
+const createFields = [$<HTMLInputElement>('#session-title'), $<HTMLInputElement>('#session-cwd')];
+function validateRequired(field: HTMLInputElement) { field.setCustomValidity(field.value.trim() ? '' : t('이 항목을 입력하세요.', 'Please fill out this field.')); }
+for (const field of createFields) { field.addEventListener('invalid', () => validateRequired(field)); field.addEventListener('input', () => validateRequired(field)); }
 const sessionBrowser = createSessionBrowser({
   call,
   projectsChanged(projects) { importedProjects = projects; renderSide(); },
@@ -370,18 +497,19 @@ $('#broadcast-form').onsubmit = async event => {
   const targets = broadcastTargets(visibleSessions(), selected); if (!targets.length) return;
   const selectionVersion = projectSelectionVersion;
   const data = input.value + '\r'; const send = $<HTMLButtonElement>('#broadcast-send'); send.disabled = true; input.disabled = true;
-  const results = $('#broadcast-results'); results.hidden = false; results.textContent = '선택한 세션에 전송 중…';
+  const results = $('#broadcast-results'); results.hidden = false; listStatus(results, '선택한 세션에 전송 중…', 'Sending to selected sessions…');
+  const failures = new Map<string, unknown>();
   const outcomes = await broadcast(targets, id => sessions.get(id), target => {
     const view = terminals.get(target.id);
     const operation = (view?.input ?? Promise.resolve()).then(async () => {
       const current = sessions.get(target.id);
-      if (selectionVersion !== projectSelectionVersion || !current || !isVisible(target.id) || current.generation !== target.generation || !writable(current)) throw new Error('대기 중 프로젝트 또는 세션 상태가 변경되어 전송하지 않았습니다.');
+      if (selectionVersion !== projectSelectionVersion || !current || !isVisible(target.id) || current.generation !== target.generation || !writable(current)) throw new UiError('대기 중 프로젝트 또는 세션 상태가 변경되어 전송하지 않았습니다.', 'Not sent because the project or session state changed while queued.');
       await call('session_write', { id: target.id, generation: target.generation, data });
-    });
+    }).catch(error => { failures.set(target.id, error); throw error; });
     if (view) view.input = operation.catch(() => {}); // Outcome is shown per target below; keep the input queue usable.
     return operation;
   });
-  results.replaceChildren(...outcomes.map(outcome => { const item = document.createElement('span'); item.textContent = `${outcome.title}: ${outcome.status === 'sent' ? '전송됨' : outcome.status === 'skipped' ? '상태 변경으로 건너뜀' : `실패 — ${outcome.error}`}`; return item; }));
+  results.replaceChildren(...outcomes.map(outcome => { const item = document.createElement('span'); bindText(item, `${outcome.title}: ${outcome.status === 'sent' ? '전송됨' : outcome.status === 'skipped' ? '상태 변경으로 건너뜀' : `실패 — ${failures.has(outcome.id) ? message(failures.get(outcome.id), 'ko') : outcome.error}`}`, `${outcome.title}: ${outcome.status === 'sent' ? 'Sent' : outcome.status === 'skipped' ? 'Skipped after state change' : `Failed — ${failures.has(outcome.id) ? message(failures.get(outcome.id), 'en') : outcome.error}`}`); return item; }));
   input.disabled = false; renderCounts();
 };
 
@@ -401,7 +529,7 @@ async function start(request: SavedSession) {
       if (existing) {
         let latest: SessionInfo[];
         try { latest = await call<SessionInfo[]>('list_sessions'); }
-        catch (error) { throw new Error(`실행 중 세션 확인 실패: ${message(error)}`); }
+        catch (error) { throw new UiError(`실행 중 세션 확인 실패: ${message(error, 'ko')}`, `Could not check running sessions: ${message(error, 'en')}`); }
         for (const info of latest) if (sessions.has(info.id)) receiveSession(info);
         const owned = latest.find(info => info.threadId === request.threadId && info.active);
         if (owned) {
@@ -410,7 +538,7 @@ async function start(request: SavedSession) {
         }
       }
       // Reserve capacity only for a new native process, after reconciling any existing card.
-      if (sessions.size + pendingStarts >= MAX_WORKSPACE_SESSIONS) throw new Error(`작업 공간에는 시작 중인 세션을 포함해 최대 ${MAX_WORKSPACE_SESSIONS}개를 표시할 수 있습니다. 완료된 세션을 닫은 뒤 다시 시작하세요.`);
+      if (sessions.size + pendingStarts >= MAX_WORKSPACE_SESSIONS) throw new UiError(`작업 공간에는 시작 중인 세션을 포함해 최대 ${MAX_WORKSPACE_SESSIONS}개를 표시할 수 있습니다. 완료된 세션을 닫은 뒤 다시 시작하세요.`, `A workspace can display at most ${MAX_WORKSPACE_SESSIONS} sessions, including sessions that are starting. Close a finished session and try again.`);
       pendingStarts++; reserved = true;
       try {
         const info = await call<SessionInfo>('start_session', { request: { ...request, cols: 100, rows: 30 } });
@@ -424,7 +552,7 @@ async function start(request: SavedSession) {
           // The cleanup event can arrive after the rejected IPC. Reconcile owned cards before allowing retry.
           const latest = await call<SessionInfo[]>('list_sessions');
           for (const info of latest) if (sessions.has(info.id)) receiveSession(info);
-        } catch (refreshError) { throw new Error(`${message(error)} · 세션 상태 확인 실패: ${message(refreshError)}`); }
+        } catch (refreshError) { throw new UiError(`${message(error, 'ko')} · 세션 상태 확인 실패: ${message(refreshError, 'ko')}`, `${message(error, 'en')} · Could not check session state: ${message(refreshError, 'en')}`); }
         throw error;
       }
     } finally { if (reserved) pendingStarts--; if (request.threadId) pendingThreads.delete(request.threadId); }
@@ -436,29 +564,29 @@ $('#create-form').onsubmit = async event => {
   event.preventDefault(); const button = $<HTMLButtonElement>('#create-submit'); button.disabled = true;
   const threadId = $<HTMLInputElement>('#session-thread').value.trim();
   try { await start({ title: $<HTMLInputElement>('#session-title').value.trim(), cwd: $<HTMLInputElement>('#session-cwd').value.trim(), ...(threadId ? { threadId } : {}) }); $<HTMLDialogElement>('#create-dialog').close(); $<HTMLFormElement>('#create-form').reset(); }
-  catch (error) { $('#create-error').hidden = false; $('#create-error').textContent = message(error); } finally { button.disabled = false; }
+  catch (error) { $('#create-error').hidden = false; showError($('#create-error'), error); } finally { button.disabled = false; }
 };
 $('#restore-open').onclick = () => {
   const list = $('#restore-list'); list.replaceChildren();
-  for (const session of saved) { const row = document.createElement('div'); row.className = 'restore-item'; const title = document.createElement('strong'); title.textContent = session.title; const path = document.createElement('small'); path.textContent = session.cwd; const thread = document.createElement('small'); thread.textContent = session.threadId ? `스레드 ${session.threadId}` : '스레드 ID 없음 · 새 대화로 시작'; const button = document.createElement('button'); button.className = 'quiet-button'; button.textContent = session.threadId ? '이 대화 재개 →' : '새 대화 시작 →'; button.onclick = async () => { button.disabled = true; try { await start(session); button.textContent = '시작됨'; } catch (error) { notify(`복원 실패: ${message(error)}`, true); button.disabled = false; } }; row.append(title, path, thread, button); list.append(row); }
+  for (const session of saved) { const row = document.createElement('div'); row.className = 'restore-item'; const title = document.createElement('strong'); title.textContent = session.title; const path = document.createElement('small'); path.textContent = session.cwd; const thread = document.createElement('small'); bindText(thread, session.threadId ? `스레드 ${session.threadId}` : '스레드 ID 없음 · 새 대화로 시작', session.threadId ? `Thread ${session.threadId}` : 'No thread ID · starts a new conversation'); const button = document.createElement('button'); button.className = 'quiet-button'; bindText(button, session.threadId ? '이 대화 재개 →' : '새 대화 시작 →', session.threadId ? 'Resume conversation →' : 'Start new conversation →'); button.onclick = async () => { button.disabled = true; try { await start(session); bindText(button, '시작됨', 'Started'); } catch (error) { notifyError('복원 실패', 'Could not restore session', error); button.disabled = false; } }; row.append(title, path, thread, button); list.append(row); }
   $<HTMLDialogElement>('#restore-dialog').showModal();
 };
 
 async function refreshExternal() {
-  const list = $('#external-list'); list.textContent = '관측 기록을 불러오는 중…';
+  const list = $('#external-list'); listStatus(list, '관측 기록을 불러오는 중…', 'Loading observed records…');
   try { const external = await call<{ id: string; title: string; cwd: string; status: string; observedAt: string }[]>('list_external'); list.replaceChildren();
-    for (const session of external) { const item = document.createElement('div'); item.className = 'external-item'; const title = document.createElement('strong'); title.textContent = session.title; const cwd = document.createElement('small'); cwd.textContent = session.cwd || '경로 미확인'; const state = document.createElement('small'); state.textContent = `현재 상태 미확인 · 관측 ${session.observedAt || '시각 미확인'}`; item.append(title, cwd, state); list.append(item); }
-    if (!external.length) list.textContent = '발견된 외부 기록이 없습니다.';
-  } catch (error) { list.textContent = `불러오기 실패: ${message(error)}`; }
+    for (const session of external) { const item = document.createElement('div'); item.className = 'external-item'; const title = document.createElement('strong'); title.textContent = session.title; const cwd = document.createElement('small'); if (session.cwd) cwd.textContent = session.cwd; else bindText(cwd, '경로 미확인', 'Unknown path'); const state = document.createElement('small'); bindText(state, `현재 상태 미확인 · 관측 ${session.observedAt || '시각 미확인'}`, `Current state unknown · observed ${session.observedAt || 'at an unknown time'}`); item.append(title, cwd, state); list.append(item); }
+    if (!external.length) listStatus(list, '발견된 외부 기록이 없습니다.', 'No external records found.');
+  } catch (error) { listStatus(list, `불러오기 실패: ${message(error, 'ko')}`, `Could not load records: ${message(error, 'en')}`); }
 }
 $('#external-toggle').onclick = () => { $<HTMLDialogElement>('#external-dialog').showModal(); void refreshExternal(); };
 $('#external-refresh').onclick = () => void refreshExternal();
 $('#notifications').onclick = () => { notificationCount = 0; $('#notification-count').hidden = true; $<HTMLDialogElement>('#notification-dialog').showModal(); };
 $('#exit').onclick = () => $<HTMLDialogElement>('#exit-dialog').showModal();
-$('#confirm-exit').onclick = async () => { const button = $<HTMLButtonElement>('#confirm-exit'); button.disabled = true; try { clearTimeout(saveTimer); scheduleSave(); await new Promise(resolve => setTimeout(resolve, 450)); await saveQueue; await call('complete_exit', { confirmed: true }); } catch (error) { notify(`앱 종료 실패: ${message(error)}`, true); } finally { button.disabled = false; } };
+$('#confirm-exit').onclick = async () => { const button = $<HTMLButtonElement>('#confirm-exit'); button.disabled = true; try { clearTimeout(saveTimer); scheduleSave(); await new Promise(resolve => setTimeout(resolve, 450)); await saveQueue; await call('complete_exit', { confirmed: true }); } catch (error) { notifyError('앱 종료 실패', 'Could not exit app', error); } finally { button.disabled = false; } };
 
 function toggleSearch(force?: boolean) { searchVisible = force ?? !searchVisible; $('#search-bar').hidden = !searchVisible; if (searchVisible) $<HTMLInputElement>('#terminal-search').focus(); }
-function find(previous = false) { const value = $<HTMLInputElement>('#terminal-search').value; const search = terminals.get(active)?.search; $('#search-result').textContent = !value ? '' : search && (previous ? search.findPrevious(value) : search.findNext(value)) ? '결과 찾음' : '결과 없음'; }
+function find(previous = false) { const value = $<HTMLInputElement>('#terminal-search').value; const search = terminals.get(active)?.search; const found = !!value && search && (previous ? search.findPrevious(value) : search.findNext(value)); bindText($('#search-result'), !value ? '' : found ? '결과 찾음' : '결과 없음', !value ? '' : found ? 'Match found' : 'No matches'); }
 $('#search-toggle').onclick = () => toggleSearch(); $('#search-close').onclick = () => toggleSearch(false); $('#search-prev').onclick = () => find(true); $('#search-next').onclick = () => find(); $('#terminal-search').oninput = () => find(); $('#terminal-search').onkeydown = event => { if (event.key === 'Enter') { event.preventDefault(); find(event.shiftKey); } if (event.key === 'Escape') toggleSearch(false); };
 document.addEventListener('keydown', event => {
   if (document.querySelector('dialog[open]')) return;
@@ -473,12 +601,13 @@ document.addEventListener('keydown', event => {
 
 async function initialize() {
   if (!native) {
-    $('#connection').textContent = demo ? '디자인 데모' : '브라우저 미리보기'; $('#mode-label').textContent = demo ? 'DESIGN DEMO' : 'BROWSER PREVIEW'; $('#runtime-banner').hidden = false;
-    $('#runtime-banner').textContent = demo ? '디자인 데모 · 아래 터미널은 정적인 예시입니다. 실제 프로세스 실행·입력·전송은 지원하지 않습니다.' : '브라우저 미리보기입니다. 실제 세션 실행은 Agent Grid 데스크톱 앱에서 사용할 수 있습니다.';
-    $('#save-status').textContent = '미리보기 · 저장 안 함';
+    bindText($('#connection'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'Design demo' : 'Browser preview'); bindText($('#mode-label'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'DESIGN DEMO' : 'BROWSER PREVIEW'); $('#runtime-banner').hidden = false;
+    bindText($('#runtime-banner'), demo ? '디자인 데모 · 아래 터미널은 정적인 예시입니다. 실제 프로세스 실행·입력·전송은 지원하지 않습니다.' : '브라우저 미리보기입니다. 실제 세션 실행은 Agent Grid 데스크톱 앱에서 사용할 수 있습니다.', demo ? 'Design demo · These terminals are static examples. Process execution, input and sending are unavailable.' : 'Browser preview. Run real sessions in the Agent Grid desktop app.');
+    bindText($('#save-status'), '미리보기 · 저장 안 함', 'Preview · not saved');
     if (demo) seedDemo(); renderAll(); return;
   }
   try {
+    await syncNativeLanguage();
     unlisteners.push(await listen<Output>('terminal-output', event => receiveOutput(event.payload)));
     unlisteners.push(await listen<SessionInfo>('session-changed', event => receiveSession(event.payload)));
     unlisteners.push(await listen<string>('application-error', event => notify(event.payload, true)));
@@ -490,9 +619,9 @@ async function initialize() {
     for (const session of existing) if (session.state !== 'restored' && (sessions.get(session.id)?.generation ?? -1) < session.generation) receiveSession(session, false);
     saved = chooseSavedSessions(layout, existing);
     $('#restore-banner').hidden = saved.length === 0;
-    $('#connection').textContent = '로컬 연결됨'; renderAll();
-    void sessionBrowser.refreshProjects().catch(error => notify(`프로젝트 목록 조회 실패: ${message(error)}`, true));
-  } catch (error) { $('#connection').textContent = '연결 오류'; notify(`초기화 실패: ${message(error)}`, true); }
+    bindText($('#connection'), '로컬 연결됨', 'Connected locally'); renderAll();
+    void sessionBrowser.refreshProjects().catch(error => notifyError('프로젝트 목록 조회 실패', 'Could not load projects', error));
+  } catch (error) { bindText($('#connection'), '연결 오류', 'Connection error'); notifyError('초기화 실패', 'Could not initialize', error); }
 }
 
 function seedDemo() {

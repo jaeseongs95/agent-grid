@@ -9,12 +9,12 @@ impl Drop for BusyPicker {
 }
 
 impl ExecutablePicker {
-    pub fn choose(&self, owner: isize) -> Result<Option<String>, String> {
+    pub fn choose(&self, owner: isize, language: crate::ui_language::UiLanguage) -> Result<Option<String>, String> {
         self.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "The executable chooser is already open")?;
         let _busy = BusyPicker(self.busy.clone());
         std::thread::Builder::new().name("executable-picker".into())
-            .spawn(move || choose_file(owner)).map_err(|e| format!("Start executable chooser: {e}"))?
+            .spawn(move || choose_file(owner, language)).map_err(|e| format!("Start executable chooser: {e}"))?
             .join().map_err(|_| "Executable chooser worker panicked".to_owned())?
     }
 }
@@ -35,7 +35,7 @@ fn selected_path(path: &Path) -> Result<String, String> {
 }
 
 #[cfg(windows)]
-fn choose_file(owner: isize) -> Result<Option<String>, String> {
+fn choose_file(owner: isize, language: crate::ui_language::UiLanguage) -> Result<Option<String>, String> {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt};
     use windows_sys::Win32::{
         Foundation::HWND,
@@ -49,8 +49,8 @@ fn choose_file(owner: isize) -> Result<Option<String>, String> {
     let initialized = unsafe { CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) };
     if initialized < 0 { return Err(format!("Initialize executable chooser COM apartment failed: {initialized:#010x}")); }
     let _apartment = Apartment;
-    let title: Vec<u16> = "CLI 실행 파일 선택\0".encode_utf16().collect();
-    let filter: Vec<u16> = "Windows 실행 파일 (*.exe)\0*.exe\0\0".encode_utf16().collect();
+    let title: Vec<u16> = language.text("CLI 실행 파일 선택", "Select CLI executable").encode_utf16().chain(Some(0)).collect();
+    let filter: Vec<u16> = language.text("Windows 실행 파일 (*.exe)\0*.exe\0\0", "Windows executable (*.exe)\0*.exe\0\0").encode_utf16().collect();
     let extension: Vec<u16> = "exe\0".encode_utf16().collect();
     let mut buffer = vec![0u16; 32768];
     let mut dialog = OPENFILENAMEW {
@@ -76,7 +76,7 @@ fn choose_file(owner: isize) -> Result<Option<String>, String> {
 }
 
 #[cfg(not(windows))]
-fn choose_file(_: isize) -> Result<Option<String>, String> {
+fn choose_file(_: isize, _: crate::ui_language::UiLanguage) -> Result<Option<String>, String> {
     Err("The native executable chooser is supported only on Windows".into())
 }
 

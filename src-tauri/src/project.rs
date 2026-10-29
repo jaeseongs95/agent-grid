@@ -46,20 +46,20 @@ impl Drop for BusyPicker {
 }
 
 impl FolderPicker {
-    pub fn choose(&self, owner: isize) -> Result<Option<String>, String> {
+    pub fn choose(&self, owner: isize, language: crate::ui_language::UiLanguage) -> Result<Option<String>, String> {
         self.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "The project folder chooser is already open")?;
         let _busy = BusyPicker(self.busy.clone());
         // The async runtime's blocking pool may have an existing MTA. Shell's
         // new-style folder chooser requires a fresh STA, never a changed mode.
         std::thread::Builder::new().name("project-folder-picker".into())
-            .spawn(move || choose_folder(owner)).map_err(|e| format!("Start folder chooser: {e}"))?
+            .spawn(move || choose_folder(owner, language)).map_err(|e| format!("Start folder chooser: {e}"))?
             .join().map_err(|_| "Project folder chooser worker panicked".to_owned())?
     }
 }
 
 #[cfg(windows)]
-fn choose_folder(owner: isize) -> Result<Option<String>, String> {
+fn choose_folder(owner: isize, language: crate::ui_language::UiLanguage) -> Result<Option<String>, String> {
     use std::{ffi::OsString, os::windows::ffi::OsStringExt};
     use windows_sys::Win32::{
         Foundation::HWND,
@@ -73,7 +73,7 @@ fn choose_folder(owner: isize) -> Result<Option<String>, String> {
     let initialized = unsafe { CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) };
     if initialized < 0 { return Err(format!("Initialize folder chooser COM apartment failed: {initialized:#010x}")); }
     let _apartment = Apartment;
-    let title: Vec<u16> = "프로젝트로 가져올 폴더를 선택하세요".encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = language.text("프로젝트로 가져올 폴더를 선택하세요", "Select a folder to import as a project").encode_utf16().chain(Some(0)).collect();
     let mut display_name = vec![0u16; 32768];
     let browse = BROWSEINFOW {
         hwndOwner: owner as HWND,
@@ -94,7 +94,7 @@ fn choose_folder(owner: isize) -> Result<Option<String>, String> {
 }
 
 #[cfg(not(windows))]
-fn choose_folder(_: isize) -> Result<Option<String>, String> {
+fn choose_folder(_: isize, _: crate::ui_language::UiLanguage) -> Result<Option<String>, String> {
     Err("The native project folder chooser is supported only on Windows".into())
 }
 

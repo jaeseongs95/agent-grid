@@ -8,6 +8,7 @@ pub mod process_job;
 mod session;
 pub mod self_test;
 mod storage;
+mod ui_language;
 
 use session::{BackendEvent, Engine, SessionInfo, StartRequest};
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
@@ -15,6 +16,24 @@ use tauri::{menu::{Menu, MenuItem}, tray::{MouseButton, MouseButtonState, TrayIc
 
 #[derive(Default)]
 struct ExitState(AtomicBool);
+
+struct UiSettings {
+    english: AtomicBool,
+    show: MenuItem<tauri::Wry>,
+    exit: MenuItem<tauri::Wry>,
+}
+
+#[tauri::command]
+fn set_ui_language(settings: State<'_, UiSettings>, language: ui_language::UiLanguage) -> Result<serde_json::Value, String> {
+
+    settings.show.set_text(language.text("Agent Grid 열기", "Open Agent Grid")).map_err(|e| format!("Update tray open label: {e}"))?;
+    settings.exit.set_text(language.text("종료…", "Exit…")).map_err(|e| format!("Update tray exit label: {e}"))?;
+    settings.english.store(language == ui_language::UiLanguage::En, Ordering::Release);
+    Ok(serde_json::json!({
+        "show": settings.show.text().map_err(|e| format!("Read tray open label: {e}"))?,
+        "exit": settings.exit.text().map_err(|e| format!("Read tray exit label: {e}"))?,
+    }))
+}
 
 fn workspace_directory(default: std::path::PathBuf, override_path: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, String> {
     match override_path {
@@ -72,14 +91,15 @@ async fn set_codex_executable(engine: State<'_, Engine>, path: Option<String>) -
     tauri::async_runtime::spawn_blocking(move || engine.set_codex_executable(path.as_deref())).await.map_err(|e| format!("Save executable setting worker: {e}"))?
 }
 #[tauri::command]
-async fn choose_codex_executable(app: tauri::AppHandle, engine: State<'_, Engine>, picker: State<'_, executable_picker::ExecutablePicker>) -> Result<Option<codex_settings::CodexSettings>, String> {
+async fn choose_codex_executable(app: tauri::AppHandle, engine: State<'_, Engine>, picker: State<'_, executable_picker::ExecutablePicker>, ui: State<'_, UiSettings>) -> Result<Option<codex_settings::CodexSettings>, String> {
     let engine = engine.inner().clone();
     let picker = picker.inner().clone();
+    let language = if ui.english.load(Ordering::Acquire) { ui_language::UiLanguage::En } else { ui_language::UiLanguage::Ko };
     #[cfg(windows)]
     let owner = app.get_webview_window("main").ok_or("Main window is unavailable")?.hwnd().map_err(|e| format!("Get executable chooser parent window: {e}"))?.0 as isize;
     #[cfg(not(windows))]
     let owner = { let _ = app; 0 };
-    tauri::async_runtime::spawn_blocking(move || picker.choose(owner)?.map(|path| engine.set_codex_executable(Some(&path))).transpose())
+    tauri::async_runtime::spawn_blocking(move || picker.choose(owner, language)?.map(|path| engine.set_codex_executable(Some(&path))).transpose())
         .await.map_err(|e| format!("Executable chooser worker: {e}"))?
 }
 #[tauri::command]
@@ -93,15 +113,16 @@ async fn import_project(engine: State<'_, Engine>, cwd: String) -> Result<projec
     tauri::async_runtime::spawn_blocking(move || engine.import_project(&cwd)).await.map_err(|e| format!("Import project worker: {e}"))?
 }
 #[tauri::command]
-async fn choose_project(app: tauri::AppHandle, engine: State<'_, Engine>, picker: State<'_, project::FolderPicker>) -> Result<Option<project::ProjectInfo>, String> {
+async fn choose_project(app: tauri::AppHandle, engine: State<'_, Engine>, picker: State<'_, project::FolderPicker>, ui: State<'_, UiSettings>) -> Result<Option<project::ProjectInfo>, String> {
     let engine = engine.inner().clone();
     let picker = picker.inner().clone();
+    let language = if ui.english.load(Ordering::Acquire) { ui_language::UiLanguage::En } else { ui_language::UiLanguage::Ko };
     #[cfg(windows)]
     let owner = app.get_webview_window("main").ok_or("Main window is unavailable")?.hwnd().map_err(|e| format!("Get project chooser parent window: {e}"))?.0 as isize;
     #[cfg(not(windows))]
     let owner = { let _ = app; 0 };
     tauri::async_runtime::spawn_blocking(move || {
-        picker.choose(owner)?.map(|cwd| engine.import_project(&cwd)).transpose()
+        picker.choose(owner, language)?.map(|cwd| engine.import_project(&cwd)).transpose()
     }).await.map_err(|e| format!("Project folder chooser worker: {e}"))?
 }
 #[tauri::command]
@@ -157,6 +178,7 @@ pub fn run() {
             let show = MenuItem::with_id(app, "show", "Agent Grid 열기", true, None::<&str>)?;
             let exit = MenuItem::with_id(app, "exit", "종료…", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &exit])?;
+            app.manage(UiSettings { english: AtomicBool::new(false), show, exit });
             let mut tray = TrayIconBuilder::new().tooltip("Agent Grid").menu(&menu).show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main(app),
@@ -170,7 +192,7 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, complete_exit])
+        .invoke_handler(tauri::generate_handler![set_ui_language, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, complete_exit])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<ExitState>().0.load(Ordering::Acquire) {

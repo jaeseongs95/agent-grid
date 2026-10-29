@@ -1,5 +1,7 @@
 # Agent Grid
 
+**English** | [한국어](README.ko.md)
+
 A Windows desktop grid for running coding-agent CLI sessions side by side.
 
 The first adapter supports the official Codex CLI. Arrange terminals in a
@@ -16,6 +18,15 @@ assets or branding from Claudes. That project's multi-terminal workflow was
 a product reference; its source-available license does not permit unapproved
 modification or redistribution. See the [reference license](https://github.com/paulallington/Claudes/blob/v1.9.82/LICENSE).
 
+## Language
+
+Select **한국어** or **English** from **언어 / Language** in the sidebar.
+Changes apply immediately to the app interface and native tray/chooser labels,
+and the selection is saved for the next launch in this app's WebView storage.
+The default is Korean. Session titles, paths, conversations and terminal output
+stay exactly as provided. CLI diagnostics and Windows system buttons can remain
+in their original language; the app does not change the CLI or OS locale.
+
 ## Running
 
 Download the portable ZIP or per-user installer from
@@ -25,38 +36,38 @@ Extract the whole portable ZIP and run `agent-grid.exe`. Keep
 `agent-grid-helper.exe` beside it: Windows requires a console process for the
 terminal side while the main application uses a normal desktop window.
 
-Install and sign in to the official Codex CLI first. Open **실행파일 설정**
+Install and sign in to the official Codex CLI first. Open **Executable settings**
 and select its native `codex.exe`; the app saves that path for future starts
 and history queries. The screen shows the saved path, resolved executable and
 where it came from. Cancelling the chooser keeps the previous setting.
 Changing it leaves running terminals alone.
 
-Choose **자동 찾기** to clear the app's saved override. Resolution then uses
+Choose **Use automatic discovery** to clear the app's saved override. Resolution then uses
 `AGENT_GRID_CODEX`, if set, followed by the native executable on `PATH`.
 The saved app preference has priority over both. Missing or invalid executables
 are reported explicitly instead of silently using a different program.
 The CLI must support authenticated app-server WebSockets and `--remote`.
 Older CLI versions are not silently downgraded to a different connection mode.
 
-Choose **프로젝트 가져오기** to select an existing local folder. Imported
+Choose **Import project** to select an existing local folder. Imported
 projects remain in the sidebar after their terminals stop. The session browser
 opens for that project; choose an existing conversation or start a new session
 with its working directory already filled in.
 
 Use the project tabs above the grid, or click a project in the sidebar, to
-view that project's sessions. **전체** shows every session. Switching tabs keeps
+view that project's sessions. **All** shows every session. Switching tabs keeps
 all terminals running and retains their output; group input and keyboard
 session shortcuts apply only to the visible project. New sessions and the
 session browser start with the selected project's directory.
 
-**세션 불러오기** opens a two-pane popup. Search session titles and filter by
+**Load sessions** opens a two-pane popup. Search session titles and filter by
 project on the left; inspect dates, the conversation ID and recent messages on
 the right before resuming. Already open conversations focus their existing
 terminal. Browsing uses read-only requests through a short-lived owned server,
 so it does not require an existing desktop daemon. Recent messages are fetched
 in bounded pages and are not stored in Agent Grid's database.
 
-Use **새 세션** to enter a directory directly. Use the official TUI to choose
+Use **New session** to enter a directory directly. Use the official TUI to choose
 a model, sign in or answer permission prompts. Select
 terminal cards before using group input. A reported delivery means bytes
 reached that terminal; it does not mean a model accepted or completed a turn.
@@ -101,7 +112,8 @@ Closing the window hides it to the tray. Complete exit terminates owned
 processes after confirmation. Restoring after a complete exit starts new
 processes against the saved conversation ID, rather than reviving an old PID.
 Authentication tokens are not stored in the application database.
-Only layout and session metadata are stored in the app's own SQLite database.
+Layout, session metadata, imported projects and the executable choice are stored
+in the app's own SQLite database. Language is stored separately in app WebView storage.
 Terminal transcripts and Codex authentication files are not copied there.
 
 ## Validation and releases

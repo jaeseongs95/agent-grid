@@ -268,6 +268,66 @@ try {
   const token = Date.now().toString(36);
   await check('create first real CLI session', () => createSession(`native-smoke-${token}-A`, cwd));
   await check('create second real CLI session', () => createSession(`native-smoke-${token}-B`, cwd));
+  await check('native Korean and English switch preserves two live CLI sessions and terminal DOM', async () => {
+    const before = await nativeCall('list_sessions');
+    assert.equal(before.filter(session => session.active).length, 2);
+    const retained = [];
+    for (const title of await tileTitles()) {
+      const card = tile(title);
+      retained.push({ title, path: await card.locator('.terminal-path').textContent(), screen: await card.locator('.xterm-screen').elementHandle(), output: await card.locator('.xterm-rows').innerText() });
+    }
+    try {
+      await page.locator('#language-select').selectOption('en');
+      await until(() => page.locator('html').getAttribute('lang'), value => value === 'en', 'English language applied');
+      assert.match((await page.locator('#new-session').textContent()) ?? '', /new session/i);
+      assert.match((await page.locator('#connection').textContent()) ?? '', /connected/i);
+      assert.equal(await page.evaluate(() => localStorage.getItem('agent-grid-language')), 'en');
+      const menu = await nativeCall('set_ui_language', { language: 'en' });
+      assert.deepEqual(menu, { show: 'Open Agent Grid', exit: 'Exit…' }, 'Native menu readback did not match English');
+      let invalidRejected = false;
+      try { await nativeCall('set_ui_language', { language: 'unsupported-language' }); } catch { invalidRejected = true; }
+      assert(invalidRejected, 'Native language command silently accepted an unsupported value');
+      await page.locator('#codex-settings-open').click();
+      await until(() => page.locator('#codex-settings-dialog').getAttribute('aria-busy'), value => value === 'false', 'English settings read completes');
+      assert.match((await page.locator('#codex-settings-title').textContent()) ?? '', /executable/i);
+      assert.match((await page.locator('#codex-executable-choose').textContent()) ?? '', /select|choose/i);
+      assert(!/[가-힣]/.test((await page.locator('#codex-executable-source').textContent()) ?? ''), 'English settings source contains Korean UI text');
+      await page.locator('#codex-settings-close').click();
+      await page.locator('#catalog-open').click();
+      await until(() => page.locator('#catalog-list').getAttribute('aria-busy'), value => value === 'false', 'English catalog query completes', 45_000);
+      assert.match((await page.locator('#catalog-title').textContent()) ?? '', /session/i);
+      assert.match((await page.locator('#catalog-search').getAttribute('placeholder')) ?? '', /session title/i);
+      assert.match((await page.locator('#catalog-project option').first().textContent()) ?? '', /all projects/i);
+      assert.match((await page.locator('#catalog-close').getAttribute('aria-label')) ?? '', /close/i);
+      await page.locator('#catalog-close').click();
+      const after = await nativeCall('list_sessions');
+      assert.equal(after.length, before.length, 'Language switch changed session count');
+      for (const previous of before) {
+        const current = after.find(session => session.id === previous.id);
+        assert(current?.active, 'Language switch stopped a live CLI session');
+        assert.equal(current.generation, previous.generation, 'Language switch restarted a PTY generation');
+        assert.equal(current.threadId, previous.threadId, 'Language switch replaced a CLI UUID');
+      }
+      const sessions = [];
+      for (const previous of retained) {
+        const card = tile(previous.title);
+        assert(previous.screen && await previous.screen.evaluate(element => element.isConnected && element.closest('.terminal-card')?.querySelector('.xterm-screen') === element), 'Language switch replaced an xterm DOM');
+        assert.equal(await card.locator('.terminal-title').textContent(), previous.title);
+        assert.equal(await card.locator('.terminal-path').textContent(), previous.path);
+        const output = await card.locator('.xterm-rows').innerText();
+        assert(output.trim().length > 10, 'Language switch cleared rendered terminal output');
+        // Real CLIs may asynchronously repaint. Record equality without claiming a quiet PTY.
+        sessions.push({ title: previous.title, sameTerminalDom: true, beforeOutputSha256: hash(previous.output), afterOutputSha256: hash(output), outputUnchanged: output === previous.output });
+      }
+      return { nativeMenuReadback: menu, invalidLanguageRejected: true, sameSessionIdsGenerationsAndThreadUuids: true, sessions, physicalTrayInteractionVerified: false, globalConfigurationWritten: false };
+    } finally {
+      if (await page.locator('dialog[open]').count()) await page.keyboard.press('Escape');
+      await page.locator('#language-select').selectOption('ko');
+      await until(() => page.locator('#connection').textContent(), value => value === '로컬 연결됨', 'Korean restored for existing smoke checks');
+      assert.deepEqual(await nativeCall('set_ui_language', { language: 'ko' }), { show: 'Agent Grid 열기', exit: '종료…' });
+      for (const previous of retained) await previous.screen?.dispose();
+    }
+  });
   await check('independent real CLI threads', async () => {
     assert(report.sessions.every(session => session.fullThreadId && uuid.test(session.threadId)), 'Both sessions must expose full thread UUIDs');
     assert.notEqual(report.sessions[0].threadId, report.sessions[1].threadId, 'Two new sessions unexpectedly share a thread UUID');
