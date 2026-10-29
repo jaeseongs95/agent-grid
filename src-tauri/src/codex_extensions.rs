@@ -119,6 +119,11 @@ fn capture(mut pipe: impl Read + Send + 'static, overflow: Arc<AtomicBool>) -> J
 }
 // JSON 명령과 startup 도움말이 같은 프로세스 소유권·출력 상한을 사용한다.
 pub(super) fn command_stdout(exe: &OsString, cwd: &Path, args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
+    command_stdout_until(exe, cwd, args, Instant::now() + timeout, None)
+}
+pub(super) fn command_stdout_until(exe: &OsString, cwd: &Path, args: &[String], deadline: Instant, cancelled: Option<&Arc<AtomicBool>>) -> Result<Vec<u8>, String> {
+    check_cancelled(cancelled)?;
+    if Instant::now() >= deadline { return Err("Codex command timed out; its result is unknown. Refresh before retrying".into()); }
     let (mut command, gate) = LaunchGate::wrap_std(exe.as_os_str())?;
     command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     hidden(&mut command);
@@ -129,8 +134,8 @@ pub(super) fn command_stdout(exe: &OsString, cwd: &Path, args: &[String], timeou
     process.readers.push(capture(process.child.stdout.take().ok_or("Codex stdout pipe is missing")?, overflow.clone()));
     process.readers.push(capture(process.child.stderr.take().ok_or("Codex stderr pipe is missing")?, overflow.clone()));
     process._gate.release()?;
-    let deadline = Instant::now() + timeout;
     let status = loop {
+        check_cancelled(cancelled)?;
         if overflow.load(Ordering::Acquire) { return Err("Codex command output exceeded 8 MiB; operation result may be unknown. Refresh before retrying".into()); }
         if let Some(status) = process.child.try_wait().map_err(|e| format!("Inspect Codex command: {e}"))? { break status; }
         if Instant::now() >= deadline { return Err("Codex command timed out; its result is unknown. Refresh before retrying".into()); }

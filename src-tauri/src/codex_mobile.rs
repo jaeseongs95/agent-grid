@@ -13,6 +13,8 @@ pub enum MobileAction { Status, Enable, Disable, Pair }
 #[serde(rename_all = "camelCase")]
 pub struct MobileReply {
     pub isolated: bool,
+    pub shared: bool,
+    pub mutations_allowed: bool,
     pub status: Option<MobileStatus>,
     pub pairing: Option<MobilePairing>,
 }
@@ -41,11 +43,16 @@ struct Management {
     admission: Mutex<()>,
     socket: Mutex<Option<TcpStream>>,
     namespaced_remote: bool,
+    shared: Option<shared::SharedEndpoint>,
 }
 
 impl MobileConnection {
     pub(super) fn new(endpoint: String, token: String, job: &Arc<ProcessJob>, stopped: Arc<AtomicBool>, namespaced_remote: bool) -> Self {
-        Self(Arc::new(Management { endpoint, token, job: Arc::downgrade(job), stopped, admission:Mutex::new(()), socket:Mutex::new(None), namespaced_remote }))
+        Self(Arc::new(Management { endpoint, token, job: Arc::downgrade(job), stopped, admission:Mutex::new(()), socket:Mutex::new(None), namespaced_remote, shared:None }))
+    }
+
+    pub(super) fn shared(endpoint: shared::SharedEndpoint, stopped: Arc<AtomicBool>) -> Self {
+        Self(Arc::new(Management { endpoint:String::new(),token:String::new(),job:Weak::new(),stopped,admission:Mutex::new(()),socket:Mutex::new(None),namespaced_remote:false,shared:Some(endpoint) }))
     }
 
     pub(super) fn cancel(&self) {
@@ -61,14 +68,23 @@ impl MobileConnection {
     }
 
     pub fn request(&self, action: MobileAction) -> Result<MobileReply, String> {
-        if !matches!(action, MobileAction::Status) && !self.0.namespaced_remote {
-            return Err("기존 원격 등록을 보호하기 위해 이 CLI의 모바일 변경을 차단했습니다. --remote-control-client-name을 지원하는 CLI를 선택한 뒤 새 세션을 실행하세요. / Select a CLI with --remote-control-client-name support and start a new session to enable isolated mobile control.".into());
+        if !matches!(action, MobileAction::Status) && !self.0.namespaced_remote && self.0.shared.is_none() {
+            return Err("기존 원격 등록을 보호하기 위해 개별 세션 서버의 모바일 변경을 차단했습니다. 기존 공유 Codex 서버를 실행한 뒤 새 세션을 시작하거나 --remote-control-client-name 지원 CLI를 선택하세요.".into());
         }
         let _permit = self.0.admission.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => "이 세션의 모바일 연결 요청이 진행 중입니다.",
             std::sync::TryLockError::Poisoned(_) => "모바일 연결 요청 상태를 확인할 수 없습니다. 세션을 다시 여세요.",
         })?;
         self.live()?;
+        if let Some(endpoint) = &self.0.shared {
+            let deadline = Instant::now() + RPC_TIMEOUT;
+            let mut proxy = endpoint.open_until(Some(self.0.stopped.clone()), Some(deadline))?;
+            let mut rpc = proxy.rpc.take().unwrap();
+            let result = self.run_rpc_until(action, &mut rpc, deadline);
+            drop(rpc);
+            drop(proxy);
+            return result;
+        }
         let address = owned_address(&self.0.endpoint)?;
         let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
             .map_err(|_| "기존 세션 서버에 연결할 수 없습니다.")?;
@@ -89,28 +105,34 @@ impl MobileConnection {
         self.live()?;
         let mut rpc = authenticated_socket(&self.0.endpoint, &self.0.token, stream)
             .map_err(|_| "세션 서버 인증 연결에 실패했습니다.")?;
+        self.run_rpc(action, &mut rpc, timeout)
+    }
+
+    fn run_rpc<S: Read + Write>(&self, action: MobileAction, rpc: &mut Rpc<S>, timeout: Duration) -> Result<MobileReply, String> {
+        self.run_rpc_until(action, rpc, Instant::now() + timeout)
+    }
+    fn run_rpc_until<S: Read + Write>(&self, action: MobileAction, rpc: &mut Rpc<S>, deadline: Instant) -> Result<MobileReply, String> {
         rpc.ws.set_config(|config| {
             config.max_message_size = Some(MAX_REPLY);
             config.max_frame_size = Some(MAX_REPLY);
         });
-        let deadline = Instant::now() + timeout;
         let mut init = initialize();
         init["capabilities"] = json!({"experimentalApi":true});
-        self.call(&mut rpc, "initialize", init, deadline)?;
+        self.call(rpc, "initialize", init, deadline)?;
         self.live()?;
         rpc.send(json!({"method":"initialized","params":{}})).map_err(|_| "모바일 관리 초기화 전송에 실패했습니다.")?;
-        let state = self.call(&mut rpc, "remoteControl/status/read", json!({}), deadline)?;
+        let state = self.call(rpc, "remoteControl/status/read", json!({}), deadline)?;
         let current = parse_status(&state, &self.0.token)?;
-        let mut reply = MobileReply { isolated:self.0.namespaced_remote, status:None, pairing:None };
+        let mut reply = MobileReply { isolated:self.0.namespaced_remote, shared:self.0.shared.is_some(), mutations_allowed:self.0.namespaced_remote || self.0.shared.is_some(), status:None, pairing:None };
         match action {
             MobileAction::Status => reply.status = Some(current),
             MobileAction::Enable | MobileAction::Disable => {
                 let method = if matches!(action, MobileAction::Enable) { "remoteControl/enable" } else { "remoteControl/disable" };
-                let result = self.call(&mut rpc, method, json!({"ephemeral":true}), deadline)?;
+                let result = self.call(rpc, method, json!({"ephemeral":true}), deadline)?;
                 reply.status = Some(parse_status(&result, &self.0.token)?);
             }
             MobileAction::Pair => {
-                let result = self.call(&mut rpc, "remoteControl/pairing/start", json!({"manualCode":true}), deadline)?;
+                let result = self.call(rpc, "remoteControl/pairing/start", json!({"manualCode":true}), deadline)?;
                 reply.pairing = Some(parse_pairing(&result, &self.0.token)?);
             }
         }
@@ -118,7 +140,7 @@ impl MobileConnection {
         Ok(reply)
     }
 
-    fn call(&self, rpc: &mut Rpc<TcpStream>, method: &str, params: Value, deadline: Instant) -> Result<Value, String> {
+    fn call<S: Read + Write>(&self, rpc: &mut Rpc<S>, method: &str, params: Value, deadline: Instant) -> Result<Value, String> {
         self.live()?;
         if Instant::now() >= deadline { return Err(timeout_error()); }
         rpc.next_id += 1;

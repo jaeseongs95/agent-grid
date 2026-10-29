@@ -49,8 +49,9 @@ Choose **Use automatic discovery** to clear the app's saved override. Resolution
 `AGENT_GRID_CODEX`, if set, followed by the native executable on `PATH`.
 The saved app preference has priority over both. Missing or invalid executables
 are reported explicitly instead of silently using a different program.
-The CLI must support authenticated app-server WebSockets and `--remote`.
-Older CLI versions are not silently downgraded to a different connection mode.
+The CLI must support `--remote` and either the shared daemon/proxy commands or
+authenticated app-server WebSockets. Supported shared connections fail explicitly
+when unavailable; they are never silently replaced with a separate server.
 
 Choose **Import project** to select an existing local folder in the native Windows
 folder chooser (`IFileOpenDialog`). Imported projects remain in the sidebar after
@@ -108,19 +109,24 @@ remote control, refresh until the remote service is connected, then create a pai
 code to enter in mobile Codex. A connected remote service means the session server
 has connected to the relay; it does not confirm that a phone is paired.
 
-The selected CLI must support the remote-control app-server APIs and
-`--remote-control-client-name`, and must be signed in with a ChatGPT account.
-API key authentication is unsupported. Without that startup option, existing
-session operation remains available, but mobile enable, disable and pairing requests
-are blocked to protect other remote registrations. After choosing a supported CLI,
-start a new session to use mobile control. These three actions stay disabled until a status
-response confirms isolated registration support. For an unsupported CLI, the popup
-explains the limitation and provides **Open executable settings**.
+The selected CLI must support the remote-control app-server APIs and be signed
+in with a ChatGPT account. API key authentication is unsupported. Shared-capable
+CLIs connect the terminal, status observer and mobile controls to the same existing
+daemon through its default proxy. Shared enable, disable and pairing affect all
+conversations on that server. The app never installs, starts or stops the daemon.
 
-Management requests use the selected session's existing app-owned server. Hiding
-the desktop window keeps it running; stopping the session or exiting the app ends
-its mobile connection. Pairing codes are not saved. Physical phone pairing and
-control have not yet been validated.
+For older CLIs without shared commands, the app-owned server remains available.
+Its mobile mutations require `--remote-control-client-name` to avoid replacing
+other registrations. Actions stay disabled until a status response confirms that
+mutations are allowed. The popup explains the connection scope and limitations.
+
+Stopping a shared session pins its original turn ID before closing its terminal;
+it never retargets a later mobile turn. Unconfirmed stops remain unknown and are
+not automatically resent. The shared daemon and registration survive app exit.
+Pairing codes are not saved. Physical phone pairing and control remain unvalidated.
+The development branch still requires CLI integration validation: the original
+R28 runtime cannot resume a newly started empty thread, and its default proxy
+protection needs the companion CLI fix before this feature is released.
 
 ## Weekly usage
 
@@ -188,10 +194,11 @@ your existing login and honors `CODEX_HOME`. It never installs or updates the
 CLI and never changes its global permission settings. Model selection stays
 in Codex's own `/model` interface.
 
-Each managed session has an owned authenticated loopback app-server and a
-normal Codex terminal. External sessions are listed read-only through the
-official daemon proxy; no daemon is started to populate that list. An
-unreachable server or unknown runtime status is reported explicitly.
+Managed sessions use a normal Codex terminal with an explicit conversation ID.
+Shared-capable CLIs use their existing daemon; older CLIs retain an owned
+authenticated loopback server. External sessions are listed read-only through
+the official daemon proxy. An unavailable shared server or unknown status is
+reported explicitly, without starting another server.
 
 Closing the window hides it to the tray. Complete exit terminates owned
 processes after confirmation. Restoring after a complete exit starts new

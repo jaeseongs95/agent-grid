@@ -1,7 +1,7 @@
 use crate::{codex::{self, CodexEvent, CodexSession}, flow::{OutputFlow, Utf8Decoder}, process_job::{LaunchGate, ProcessJob}, storage::Store};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, io::{Read, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU8, Ordering}, Arc, Condvar, Mutex}, thread, time::Duration};
+use std::{collections::HashMap, io::{Read, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicU8, Ordering}, Arc, Condvar, Mutex}, thread, time::{Duration, Instant}};
 use uuid::Uuid;
 
 const MAX_ACTIVE_SESSIONS: usize = 32;
@@ -58,6 +58,9 @@ struct ProcessControl {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     job: Mutex<Option<ProcessJob>>,
     adapter: Mutex<Option<CodexSession>>,
+    termination: Mutex<()>,
+    shared_cleanup_failed: AtomicBool,
+    shared_stop_attempted: AtomicBool,
     _gate: LaunchGate,
 }
 
@@ -103,11 +106,34 @@ impl ProcessControl {
     }
 
     fn terminate(&self) -> Result<(), String> {
+        self.terminate_until(Instant::now() + Duration::from_secs(8))
+    }
+    fn terminate_until(&self, deadline: Instant) -> Result<(), String> {
+        let _termination = self.termination.lock().map_err(|_| "session termination lock poisoned")?;
+        // adapter를 회수하는 PTY reaper와 경합하므로 먼저 해당 세션의 제어 핸들만
+        // 복제한다. 외부 공유 서버의 프로세스 수명은 이 핸들이 소유하지 않는다.
+        let shared = self.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().and_then(CodexSession::shared_control);
+        let stop = if let Some(shared) = shared {
+            if self.shared_stop_attempted.swap(true, Ordering::AcqRel) {
+                if self.shared_cleanup_failed.load(Ordering::Acquire) {
+                    return Err("공유 작업 중단 결과를 확인할 수 없습니다. 중단 요청을 재전송하지 않았습니다.".into());
+                }
+                return Ok(());
+            }
+            self.shared_cleanup_failed.store(true, Ordering::Release);
+            shared.capture_stop(deadline).map(Some)
+        } else { Ok(None) };
         let job = self.job.lock().map_err(|_| "owned process job lock poisoned")?;
         let job_result = job.as_ref().map(ProcessJob::terminate).unwrap_or(Ok(()));
         let kill_result = self.killer.lock().map_err(|_| "owned process killer lock poisoned")?.kill().map_err(|e| format!("stop owned PTY: {e}"));
-        #[cfg(windows)] { let _ = kill_result; job_result }
-        #[cfg(not(windows))] { let _ = job_result; kill_result }
+        drop(job);
+        #[cfg(windows)] let terminated = { let _ = kill_result; job_result };
+        #[cfg(not(windows))] let terminated = { let _ = job_result; kill_result };
+        terminated?;
+        // 원래 turn을 고정한 뒤 자기 TUI를 정리하고 정확한 ID만 중단한다.
+        let result = stop.and_then(|stop| stop.map(|stop| stop.finish()).unwrap_or(Ok(())));
+        self.shared_cleanup_failed.store(result.is_err(), Ordering::Release);
+        result
     }
 }
 
@@ -117,6 +143,7 @@ struct Session {
     // Codex status observations cannot turn a reaped process back into a live one.
     phase: AtomicU8,
     stop_requested: Arc<AtomicBool>,
+    cleanup_failed: AtomicBool,
     process: Mutex<Option<Arc<ProcessControl>>>,
     flow: OutputFlow,
     done: (Mutex<bool>, Condvar),
@@ -176,7 +203,8 @@ impl Session {
             // Publish process ownership and completion together under info's lock.
             self.phase.store(3, Ordering::Release);
             info.active = false;
-            info.state = if self.stop_requested.load(Ordering::Acquire) { "stopped" } else { state }.into();
+            info.state = if self.cleanup_failed.load(Ordering::Acquire) { "unknown" }
+                else if self.stop_requested.load(Ordering::Acquire) { "stopped" } else { state }.into();
         }, false);
         let mut done = self.done.0.lock().map_err(|_| "session completion lock poisoned")?;
         *done = true;
@@ -199,14 +227,20 @@ impl Session {
     }
 
     fn stop(&self) -> Result<(), String> {
-        if self.phase.load(Ordering::Acquire) == 3 { return Ok(()); }
+        self.stop_until(Instant::now() + Duration::from_secs(43))
+    }
+    fn stop_until(&self, deadline: Instant) -> Result<(), String> {
+        if self.phase.load(Ordering::Acquire) == 3 {
+            return if self.cleanup_failed.load(Ordering::Acquire) { Err("공유 작업 중단 결과가 확인되지 않았습니다. 중단 요청을 재전송하지 않았습니다.".into()) } else { Ok(()) };
+        }
         let status_result = self.request_stop();
         let process = self.process.lock().map_err(|_| "session process lock poisoned")?.clone();
-        if let Some(process) = process { process.terminate()?; }
+        let termination_result = if let Some(process) = process { process.terminate_until(deadline) } else { Ok(()) };
         let done = self.done.0.lock().map_err(|_| "session completion lock poisoned")?;
-        let (_done_guard, timeout) = self.done.1.wait_timeout_while(done, Duration::from_secs(35), |done| !*done).map_err(|_| "session completion lock poisoned")?;
+        let remaining = deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(35));
+        let (_done_guard, timeout) = self.done.1.wait_timeout_while(done, remaining, |done| !*done).map_err(|_| "session completion lock poisoned")?;
         if timeout.timed_out() { return Err("owned session cleanup has not completed within 35 seconds".into()); }
-        status_result
+        termination_result.and(status_result)
     }
 }
 
@@ -226,7 +260,7 @@ impl Engine {
         let saved = store.lock().map_err(|_| "metadata store lock poisoned")?.sessions()?;
         let mut sessions = HashMap::new();
         for info in saved {
-            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone() }));
+            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone() }));
         }
         Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: AtomicBool::new(false) }) })
     }
@@ -261,7 +295,7 @@ impl Engine {
             live_ids.push(info.id.clone());
             store.prune_sessions(&live_ids)?;
         }
-        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: Arc::new(AtomicBool::new(false)), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone() });
+        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone() });
         if let Some(id) = retired_id { sessions.remove(&id); }
         sessions.insert(info.id.clone(), session.clone());
         drop(sessions);
@@ -312,7 +346,7 @@ impl Engine {
             };
             gate.release()?;
             let killer = child.child.clone_killer();
-            let process = Arc::new(ProcessControl { master: Mutex::new(Some(pair.master)), writer: Mutex::new(Some(writer)), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter), _gate: gate });
+            let process = Arc::new(ProcessControl { master: Mutex::new(Some(pair.master)), writer: Mutex::new(Some(writer)), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter), termination:Mutex::new(()),shared_cleanup_failed:AtomicBool::new(false),shared_stop_attempted:AtomicBool::new(false), _gate: gate });
             *session.process.lock().map_err(|_| "session process lock poisoned")? = Some(process.clone());
             Ok((child, reader, process))
         };
@@ -358,11 +392,15 @@ impl Engine {
         let waiting = session.clone();
         thread::Builder::new().name("pty-reaper".into()).spawn(move || {
             let waited = child.wait();
+            // 공유 turn의 중단 판정 전에 PTY 종료를 세션 중단 완료로 발표하지 않는다.
+            let termination = process.termination.lock().unwrap_or_else(|e| e.into_inner());
+            waiting.cleanup_failed.store(process.shared_cleanup_failed.load(Ordering::Acquire), Ordering::Release);
+            let adapter = process.adapter.lock().unwrap_or_else(|e| e.into_inner()).take();
+            drop(termination);
             // Kill any descendants retaining the terminal after their leader exits.
             let job = process.job.lock().unwrap_or_else(|e| e.into_inner()).take();
             drop(job);
             process.close_io();
-            let adapter = process.adapter.lock().unwrap_or_else(|e| e.into_inner()).take();
             drop(adapter); // No registry/metadata lock is held across observer join.
             let read_result = reader_thread.join();
             waiting.process.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -580,14 +618,30 @@ impl Engine {
         // Send every cancellation before waiting, so one slow session cannot
         // prevent the others from receiving their stop signal.
         let mut failures = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(43);
         for session in &sessions {
             if session.phase.load(Ordering::Acquire) < 3 {
                 if let Err(error) = session.request_stop() { failures.push(error); }
-                let process = match session.process.lock() { Ok(lock) => lock.clone(), Err(_) => { failures.push("session process lock poisoned".into()); continue; } };
-                if let Some(process) = process { if let Err(error) = process.terminate() { failures.push(error); } }
             }
         }
-        for session in sessions { if let Err(error) = session.stop() { failures.push(error); } }
+        // 활성 세션은 기존 상한 32개뿐이다. 별도 대기열 없이 같은 전체 기한으로
+        // 각 소유 TUI와 공유 작업을 정리하여 느린 RPC가 다음 세션의 취소를 막지 않는다.
+        thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for session in sessions.into_iter().filter(|session| session.phase.load(Ordering::Acquire) < 3) {
+                match thread::Builder::new().name("session-shutdown".into()).spawn_scoped(scope, move || session.stop_until(deadline)) {
+                    Ok(worker) => workers.push(worker),
+                    Err(error) => failures.push(format!("세션 정리 작업자를 시작할 수 없습니다: {error}")),
+                }
+            }
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(())) => {},
+                    Ok(Err(error)) => failures.push(error),
+                    Err(_) => failures.push("세션 정리 작업자가 비정상 종료되었습니다.".into()),
+                }
+            }
+        });
         if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
     }
 
@@ -608,6 +662,18 @@ fn validate_size(cols: u16, rows: u16) -> Result<(), String> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    #[test]
+    fn unconfirmed_shared_stop_finishes_as_unknown_and_a_retry_never_reports_success() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let session = engine.allocate(&request()).unwrap();
+        session.request_stop().unwrap();
+        session.cleanup_failed.store(true, Ordering::Release);
+        session.finish("stopped").unwrap();
+        let info = session.info().unwrap();
+        assert!(!info.active);
+        assert_eq!(info.state, "unknown", "PTY 정리만으로 공유 작업 중단 완료를 보고하면 안 된다");
+        assert!(session.stop().unwrap_err().contains("재전송하지 않았습니다"));
+    }
     // 서로 다른 Engine도 같은 전역 확장 관리 입장권을 사용한다.
     static EXTENSION_ADMISSION_TEST: Mutex<()> = Mutex::new(());
 

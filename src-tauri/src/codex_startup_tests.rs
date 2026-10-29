@@ -57,17 +57,27 @@ class StartupFixture {
    File.WriteAllText(Path.Combine(root, "help.args"), String.Join("\n", args));
    File.WriteAllText(Path.Combine(root, "probe.pid"), Process.GetCurrentProcess().Id.ToString());
    if (mode == "failure") { Console.Error.Write("fixture help failed"); return 23; }
-   if (mode == "timeout") { Thread.Sleep(30000); return 0; }
+   if (mode == "timeout" || mode == "shared-help-cancel") { Thread.Sleep(30000); return 0; }
    if (mode == "overflow") { Console.Write(new string('x', 8 * 1024 * 1024 + 1024)); Console.Out.Flush(); Thread.Sleep(30000); return 0; }
    if (mode == "invalid-utf8") { Console.OpenStandardOutput().WriteByte(255); return 0; }
    if (mode == "malformed") { Console.Write("not a help document"); return 0; }
-   Console.Write((mode.StartsWith("ko-") ? "\uC0AC\uC6A9\uBC95:" : "Usage:") + " fixture app-server [OPTIONS] [COMMAND]\n\nOptions:\n  -h, --help\n          Print help\n      --listen <URI>\n          Listener\n");
+   Console.Write((mode.StartsWith("ko-") ? "\uC0AC\uC6A9\uBC95:" : "Usage:") + " fixture app-server [OPTIONS] [COMMAND]\n\n" + (mode.StartsWith("shared-") ? "Commands:\n  daemon  Manage daemon\n  proxy  Relay\n\n" : "") + "Options:\n  -h, --help\n          Print help\n      --listen <URI>\n          Listener\n");
    if (mode == "supported" || mode == "ko-supported") Console.Write("      --no-remote-control\n          Disable automatic remote-control startup\n");
    return 0;
   }
   File.WriteAllText(Path.Combine(root, "server.args"), String.Join("\n", args));
   File.WriteAllText(Path.Combine(root, "server.pid"), Process.GetCurrentProcess().Id.ToString());
-  if (mode == "cancelled-start") Thread.Sleep(30000);
+  if (mode == "proxy-write-blocked") {
+   var header = new StringBuilder();
+   var input = Console.OpenStandardInput();
+   while (!header.ToString().EndsWith("\r\n\r\n")) { int value = input.ReadByte(); if (value < 0) return 2; header.Append((char)value); }
+   string key = Array.Find(header.ToString().Split(new string[]{"\r\n"}, StringSplitOptions.None), line => line.StartsWith("Sec-WebSocket-Key:", StringComparison.OrdinalIgnoreCase)).Substring(18).Trim();
+   string accept;
+   using (var sha = System.Security.Cryptography.SHA1.Create()) accept = Convert.ToBase64String(sha.ComputeHash(Encoding.ASCII.GetBytes(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")));
+   Console.Write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"); Console.Out.Flush();
+   Thread.Sleep(30000); return 0;
+  }
+  if (mode == "cancelled-start" || mode == "shared-version-cancel") Thread.Sleep(30000);
   return 0;
  }
 }
@@ -112,6 +122,51 @@ class StartupFixture {
         assert_eq!(fs::read_to_string(root.join("server.args")).unwrap(), "server was not launched");
         assert!(started.elapsed() < HELP_TIMEOUT + Duration::from_secs(5), "probe pipe readers must settle after {mode}");
         exited("probe.pid");
+    }
+    // 무응답 proxy의 전체 기한은 핸드셰이크와 소유 pipe reader까지 회수한다.
+    fs::write(root.join("mode"), "cancelled-start").unwrap();
+    let started = Instant::now();
+    assert!(Proxy::open_until(&exe, None, Some(started + Duration::from_millis(300))).is_err());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(fs::read_to_string(root.join("server.args")).unwrap(), "app-server\nproxy");
+    exited("server.pid");
+    // peer가 stdin을 더 읽지 않아 write가 막혀도 proxy Job 기한이 해제해야 한다.
+    fs::write(root.join("mode"), "proxy-write-blocked").unwrap();
+    let started = Instant::now();
+    let mut proxy = Proxy::open_until(&exe, None, Some(started + Duration::from_secs(1))).unwrap();
+    assert!(proxy.rpc.as_mut().unwrap().send(json!({"fixture":"x".repeat(2*1024*1024)})).is_err());
+    drop(proxy);
+    assert!(started.elapsed() < Duration::from_secs(3), "포화된 pipe 쓰기도 전체 기한 안에 해제해야 한다");
+    exited("server.pid");
+    // 모바일/시작 취소도 같은 Job 감시를 사용해 20초 기한을 기다리지 않고 쓰기를 깨운다.
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut proxy = Proxy::open_until(&exe, Some(cancelled.clone()), Some(Instant::now()+Duration::from_secs(20))).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let writer = thread::spawn(move || {
+        let result = proxy.rpc.as_mut().unwrap().send(json!({"fixture":"x".repeat(2*1024*1024)}));
+        drop(proxy);
+        done_tx.send(result).unwrap();
+    });
+    assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err(), "fixture가 쓰기를 포화시켜야 한다");
+    let started = Instant::now();
+    cancelled.store(true, Ordering::Release);
+    assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap().is_err());
+    writer.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    exited("server.pid");
+    // discovery의 도움말과 version 모두 같은 취소 가능한 소유 명령 runner를 쓴다.
+    for (mode, ready) in [("shared-help-cancel", "probe.pid"), ("shared-version-cancel", "server.pid")] {
+        fs::write(root.join("mode"), mode).unwrap();
+        if root.join(ready).exists() { fs::remove_file(root.join(ready)).unwrap(); }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_exe = exe.clone(); let worker_root = root.clone(); let worker_cancelled = cancelled.clone();
+        let worker = thread::spawn(move || shared::SharedEndpoint::existing(&worker_exe, &worker_root, Some(&worker_cancelled)).err().expect("discovery를 취소해야 한다"));
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !root.join(ready).is_file() { assert!(Instant::now() < ready_deadline); thread::sleep(Duration::from_millis(10)); }
+        let started = Instant::now(); cancelled.store(true, Ordering::Release);
+        assert!(worker.join().unwrap().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        exited(ready);
     }
     // 실제 소유 서버가 연결을 기다리는 동안 취소하고 원래 프로세스 핸들로 회수를 확인한다.
     fs::remove_file(root.join("server.pid")).unwrap();

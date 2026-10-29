@@ -38,6 +38,9 @@ pub(crate) use extensions::{extension_admission, extensions_list_with_executable
 mod mobile;
 pub use mobile::{MobileAction, MobileConnection, MobileReply, MobileStatus, MobilePairing};
 
+#[path = "codex_shared.rs"]
+mod shared;
+
 #[path = "codex_usage.rs"]
 mod usage;
 pub use usage::{weekly_usage_with_executable, WeeklyUsageSnapshot};
@@ -58,19 +61,22 @@ pub struct ExternalSession {
 
 pub struct CodexSession {
     pub command: CommandBuilder,
-    server: Child,
+    server: Option<Child>,
     job: Option<Arc<ProcessJob>>,
-    _launch_gate: LaunchGate,
+    _launch_gate: Option<LaunchGate>,
     stopped: Arc<AtomicBool>,
     socket: Option<TcpStream>,
     observer: Option<JoinHandle<()>>,
     mobile: Option<MobileConnection>,
+    shared: Option<shared::SharedControl>,
+    proxy_job: Option<std::sync::Weak<ProcessJob>>,
 }
 
 impl CodexSession {
     pub fn mobile_connection(&self) -> MobileConnection {
         self.mobile.as_ref().expect("connected sessions have a mobile management handle").clone()
     }
+    pub(crate) fn shared_control(&self) -> Option<shared::SharedControl> { self.shared.clone() }
 }
 
 impl Drop for CodexSession {
@@ -78,10 +84,10 @@ impl Drop for CodexSession {
         self.stopped.store(true, Ordering::Release);
         if let Some(mobile) = &self.mobile { mobile.cancel(); }
         if let Some(socket) = self.socket.take() { let _ = socket.shutdown(Shutdown::Both); }
+        if let Some(job) = self.proxy_job.take().and_then(|job| job.upgrade()) { let _ = job.terminate(); }
         if let Some(job) = self.job.take() { let _ = job.terminate(); }
         // kill may report that the owned process already exited; wait still reaps it.
-        let _ = self.server.kill();
-        let _ = self.server.wait();
+        if let Some(server) = self.server.as_mut() { let _ = server.kill(); let _ = server.wait(); }
         if let Some(observer) = self.observer.take() { let _ = observer.join(); }
     }
 }
@@ -128,11 +134,11 @@ fn help_supports_option(bytes: &[u8], option: &str) -> Result<bool, String> {
 #[cfg(test)]
 fn help_supports_no_remote_control(bytes: &[u8]) -> Result<bool, String> { help_supports_option(bytes, "--no-remote-control") }
 
-fn server_capabilities(exe: &OsString, cwd: &Path) -> Result<(bool, bool), String> {
+fn server_capabilities(exe: &OsString, cwd: &Path, cancelled: Option<&Arc<AtomicBool>>) -> Result<(bool, bool), String> {
     // 실행 파일별 캐시를 두지 않아 같은 경로의 교체나 설정 변경도 다음
     // launch에서 실제 도움말로 판별한다. 실패를 미지원으로 삼키지 않는다.
     let args = vec!["app-server".into(), "--help".into()];
-    let output = extensions::command_stdout(exe, cwd, &args, HELP_TIMEOUT)
+    let output = extensions::command_stdout_until(exe, cwd, &args, Instant::now() + HELP_TIMEOUT, cancelled)
         .map_err(|error| format!("Cannot inspect app-server startup capabilities: {error}"))?;
     Ok((help_supports_option(&output, "--no-remote-control")?, help_supports_option(&output, "--remote-control-client-name")?))
 }
@@ -175,6 +181,7 @@ struct Rpc<S: Read + Write> {
     ws: WebSocket<S>,
     next_id: u64,
     cancelled: Option<Arc<AtomicBool>>,
+    deadline: Option<Instant>,
 }
 
 fn adopt_root(threads: &[Value], cwd: &Path) -> Result<Option<Value>, String> {
@@ -191,7 +198,7 @@ fn adopt_root(threads: &[Value], cwd: &Path) -> Result<Option<Value>, String> {
     Ok(root)
 }
 
-fn read_state(rpc: &mut Rpc<TcpStream>, selected: Option<&str>, cwd: &Path) -> Result<Option<Value>, String> {
+fn read_state<S: Read + Write>(rpc: &mut Rpc<S>, selected: Option<&str>, cwd: &Path) -> Result<Option<Value>, String> {
     if let Some(id) = selected {
         let result = rpc.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
         verified_thread(&result["thread"], id, cwd)?;
@@ -211,6 +218,9 @@ fn read_state(rpc: &mut Rpc<TcpStream>, selected: Option<&str>, cwd: &Path) -> R
 impl<S: Read + Write> Rpc<S> {
     fn send(&mut self, value: Value) -> Result<(), String> {
         check_cancelled(self.cancelled.as_ref())?;
+        if self.deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err("Codex 요청 전체 기한이 만료되었습니다. 요청 결과는 확인되지 않았습니다.".into());
+        }
         self.ws.send(Message::Text(value.to_string().into())).map_err(|e| format!("Codex transport write failed: {e}"))
     }
     fn read(&mut self) -> Result<Option<Value>, String> {
@@ -230,7 +240,7 @@ impl<S: Read + Write> Rpc<S> {
         self.next_id += 1;
         let id = self.next_id;
         self.send(json!({"id":id,"method":method,"params":params}))?;
-        let deadline = Instant::now() + RPC_TIMEOUT;
+        let deadline = self.deadline.unwrap_or_else(|| Instant::now() + RPC_TIMEOUT).min(Instant::now() + RPC_TIMEOUT);
         while Instant::now() < deadline {
             check_cancelled(self.cancelled.as_ref())?;
             if let Some(message) = self.read()? {
@@ -280,7 +290,7 @@ fn authenticated_socket(endpoint: &str, token: &str, stream: TcpStream) -> Resul
     // Handshake errors can contain the authorization header; never return them.
     let (ws, _) = tungstenite::client::client_with_config(request, stream, Some(config))
         .map_err(|_| "Codex authenticated WebSocket handshake failed".to_string())?;
-    Ok(Rpc {ws, next_id:0, cancelled:None})
+    Ok(Rpc {ws, next_id:0, cancelled:None, deadline:None})
 }
 
 #[cfg(windows)]
@@ -341,7 +351,7 @@ fn launch_server(exe: &OsString, cwd: &Path, thread_id: Option<&str>) -> Result<
 
 fn launch_server_with_cancellation(exe: &OsString, cwd: &Path, thread_id: Option<&str>, cancelled: Option<Arc<AtomicBool>>) -> Result<(CodexSession, Rpc<TcpStream>), String> {
     check_cancelled(cancelled.as_ref())?;
-    let (no_remote_control, namespaced_remote) = server_capabilities(exe, cwd)?;
+    let (no_remote_control, namespaced_remote) = server_capabilities(exe, cwd, cancelled.as_ref())?;
     check_cancelled(cancelled.as_ref())?;
     // Opt-in namespace isolates this owned process from all existing servers'
     // enrollment records. Older CLIs remain usable with mobile mutations gated.
@@ -358,14 +368,14 @@ fn launch_server_with_cancellation(exe: &OsString, cwd: &Path, thread_id: Option
     hidden(&mut process);
     let server = process.spawn().map_err(|e| format!("Cannot start Codex app-server: {e}"))?;
     let mut session = CodexSession {
-        command: tui_command(exe, cwd, &endpoint, &token, thread_id), server, job:None, _launch_gate:launch_gate,
-        stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None, mobile:None,
+        command: tui_command(exe, cwd, &endpoint, &token, thread_id), server:Some(server), job:None, _launch_gate:Some(launch_gate),
+        stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None, mobile:None, shared:None, proxy_job:None,
     };
-    session.job = Some(Arc::new(ProcessJob::assign_std(&session.server)?));
+    session.job = Some(Arc::new(ProcessJob::assign_std(session.server.as_ref().unwrap())?));
     session.mobile = Some(MobileConnection::new(endpoint.clone(), token.clone(), session.job.as_ref().unwrap(), session.stopped.clone(), namespaced_remote));
-    session._launch_gate.release()?;
+    session._launch_gate.as_ref().unwrap().release()?;
     let job = session.job.as_ref().ok_or("Codex server has no owned process job")?;
-    let mut rpc = connect(&endpoint, &token, &mut session.server, job, cancelled)?;
+    let mut rpc = connect(&endpoint, &token, session.server.as_mut().unwrap(), job, cancelled)?;
     rpc.call("initialize", initialize())?;
     rpc.send(json!({"method":"initialized","params":{}}))?;
     Ok((session, rpc))
@@ -383,6 +393,9 @@ pub(crate) fn prepare_with_cancellation(exe: &OsString, cwd: &Path, thread_id: O
     let cwd = cwd.canonicalize().map_err(|e| format!("Cannot open working directory: {e}"))?;
     if !cwd.is_dir() { return Err("Working directory must be a directory".into()); }
     if let Some(id) = thread_id { Uuid::parse_str(id).map_err(|_| "Saved Codex thread ID is not a UUID; refusing ambiguous name-based resume")?; }
+    if let Some(endpoint) = shared::SharedEndpoint::existing(exe, &cwd, Some(&cancelled))? {
+        return shared::prepare(&cwd, thread_id, endpoint, on_event, cancelled);
+    }
     let (mut session, mut rpc) = launch_server_with_cancellation(exe, &cwd, thread_id, Some(cancelled))?;
     if let Some(id) = thread_id {
         let existing = rpc.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
@@ -394,32 +407,38 @@ pub(crate) fn prepare_with_cancellation(exe: &OsString, cwd: &Path, thread_id: O
     // The observer uses only read RPCs and never claims the TUI's writer/approval ownership.
     session.socket = Some(rpc.ws.get_ref().try_clone().map_err(|e| e.to_string())?);
     let stopped = session.stopped.clone();
-    let mut selected = thread_id.map(str::to_owned);
+    let selected = thread_id.map(str::to_owned);
     session.observer = Some(thread::spawn(move || {
+        observe(&mut rpc, selected, &cwd, &stopped, on_event.as_ref());
+    }));
+    Ok(session)
+}
+
+fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd: &Path, stopped: &AtomicBool, on_event: &dyn Fn(CodexEvent)) {
         let mut next_poll = Instant::now();
         let mut last_state: Option<String> = None;
         let mut failures = 0;
         while !stopped.load(Ordering::Acquire) {
             if Instant::now() >= next_poll {
-                let snapshot = read_state(&mut rpc, selected.as_deref(), &cwd);
+                let snapshot = read_state(rpc, selected.as_deref(), cwd);
                 if stopped.load(Ordering::Acquire) { break; }
                 match snapshot {
                     Ok(Some(thread)) => {
                         failures = 0;
                         if selected.is_none() {
                             let Some(id) = thread["id"].as_str().filter(|id| Uuid::parse_str(id).is_ok()) else {
-                                publish_status(&mut last_state, "unknown".into(), on_event.as_ref());
+                                publish_status(&mut last_state, "unknown".into(), on_event);
                                 break;
                             };
                             selected = Some(id.to_owned());
                             on_event(CodexEvent::ThreadId(id.to_owned()));
                         }
-                        publish_status(&mut last_state, status(&thread["status"]), on_event.as_ref());
+                        publish_status(&mut last_state, status(&thread["status"]), on_event);
                     }
                     Ok(None) => { failures = 0; }
                     Err(_) => {
                         failures += 1;
-                        publish_status(&mut last_state, "unknown".into(), on_event.as_ref());
+                        publish_status(&mut last_state, "unknown".into(), on_event);
                         // Only bounded read-only retries; never resume/start from the observer.
                         if failures >= 3 { break; }
                     }
@@ -430,17 +449,15 @@ pub(crate) fn prepare_with_cancellation(exe: &OsString, cwd: &Path, thread_id: O
             if stopped.load(Ordering::Acquire) { break; }
             match incoming {
                 Ok(Some(message)) => if let Some(id) = selected.as_deref() {
-                    if let Some(state) = event_status(&message, id) { publish_status(&mut last_state, state, on_event.as_ref()); }
+                    if let Some(state) = event_status(&message, id) { publish_status(&mut last_state, state, on_event); }
                 },
                 Ok(None) => {},
                 Err(_) => {
-                    if !stopped.load(Ordering::Acquire) { publish_status(&mut last_state, "unknown".into(), on_event.as_ref()); }
+                    if !stopped.load(Ordering::Acquire) { publish_status(&mut last_state, "unknown".into(), on_event); }
                     break;
                 }
             }
         }
-    }));
-    Ok(session)
 }
 
 /// `app-server proxy` relays raw bytes, including the control socket's WebSocket handshake.
@@ -458,7 +475,7 @@ impl Read for ProxyStream {
         if self.offset == self.pending.len() {
             self.pending = match self.receiver.as_ref().ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "proxy closed"))?.recv_timeout(self.timeout) {
                 Ok(result) => result?,
-                Err(mpsc::RecvTimeoutError::Timeout) => return Err(io::Error::new(io::ErrorKind::TimedOut, "proxy read timed out")),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(io::Error::new(io::ErrorKind::WouldBlock, "proxy read timed out")),
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
             };
             self.offset = 0;
@@ -477,14 +494,44 @@ impl Write for ProxyStream {
 /// A short-lived connection to an *existing* official daemon. Never starts/stops it.
 struct Proxy {
     child: Child,
-    job: Option<ProcessJob>,
+    job: Option<Arc<ProcessJob>>,
     _launch_gate: LaunchGate,
     rpc: Option<Rpc<ProxyStream>>,
     reader: Option<JoinHandle<()>>,
+    expiry: Option<ProxyExpiry>,
+}
+// 전체 기한은 읽기뿐 아니라 포화된 stdin 쓰기도 해제해야 한다. 외부 daemon이
+// 아닌 이 연결의 proxy Job만 종료하며, 정상 Drop은 감시자를 즉시 깨워 회수한다.
+struct ProxyExpiry { cancel: mpsc::Sender<()>, worker: Option<JoinHandle<()>> }
+impl ProxyExpiry {
+    fn new(job: &Arc<ProcessJob>, deadline: Option<Instant>, cancelled: Option<Arc<AtomicBool>>) -> Result<Self, String> {
+        let job = Arc::downgrade(job);
+        let (cancel, receiver) = mpsc::channel();
+        let worker = thread::Builder::new().name("codex-proxy-deadline".into()).spawn(move || {
+            loop {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    || cancelled.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    if let Some(job) = job.upgrade() { let _ = job.terminate(); }
+                    break;
+                }
+                let wait = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now())).unwrap_or(Duration::from_millis(100));
+                let wait = if cancelled.is_some() { wait.min(Duration::from_millis(100)) } else { wait };
+                match receiver.recv_timeout(wait) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {},
+                }
+            }
+        }).map_err(|e| format!("공유 연결 기한 감시자를 시작할 수 없습니다: {e}"))?;
+        Ok(Self {cancel,worker:Some(worker)})
+    }
+}
+impl Drop for ProxyExpiry {
+    fn drop(&mut self) { let _ = self.cancel.send(()); if let Some(worker) = self.worker.take() { let _ = worker.join(); } }
 }
 impl Drop for Proxy {
     fn drop(&mut self) {
         self.rpc.take(); // Drop stdin/receiver, unblocking a reader waiting to send.
+        self.expiry.take();
         if let Some(job) = self.job.take() { let _ = job.terminate(); }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -493,12 +540,19 @@ impl Drop for Proxy {
 }
 impl Proxy {
     fn open(exe: &OsString) -> Result<Self, String> {
+        Self::open_until(exe, None, None)
+    }
+    fn open_until(exe: &OsString, cancelled: Option<Arc<AtomicBool>>, overall: Option<Instant>) -> Result<Self, String> {
+        check_cancelled(cancelled.as_ref())?;
+        if overall.is_some_and(|deadline| Instant::now() >= deadline) { return Err("공유 연결 전체 기한이 만료되었습니다.".into()); }
         let (mut command, launch_gate) = LaunchGate::wrap_std(exe.as_os_str())?;
-        command.args(["app-server", "proxy"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        command.args(["app-server", "proxy"]);
+        command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         hidden(&mut command);
         let child = command.spawn().map_err(|e| format!("Cannot open existing Codex daemon proxy: {e}"))?;
-        let mut proxy = Self {child,job:None,_launch_gate:launch_gate,rpc:None,reader:None};
-        proxy.job = Some(ProcessJob::assign_std(&proxy.child)?);
+        let mut proxy = Self {child,job:None,_launch_gate:launch_gate,rpc:None,reader:None,expiry:None};
+        proxy.job = Some(Arc::new(ProcessJob::assign_std(&proxy.child)?));
+        if overall.is_some() || cancelled.is_some() { proxy.expiry = Some(ProxyExpiry::new(proxy.job.as_ref().unwrap(), overall, cancelled.clone())?); }
         proxy._launch_gate.release()?;
         let input = proxy.child.stdin.take().expect("piped stdin");
         let mut output = proxy.child.stdout.take().expect("piped stdout");
@@ -516,24 +570,30 @@ impl Proxy {
             }
         });
         proxy.reader = Some(reader);
-        let stream = ProxyStream {input,receiver:Some(receiver),pending:Vec::new(),offset:0,timeout:Duration::from_secs(8)};
+        let stream = ProxyStream {input,receiver:Some(receiver),pending:Vec::new(),offset:0,timeout:Duration::from_millis(500)};
         let mut config = tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(MAX_FRAME);
         config.max_frame_size = Some(MAX_FRAME);
         // The URL supplies HTTP Upgrade metadata only; bytes travel through the official proxy.
-        let handshake = tungstenite::client::client_with_config("ws://localhost/", stream, Some(config));
-        match handshake {
+        let deadline = overall.unwrap_or_else(|| Instant::now() + Duration::from_secs(8)).min(Instant::now() + Duration::from_secs(8));
+        let mut handshake = tungstenite::client::client_with_config("ws://localhost/", stream, Some(config));
+        loop { match handshake {
             Ok((mut ws, _)) => {
                 ws.get_mut().timeout = Duration::from_millis(500);
-                proxy.rpc = Some(Rpc {ws,next_id:0,cancelled:None});
-                Ok(proxy)
+                proxy.rpc = Some(Rpc {ws,next_id:0,cancelled,deadline:overall});
+                return Ok(proxy);
+            }
+            Err(tungstenite::HandshakeError::Interrupted(pending)) => {
+                check_cancelled(cancelled.as_ref())?;
+                if Instant::now() >= deadline { return Err("기존 Codex 공유 서버 연결 시간이 초과되었습니다. 서버를 시작하지 않았습니다.".into()); }
+                handshake = pending.handshake();
             }
             Err(error) => {
                 // Drop the interrupted stream/receiver before Proxy joins its reader.
                 drop(error);
-                Err("Existing Codex daemon WebSocket handshake failed; no daemon was started".into())
+                return Err("Existing Codex daemon WebSocket handshake failed; no daemon was started".into());
             }
-        }
+        }}
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.rpc.as_mut().unwrap().call(method, params)
@@ -582,6 +642,29 @@ mod startup_tests;
 mod tests {
     use super::*;
     #[test]
+    fn rpc_total_deadline_spans_multiple_calls_and_prevents_late_mutation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        stream.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+        let worker = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut ws = WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None);
+            let request: Value = match ws.read().unwrap() { Message::Text(text) => serde_json::from_str(&text).unwrap(), _ => panic!("RPC 요청이 필요하다") };
+            thread::sleep(Duration::from_millis(60));
+            ws.send(Message::Text(json!({"id":request["id"],"result":{}}).to_string().into())).unwrap();
+            let _pending = ws.read().unwrap();
+            assert!(ws.read().is_err(), "기한 뒤 mutation을 전송하면 안 된다");
+        });
+        let started = Instant::now();
+        let mut rpc = Rpc {ws:WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Client, None),next_id:0,cancelled:None,deadline:Some(started+Duration::from_millis(200))};
+        rpc.call("initialize", json!({})).unwrap();
+        assert!(rpc.call("thread/read", json!({})).unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(600));
+        assert!(rpc.call("turn/interrupt", json!({})).unwrap_err().contains("전체 기한"));
+        drop(rpc); worker.join().unwrap();
+    }
+    #[test]
     fn resume_rpc_cancellation_interrupts_a_pending_reply_and_blocks_late_send() {
         use std::sync::atomic::AtomicUsize;
         struct PendingReply { cancelled: Arc<AtomicBool>, reads: Arc<AtomicUsize>, writes: Arc<AtomicUsize> }
@@ -600,7 +683,7 @@ mod tests {
         let reads = Arc::new(AtomicUsize::new(0));
         let writes = Arc::new(AtomicUsize::new(0));
         let stream = PendingReply { cancelled: cancelled.clone(), reads: reads.clone(), writes: writes.clone() };
-        let mut rpc = Rpc { ws: WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Client, None), next_id:0, cancelled:Some(cancelled) };
+        let mut rpc = Rpc { ws: WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Client, None), next_id:0, cancelled:Some(cancelled), deadline:None };
         let started = Instant::now();
         assert!(rpc.call("thread/read", json!({"threadId":"fixture"})).unwrap_err().contains("cancelled"));
         assert!(started.elapsed() < Duration::from_secs(1), "cancel must not wait for the 20-second RPC deadline");

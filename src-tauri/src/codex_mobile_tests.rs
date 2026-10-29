@@ -2,7 +2,7 @@ use super::*;
 
 fn status_value() -> Value { json!({"status":"connected","serverName":"fixture","environmentId":"env-fixture","installationId":"not-exported"}) }
 fn fixture_connection(endpoint: String) -> MobileConnection {
-    MobileConnection(Arc::new(Management {endpoint,token:"fixture-private-capability".into(),job:Weak::new(),stopped:Arc::new(AtomicBool::new(false)),admission:Mutex::new(()),socket:Mutex::new(None),namespaced_remote:true}))
+    MobileConnection(Arc::new(Management {endpoint,token:"fixture-private-capability".into(),job:Weak::new(),stopped:Arc::new(AtomicBool::new(false)),admission:Mutex::new(()),socket:Mutex::new(None),namespaced_remote:true,shared:None}))
 }
 
 #[cfg(windows)]

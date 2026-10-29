@@ -1,0 +1,209 @@
+//! 기존 공유 서버의 연결만 소유한다. 서버의 설치·시작·종료·원격 등록은 바꾸지 않는다.
+use super::*;
+use std::{fs, path::PathBuf};
+const STOP_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[derive(Clone)]
+pub(super) struct SharedEndpoint {
+    exe: OsString,
+    socket: PathBuf,
+    stamp: SocketStamp,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct SocketStamp {
+    canonical: PathBuf,
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+}
+fn socket_stamp(path: &Path) -> Result<SocketStamp, String> {
+    // Windows AF_UNIX 소켓은 일반 파일처럼 열거나 canonicalize할 수 없다.
+    // rendezvous 자체의 메타데이터와 부모의 정규 경로만 읽으며 ACL 검사는 CLI에 맡긴다.
+    let metadata = fs::symlink_metadata(path).map_err(|e| format!("공유 서버 소켓을 확인할 수 없습니다: {e}"))?;
+    let parent = path.parent().ok_or("공유 서버 소켓의 상위 경로가 없습니다.")?;
+    let name = path.file_name().ok_or("공유 서버 소켓 파일 이름이 없습니다.")?;
+    Ok(SocketStamp {
+        canonical: parent.canonicalize().map_err(|e| format!("공유 서버 소켓 경로를 확인할 수 없습니다: {e}"))?.join(name),
+        created: metadata.created().ok(), modified: metadata.modified().ok(),
+    })
+}
+impl SharedEndpoint {
+    pub(super) fn existing(exe: &OsString, cwd: &Path, cancelled: Option<&Arc<AtomicBool>>) -> Result<Option<Self>, String> {
+        // 정상 도움말에서 명시 미지원이 확인된 구형 CLI만 개별 서버를 사용한다.
+        // 실행·권한·프로토콜 오류를 미지원으로 삼켜 다른 서버로 대체하지 않는다.
+        let help_args = ["app-server", "--help"].map(str::to_owned);
+        let deadline = Instant::now() + HELP_TIMEOUT;
+        let help = extensions::command_stdout_until(exe, cwd, &help_args, deadline, cancelled)
+            .map_err(|e| format!("Codex 공유 연결 지원을 확인할 수 없습니다: {e}"))?;
+        if !supports_shared(&help)? { return Ok(None); }
+        let args = ["app-server", "daemon", "version"].map(str::to_owned);
+        let output = extensions::command_stdout_until(exe, cwd, &args, deadline, cancelled)
+            .map_err(|e| format!("기존 공유 Codex 서버에 연결할 수 없습니다. Codex에서 공유 서버의 실행 상태와 권한을 확인한 뒤 다시 시도하세요. 서버를 자동으로 설치하거나 시작하지 않았습니다. 원인: {e}"))?;
+        let value: Value = serde_json::from_slice(&output).map_err(|_| "공유 서버 버전 응답이 올바른 JSON이 아닙니다.")?;
+        let socket = lifecycle_socket(&value)?;
+        let stamp = socket_stamp(&socket)?;
+        Ok(Some(Self { exe:exe.clone(), socket, stamp }))
+    }
+    pub(super) fn open(&self, cancelled: Option<Arc<AtomicBool>>) -> Result<Proxy, String> {
+        self.open_until(cancelled, None)
+    }
+    pub(super) fn open_until(&self, cancelled: Option<Arc<AtomicBool>>, deadline: Option<Instant>) -> Result<Proxy, String> {
+        self.verify()?;
+        // 무인자 default proxy 분기의 private 디렉터리/비상승 상대 검사를 사용한다.
+        // TUI는 같은 CLI의 daemon/version이 반환한 기본 소켓을 명시한다.
+        let proxy = Proxy::open_until(&self.exe, cancelled, deadline)?;
+        self.verify()?;
+        Ok(proxy)
+    }
+    fn verify(&self) -> Result<(), String> {
+        if socket_stamp(&self.socket)? != self.stamp {
+            return Err("공유 서버 소켓이 바뀌었습니다. 세션을 다시 시작하세요. 다른 서버로 연결을 대체하지 않았습니다.".into());
+        }
+        Ok(())
+    }
+    fn tui(&self, cwd: &Path, id: &str) -> Result<CommandBuilder, String> {
+        let socket = self.socket.to_str().ok_or("공유 서버 소켓 경로가 유효한 문자열이 아닙니다.")?;
+        let mut command = CommandBuilder::new(&self.exe);
+        command.args(["resume", id, "--remote", &format!("unix://{socket}"), "--cd"]);
+        command.arg(cwd.as_os_str()); command.cwd(cwd);
+        // unix 연결에는 WS 전용 토큰 옵션을 전달하지 않는다. 기본 daemon의 명시적
+        // endpoint이므로 공식 TUI가 private ACL을 확인하며 embedded 대체를 금지한다.
+        Ok(command)
+    }
+}
+fn supports_shared(bytes: &[u8]) -> Result<bool, String> {
+    // 기존 도움말 검증기로 usage와 options 선언을 먼저 확인한다.
+    help_supports_option(bytes, "--help")?;
+    let help = std::str::from_utf8(bytes).map_err(|_| "Codex 도움말이 올바른 UTF-8이 아닙니다.")?;
+    let mut commands = help.lines();
+    if !commands.any(|line| matches!(line.trim(), "Commands:" | "명령:" | "명령어:")) {
+        if help.lines().any(|line| line.trim_start().starts_with("Usage:") || line.trim_start().starts_with("사용법:"))
+            && help.lines().any(|line| line.split_ascii_whitespace().any(|token| token == "[COMMAND]")) {
+            return Err("Codex 도움말의 명령 목록 형식을 확인할 수 없습니다. 다른 서버로 대체하지 않았습니다.".into());
+        }
+        return Ok(false);
+    }
+    let lines: Vec<_> = commands.take_while(|line| line.is_empty() || line.starts_with(char::is_whitespace)).filter(|line| !line.trim().is_empty()).collect();
+    let column = lines.iter().map(|line| line.len() - line.trim_start().len()).min().unwrap_or(0);
+    let declared = |name: &str| lines.iter().any(|line| line.len() - line.trim_start().len() == column && line.split_ascii_whitespace().next() == Some(name));
+    Ok(declared("daemon") && declared("proxy"))
+}
+fn lifecycle_socket(value: &Value) -> Result<PathBuf, String> {
+    if value["status"] != "running" || !value["appServerVersion"].as_str().is_some_and(|v| !v.is_empty()) {
+        return Err("공유 서버의 실행 상태와 버전을 확인할 수 없습니다.".into());
+    }
+    let socket = value["socketPath"].as_str().filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+        .ok_or("공유 서버 소켓 경로가 누락되었습니다.")?;
+    let path = PathBuf::from(socket);
+    if !path.is_absolute() { return Err("공유 서버 소켓 경로는 절대 경로여야 합니다.".into()); }
+    Ok(path)
+}
+
+#[derive(Clone)]
+pub(crate) struct SharedControl {
+    endpoint: SharedEndpoint,
+    thread_id: String,
+    cwd: PathBuf,
+}
+impl SharedControl {
+    /// 세대가 확인된 Desktop 세션에서 PTY를 종료하기 전에 원래 작업 ID를 고정한다.
+    pub(crate) fn capture_stop(&self, deadline: Instant) -> Result<SharedStop, String> {
+        let mut proxy = self.endpoint.open_until(None, Some(deadline.min(Instant::now() + STOP_TIMEOUT)))?;
+        initialize_proxy(&mut proxy)?;
+        let rpc = proxy.rpc.as_mut().unwrap();
+        let turn_id = capture_turn(rpc, &self.thread_id, &self.cwd)?;
+        Ok(SharedStop {proxy,thread_id:self.thread_id.clone(),cwd:self.cwd.clone(),turn_id})
+    }
+}
+pub(crate) struct SharedStop {
+    proxy: Proxy,
+    thread_id: String,
+    cwd: PathBuf,
+    turn_id: Option<String>,
+}
+impl SharedStop {
+    pub(crate) fn finish(mut self) -> Result<(), String> {
+        interrupt_exact(self.proxy.rpc.as_mut().unwrap(), &self.thread_id, &self.cwd, self.turn_id.as_deref())
+    }
+}
+fn capture_turn<S: Read + Write>(rpc: &mut Rpc<S>, thread_id: &str, cwd: &Path) -> Result<Option<String>, String> {
+        let thread = read_state(rpc, Some(thread_id), cwd)?.ok_or("중단 대상 대화가 없습니다.")?;
+        match thread["status"]["type"].as_str() {
+            Some("idle" | "notLoaded") => return Ok(None),
+            Some("active") => {},
+            _ => return Err("공유 대화의 현재 작업 상태를 확인할 수 없습니다.".into()),
+        }
+        let page = rpc.call("thread/turns/list", json!({"threadId":thread_id,"limit":1,"sortDirection":"desc","itemsView":"summary"}))?;
+        let turn_id = active_turn(&page)?;
+        turn_id.map(|id| Some(id.to_owned())).ok_or_else(|| "공유 대화가 실행 중이지만 현재 작업 ID를 확인할 수 없어 중단하지 않았습니다.".into())
+}
+fn interrupt_exact<S: Read + Write>(rpc: &mut Rpc<S>, thread_id: &str, cwd: &Path, captured: Option<&str>) -> Result<(), String> {
+    if let Some(id) = captured {
+        // 중단 사이에 모바일이 시작한 새 turn ID를 다시 조회하거나 대체하지 않는다.
+        rpc.call("turn/interrupt", json!({"threadId":thread_id,"turnId":id}))?;
+    } else {
+        let thread = read_state(rpc, Some(thread_id), cwd)?.ok_or("중단 대상 대화가 없습니다.")?;
+        if !matches!(thread["status"]["type"].as_str(), Some("idle" | "notLoaded")) {
+            return Err("세션 정리 중 공유 대화에 새 작업이 관측되었습니다. 새 작업은 중단하지 않았으며 중단 결과는 확인되지 않았습니다.".into());
+        }
+    }
+    Ok(())
+}
+fn active_turn(page: &Value) -> Result<Option<&str>, String> {
+    let data = page["data"].as_array().ok_or("공유 작업 목록 응답이 올바르지 않습니다.")?;
+    if data.len() > 1 { return Err("공유 작업 목록이 요청한 상한을 넘었습니다.".into()); }
+    let Some(turn) = data.first() else { return Ok(None); };
+    if turn["status"] != "inProgress" { return Ok(None); }
+    turn["id"].as_str().filter(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))
+        .map(Some).ok_or_else(|| "공유 작업 ID가 올바르지 않습니다.".into())
+}
+fn initialize_proxy(proxy: &mut Proxy) -> Result<(), String> {
+    proxy.call("initialize", initialize())?;
+    proxy.rpc.as_mut().unwrap().send(json!({"method":"initialized","params":{}}))
+}
+
+pub(super) fn prepare(cwd: &Path, requested: Option<&str>, endpoint: SharedEndpoint,
+    on_event: Arc<dyn Fn(CodexEvent) + Send + Sync>, cancelled: Arc<AtomicBool>) -> Result<CodexSession, String> {
+    check_cancelled(Some(&cancelled))?;
+    let mut proxy = endpoint.open(Some(cancelled.clone()))?;
+    initialize_proxy(&mut proxy)?;
+    let thread = if let Some(id) = requested {
+        proxy.call("thread/read", json!({"threadId":id,"includeTurns":false}))?["thread"].clone()
+    } else {
+        // 새 대화 ID를 명시적으로 받아 외부 loaded root를 채택하지 않는다.
+        let result = proxy.call("thread/start", json!({"cwd":cwd,"experimentalRawEvents":false,"persistExtendedHistory":false}))?;
+        let thread = result["thread"].clone();
+        // 빈 대화가 TUI 연결 전에 무구독 idle 정리로 사라지지 않도록 이 구독을
+        // 세션 수명 동안 유지한다. 관측자는 입력·승인 응답을 보내지 않으며 공식
+        // 서버의 일반 승인 요청은 TUI를 포함한 모든 구독자에게 전달된다.
+        thread
+    };
+    let id = thread["id"].as_str().ok_or("공유 대화 ID가 누락되었습니다.")?.to_owned();
+    Uuid::parse_str(&id).map_err(|_| "공유 대화 ID가 UUID가 아닙니다.")?;
+    verified_thread(&thread, requested.unwrap_or(&id), cwd)?;
+    let command = endpoint.tui(cwd, &id)?;
+    let stopped = Arc::new(AtomicBool::new(false));
+    let control = SharedControl { endpoint:endpoint.clone(),thread_id:id.clone(),cwd:cwd.into() };
+    let mobile = MobileConnection::shared(endpoint, stopped.clone());
+    on_event(CodexEvent::ThreadId(id.clone()));
+    on_event(CodexEvent::Status(status(&thread["status"])));
+    let observing = stopped.clone();
+    let observer_cwd = cwd.to_path_buf();
+    let mut rpc = proxy.rpc.take().unwrap();
+    let proxy_job = proxy.job.as_ref().map(Arc::downgrade);
+    // 초기 취소와 실행 중 정리 둘 다 같은 RPC 취소 경계를 사용한다.
+    rpc.cancelled = Some(stopped.clone());
+    check_cancelled(Some(&cancelled))?;
+    // 시작 중 포화 쓰기를 감시한 임시 작업자는 여기서 회수한다. 장기 관측은
+    // 세션의 Weak<Job> 정리로 쓰기를 해제하므로 세션마다 감시 스레드를 남기지 않는다.
+    proxy.expiry.take();
+    let observer = thread::spawn(move || {
+        observe(&mut rpc, Some(id), &observer_cwd, &observing, on_event.as_ref());
+        drop(rpc); // receiver를 먼저 닫아 bounded pipe reader의 send를 깨운다.
+        drop(proxy);
+    });
+    Ok(CodexSession { command,server:None,job:None,_launch_gate:None,stopped,socket:None,observer:Some(observer),mobile:Some(mobile),shared:Some(control),proxy_job })
+}
+
+#[cfg(test)]
+#[path = "codex_shared_tests.rs"]
+mod tests;
