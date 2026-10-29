@@ -107,7 +107,7 @@ fn capture(mut pipe: impl Read + Send + 'static, overflow: Arc<AtomicBool>) -> J
         let mut bytes = Vec::new();
         let mut block = [0u8; 16 * 1024];
         loop {
-            let count = pipe.read(&mut block).map_err(|e| format!("Read extension command output: {e}"))?;
+            let count = pipe.read(&mut block).map_err(|e| format!("Read Codex command output: {e}"))?;
             if count == 0 { return Ok(bytes); }
             let remaining = MAX_FRAME.saturating_sub(bytes.len());
             bytes.extend_from_slice(&block[..count.min(remaining)]);
@@ -115,37 +115,43 @@ fn capture(mut pipe: impl Read + Send + 'static, overflow: Arc<AtomicBool>) -> J
         }
     })
 }
-fn cli(exe: &OsString, cwd: &Path, args: &[String], timeout: Duration) -> Result<Value, String> {
+// JSON 명령과 startup 도움말이 같은 프로세스 소유권·출력 상한을 사용한다.
+pub(super) fn command_stdout(exe: &OsString, cwd: &Path, args: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
     let (mut command, gate) = LaunchGate::wrap_std(exe.as_os_str())?;
     command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     hidden(&mut command);
-    let child = command.spawn().map_err(|e| format!("Start extension CLI command: {e}"))?;
+    let child = command.spawn().map_err(|e| format!("Start Codex command: {e}"))?;
     let mut process = CliProcess { child, job: None, _gate: gate, readers: Vec::new() };
     process.job = Some(ProcessJob::assign_std(&process.child)?);
     let overflow = Arc::new(AtomicBool::new(false));
-    process.readers.push(capture(process.child.stdout.take().ok_or("Extension stdout pipe is missing")?, overflow.clone()));
-    process.readers.push(capture(process.child.stderr.take().ok_or("Extension stderr pipe is missing")?, overflow.clone()));
+    process.readers.push(capture(process.child.stdout.take().ok_or("Codex stdout pipe is missing")?, overflow.clone()));
+    process.readers.push(capture(process.child.stderr.take().ok_or("Codex stderr pipe is missing")?, overflow.clone()));
     process._gate.release()?;
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if overflow.load(Ordering::Acquire) { return Err("Extension CLI output exceeded 8 MiB; operation result may be unknown. Refresh before retrying".into()); }
-        if let Some(status) = process.child.try_wait().map_err(|e| format!("Inspect extension CLI command: {e}"))? { break status; }
-        if Instant::now() >= deadline { return Err("Extension CLI command timed out; its result is unknown. Refresh before retrying".into()); }
+        if overflow.load(Ordering::Acquire) { return Err("Codex command output exceeded 8 MiB; operation result may be unknown. Refresh before retrying".into()); }
+        if let Some(status) = process.child.try_wait().map_err(|e| format!("Inspect Codex command: {e}"))? { break status; }
+        if Instant::now() >= deadline { return Err("Codex command timed out; its result is unknown. Refresh before retrying".into()); }
         thread::sleep(Duration::from_millis(20));
     };
     // Stop owned descendants before joining pipes: a grandchild must not keep
     // stdout open after the command exits. No external process is targeted.
     if let Some(job) = process.job.take() { job.terminate()?; }
-    let mut output = Vec::new();
-    for reader in process.readers.drain(..) {
-        output.push(reader.join().map_err(|_| "Extension output reader panicked")??);
-    }
-    if overflow.load(Ordering::Acquire) { return Err("Extension CLI output exceeded 8 MiB; refresh before retrying".into()); }
+    // 한 reader의 오류로 나머지 JoinHandle을 버리지 않고 모두 정산한다.
+    let joined: Vec<_> = process.readers.drain(..).map(|reader| {
+        reader.join().map_err(|_| "Codex command output reader panicked".to_owned()).and_then(|output| output)
+    }).collect();
+    let mut output = joined.into_iter().collect::<Result<Vec<_>, String>>()?;
+    if overflow.load(Ordering::Acquire) { return Err("Codex command output exceeded 8 MiB; refresh before retrying".into()); }
     if !status.success() {
         let detail = String::from_utf8_lossy(&output[1][..output[1].len().min(16 * 1024)]);
-        return Err(format!("Extension CLI command exited with {status}: {}", detail.trim()));
+        return Err(format!("Codex command exited with {status}: {}", detail.trim()));
     }
-    serde_json::from_slice(&output[0]).map_err(|e| format!("Extension CLI returned invalid JSON; its result may be unknown: {e}"))
+    Ok(output.remove(0))
+}
+fn cli(exe: &OsString, cwd: &Path, args: &[String], timeout: Duration) -> Result<Value, String> {
+    let output = command_stdout(exe, cwd, args, timeout)?;
+    serde_json::from_slice(&output).map_err(|e| format!("Extension CLI returned invalid JSON; its result may be unknown: {e}"))
 }
 fn cli_args(exe: &OsString, cwd: &Path, args: &[&str]) -> Result<Value, String> {
     cli(exe, cwd, &args.iter().map(|value| (*value).into()).collect::<Vec<_>>(), Duration::from_secs(30))

@@ -194,8 +194,10 @@ try {
     page = candidates[0]; page.setDefaultTimeout(10_000);
     page.on('pageerror', error => report.errors.push(shortError(error)));
     page.on('dialog', async dialog => {
-      if (dialog.type() === 'confirm' && expectedStopTitle && dialog.message().includes(`“${expectedStopTitle}”`)) await dialog.accept();
-      else { report.errors.push({ name: 'UnexpectedDialog', message: 'Unexpected browser dialog dismissed; no approval granted' }); await dialog.dismiss(); }
+      try {
+        if (dialog.type() === 'confirm' && expectedStopTitle && dialog.message().includes(`“${expectedStopTitle}”`)) await dialog.accept();
+        else { report.errors.push({ name: 'UnexpectedDialog', message: 'Unexpected browser dialog dismissed; no approval granted' }); await dialog.dismiss(); }
+      } catch (error) { report.errors.push(shortError(error)); }
     });
     await until(() => page.locator('#connection').textContent(), text => text === '로컬 연결됨', 'native IPC connected');
     assert.equal(await page.locator('#runtime-banner').isVisible(), false, 'Demo/browser preview is not native evidence');
