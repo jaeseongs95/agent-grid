@@ -68,15 +68,16 @@ export function createExtensionsManager(host: ExtensionsHost) {
   let version = 0; let busy = false; let mutation: Promise<ExtensionsSnapshot> | undefined;
   let pendingRead: { token: number; cwd: string | null } | undefined; let readPump: Promise<void> | undefined;
   let pendingAction: Mutation | undefined;
+  let exitRequested = false; let exitDrain: Promise<void> | undefined; let picker: Promise<string | null> | undefined;
   const current = (token: number) => dialog.open && token === version;
   const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
   const preview = (value: string) => value.length > 4096 ? `${value.slice(0, 4096)}…` : value;
   function status(ko: string, en = ko) { text('#extensions-status', ko, en); }
   function showError(error: unknown) { $('#extensions-error').hidden = false; $('#extensions-error').textContent = preview(errorMessage(error)); }
   function setBusy(value: boolean) {
-    busy = value; dialog.setAttribute('aria-busy', String(value));
-    for (const control of dialog.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>('button:not(#extensions-close),input,select')) control.disabled = value;
-    if (!value) {
+    busy = value; const blocked = value || exitRequested; dialog.setAttribute('aria-busy', String(blocked));
+    for (const control of dialog.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>('button:not(#extensions-close),input,select')) control.disabled = blocked;
+    if (!blocked) {
       $<HTMLOptionElement>('#extensions-scope-project').disabled = !snapshot?.skillDestinations.project;
       if (!snapshot?.skillDestinations.project && $<HTMLSelectElement>('#extensions-skill-scope').value === 'project') $<HTMLSelectElement>('#extensions-skill-scope').value = 'user';
       $<HTMLButtonElement>('#extensions-skill-import').disabled = !snapshot?.skillDestinations[$<HTMLSelectElement>('#extensions-skill-scope').value as 'user' | 'project'];
@@ -87,7 +88,7 @@ export function createExtensionsManager(host: ExtensionsHost) {
   }
   function cancelReview() { pendingAction = undefined; $('#extensions-review').hidden = true; }
   function review(request: Mutation, target: string, ko: string, en: string, scopeKo: string, scopeEn: string) {
-    if (busy) return;
+    if (busy || exitRequested) return;
     pendingAction = request; text('#extensions-review-title', ko, en); $('#extensions-review-target').textContent = target;
     text('#extensions-review-scope', scopeKo, scopeEn); $('#extensions-review').hidden = false;
     const destructive = request.operation === 'removePlugin' || request.operation === 'removeMarketplace';
@@ -110,7 +111,7 @@ export function createExtensionsManager(host: ExtensionsHost) {
     const term = document.createElement('dt'); bindText(term, ko, en); const detail = document.createElement('dd'); detail.textContent = preview(value); parent.append(term, detail);
   }
   function action(parent: HTMLElement, id: string, ko: string, en: string, run: () => void) {
-    const button = document.createElement('button'); button.id = id; button.type = 'button'; button.className = 'quiet-button'; bindText(button, ko, en); button.disabled = busy; button.onclick = run; parent.append(button);
+    const button = document.createElement('button'); button.id = id; button.type = 'button'; button.className = 'quiet-button'; bindText(button, ko, en); button.disabled = busy || exitRequested; button.onclick = run; parent.append(button);
   }
   function renderDetail(row?: Row) {
     const detail = $('#extensions-detail'); detail.replaceChildren();
@@ -148,9 +149,9 @@ export function createExtensionsManager(host: ExtensionsHost) {
     const list = $('#extensions-list'); list.replaceChildren();
     for (const row of visible) {
       const button = document.createElement('button'); button.className = 'extensions-row'; button.dataset.extensionId = row.id;
-      button.setAttribute('role', 'option'); button.setAttribute('aria-selected', String(row.id === selections[tab])); button.disabled = busy;
+      button.setAttribute('role', 'option'); button.setAttribute('aria-selected', String(row.id === selections[tab])); button.disabled = busy || exitRequested;
       const title = document.createElement('strong'); title.textContent = preview(row.title); const subtitle = document.createElement('span'); subtitle.textContent = preview(row.subtitle);
-      button.append(title, subtitle); button.onclick = () => { if (!busy) { cancelReview(); selections[tab] = row.id; renderList(); } }; list.append(button);
+      button.append(title, subtitle); button.onclick = () => { if (!busy && !exitRequested) { cancelReview(); selections[tab] = row.id; renderList(); } }; list.append(button);
     }
     if (!filtered.length) {
       const empty = document.createElement('p'); const unavailable = !snapshot || snapshot[tab] === null;
@@ -177,7 +178,7 @@ export function createExtensionsManager(host: ExtensionsHost) {
     const base = snapshot?.skillDestinations[scope]; const name = $<HTMLInputElement>('#extensions-skill-name').value.trim();
     const target = base ? `${base.replace(/[\\/]+$/, '')}${base.includes('\\') ? '\\' : '/'}${name || '<name>'}` : null;
     text('#extensions-skill-destination', target ? `저장 위치: ${target}` : '이 범위의 저장 위치를 확인할 수 없습니다.', target ? `Destination: ${target}` : 'The destination for this scope is unavailable.');
-    $<HTMLButtonElement>('#extensions-skill-import').disabled = busy || !base;
+    $<HTMLButtonElement>('#extensions-skill-import').disabled = busy || exitRequested || !base;
   }
   function show(value: ExtensionsSnapshot) {
     snapshot = value; $('#extensions-executable').textContent = value.executable;
@@ -189,7 +190,7 @@ export function createExtensionsManager(host: ExtensionsHost) {
       const intent = pendingRead; pendingRead = undefined;
       try {
         if (mutation) { try { await mutation; } catch { /* Requery after the earlier operation settles. */ } }
-        if (!current(intent.token)) continue;
+        if (!current(intent.token) || exitRequested) continue;
         const value = await host.call<ExtensionsSnapshot>('extensions_list', { cwd: intent.cwd });
         if (current(intent.token)) { show(value); status(value.errors.length ? '일부 목록을 불러오지 못했습니다. 오류가 있는 탭을 확인하세요.' : '실제 CLI 구성을 불러왔습니다.', value.errors.length ? 'Some lists could not be loaded. Review the marked tabs.' : 'Loaded the actual CLI configuration.'); }
       } catch (error) {
@@ -198,14 +199,14 @@ export function createExtensionsManager(host: ExtensionsHost) {
     }
   }
   function load() {
-    if (busy && dialog.getAttribute('aria-busy') === 'true') return;
+    if (exitRequested || busy && dialog.getAttribute('aria-busy') === 'true') return;
     cancelReview(); $('#extensions-error').hidden = true; setBusy(true); status('구성을 불러오는 중…', 'Loading configuration…');
     // ponytail: one active read and one replaceable intent; no server per popup reopen.
     pendingRead = { token: version, cwd };
     if (!readPump) readPump = pumpReads().finally(() => { readPump = undefined; });
   }
   async function apply() {
-    if (busy || !pendingAction) return;
+    if (busy || exitRequested || !pendingAction) return;
     const request = pendingAction; const token = version; cancelReview(); $('#extensions-error').hidden = true; setBusy(true); status('변경하고 실제 구성을 다시 확인하는 중…', 'Applying changes and verifying the configuration…');
     const operation = host.call<ExtensionsSnapshot>('extensions_mutate', { cwd, request }); mutation = operation;
     try {
@@ -219,32 +220,33 @@ export function createExtensionsManager(host: ExtensionsHost) {
   }
   $('#extensions-close').onclick = () => dialog.close();
   dialog.onclose = () => { version++; pendingRead = undefined; snapshot = undefined; cancelReview(); $('#extensions-list').replaceChildren(); $('#extensions-detail').replaceChildren(); $('#extensions-error').textContent = ''; $('#extensions-error').hidden = true; $('#extensions-more').hidden = true; $('#extensions-previous').hidden = true; $('#extensions-range').textContent = ''; };
-  $('#extensions-refresh').onclick = load; search.oninput = () => { if (!busy) { limits[tab] = 50; starts[tab] = 0; cancelReview(); renderList(); } };
-  $('#extensions-more').onclick = () => { if (!busy) { if (limits[tab] < 250) limits[tab] += 50; else { starts[tab] += 250; limits[tab] = 50; } cancelReview(); renderList(); } };
-  $('#extensions-previous').onclick = () => { if (!busy) { starts[tab] = Math.max(0, starts[tab] - 250); limits[tab] = 250; cancelReview(); renderList(); } };
-  for (const button of dialog.querySelectorAll<HTMLButtonElement>('[data-tab]')) button.onclick = () => { if (!busy) { cancelReview(); tab = button.dataset.tab as Tab; renderList(); } };
+  $('#extensions-refresh').onclick = load; search.oninput = () => { if (!busy && !exitRequested) { limits[tab] = 50; starts[tab] = 0; cancelReview(); renderList(); } };
+  $('#extensions-more').onclick = () => { if (!busy && !exitRequested) { if (limits[tab] < 250) limits[tab] += 50; else { starts[tab] += 250; limits[tab] = 50; } cancelReview(); renderList(); } };
+  $('#extensions-previous').onclick = () => { if (!busy && !exitRequested) { starts[tab] = Math.max(0, starts[tab] - 250); limits[tab] = 250; cancelReview(); renderList(); } };
+  for (const button of dialog.querySelectorAll<HTMLButtonElement>('[data-tab]')) button.onclick = () => { if (!busy && !exitRequested) { cancelReview(); tab = button.dataset.tab as Tab; renderList(); } };
   $('.extensions-tabs').onkeydown = event => {
-    if (busy || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    if (busy || exitRequested || !['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
     event.preventDefault(); const tabs: Tab[] = ['plugins', 'skills', 'marketplaces']; const index = tabs.indexOf(tab);
     tab = tabs[event.key === 'Home' ? 0 : event.key === 'End' ? 2 : (index + (event.key === 'ArrowRight' ? 1 : 2)) % 3]; cancelReview(); renderList(); $(`#extensions-tab-${tab}`).focus();
   };
   $('#extensions-list').onkeydown = event => {
-    if (busy || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    if (busy || exitRequested || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
     const buttons = [...$('#extensions-list').querySelectorAll<HTMLButtonElement>('[role="option"]')]; if (!buttons.length) return;
     event.preventDefault(); const selected = buttons.findIndex(button => button.getAttribute('aria-selected') === 'true'); const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1 : Math.max(0, Math.min(buttons.length - 1, selected + (event.key === 'ArrowDown' ? 1 : -1)));
     selections[tab] = buttons[next].dataset.extensionId; cancelReview(); renderList(); $('#extensions-list [aria-selected="true"]').focus();
   };
   $('#extensions-review-cancel').onclick = cancelReview; $('#extensions-review-confirm').onclick = () => void apply();
   $('#extensions-skill-choose').onclick = async () => {
-    if (busy) return; const token = version; cancelReview(); setBusy(true); status('폴더 선택을 기다리는 중…', 'Waiting for folder selection…');
+    if (busy || exitRequested || picker) return; const token = version; cancelReview(); setBusy(true); status('폴더 선택을 기다리는 중…', 'Waiting for folder selection…');
     try {
-      const source = await host.call<string | null>('choose_skill_folder');
+      const operation = host.call<string | null>('choose_skill_folder'); picker = operation;
+      const source = await operation;
       if (current(token)) {
         if (source) { $<HTMLInputElement>('#extensions-skill-source').value = source; if (!$<HTMLInputElement>('#extensions-skill-name').value) $<HTMLInputElement>('#extensions-skill-name').value = source.split(/[\\/]/).filter(Boolean).at(-1) ?? ''; updateDestination(); }
         status(source ? '가져올 위치를 확인한 뒤 검토하세요.' : '폴더 선택을 취소했습니다.', source ? 'Choose the destination, then review the import.' : 'Folder selection canceled.');
       }
     } catch (error) { if (current(token)) { showError(error); status('폴더를 선택하지 못했습니다.', 'Could not select a folder.'); } }
-    finally { if (current(token)) setBusy(false); }
+    finally { picker = undefined; if (current(token)) setBusy(false); }
   };
   $('#extensions-skill-scope').onchange = () => { cancelReview(); updateDestination(); }; $('#extensions-skill-name').oninput = () => { $<HTMLInputElement>('#extensions-skill-name').setCustomValidity(''); cancelReview(); updateDestination(); };
   $<HTMLInputElement>('#extensions-skill-name').oninvalid = event => {
@@ -253,7 +255,7 @@ export function createExtensionsManager(host: ExtensionsHost) {
     else if (field.validity.patternMismatch) field.setCustomValidity(t('소문자 영문·숫자·하이픈·밑줄을 사용해 64자 이내로 입력하세요.', 'Use up to 64 lowercase letters, digits, hyphens or underscores.'));
   };
   $('#extensions-skill-form').onsubmit = event => {
-    event.preventDefault(); if (busy) return;
+    event.preventDefault(); if (busy || exitRequested) return;
     const sourcePath = $<HTMLInputElement>('#extensions-skill-source').value; const name = $<HTMLInputElement>('#extensions-skill-name').value.trim();
     const scope = $<HTMLSelectElement>('#extensions-skill-scope').value as 'user' | 'project'; const base = snapshot?.skillDestinations[scope];
     if (!sourcePath || !base) { status('소스 폴더와 저장 위치를 먼저 선택하세요.', 'Choose a source folder and an available destination first.'); return; }
@@ -262,13 +264,25 @@ export function createExtensionsManager(host: ExtensionsHost) {
   };
   $('#extensions-marketplace-source').oninput = cancelReview; $('#extensions-marketplace-ref').oninput = cancelReview;
   $('#extensions-marketplace-form').onsubmit = event => {
-    event.preventDefault(); if (busy) return;
+    event.preventDefault(); if (busy || exitRequested) return;
     const source = $<HTMLInputElement>('#extensions-marketplace-source').value.trim(); const gitRef = $<HTMLInputElement>('#extensions-marketplace-ref').value.trim();
     if (source) review({ operation: 'addMarketplace', source, ...(gitRef ? { gitRef } : {}) }, `${source}${gitRef ? `\nref: ${gitRef}` : ''}`, '마켓플레이스 등록', 'Register marketplace', ...userScope);
   };
   return {
+    beginExit(): Promise<void> {
+      if (exitDrain) return exitDrain;
+      // Close admission synchronously, before waiting for already accepted work.
+      exitRequested = true; pendingRead = undefined; cancelReview(); setBusy(busy);
+      const accepted = [mutation, readPump, picker].flatMap(operation => operation ? [operation.then(() => undefined)] : []);
+      exitDrain = Promise.allSettled(accepted).then(results => {
+        const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (failure) throw failure.reason;
+      });
+      return exitDrain;
+    },
+    cancelExit() { exitRequested = false; exitDrain = undefined; setBusy(busy); },
     open(projectCwd?: string) {
-      if (dialog.open) return;
+      if (dialog.open || exitRequested) return;
       const nextCwd = projectCwd || null; if (cwd !== nextCwd) for (const key of ['plugins', 'skills', 'marketplaces'] as Tab[]) delete selections[key];
       snapshot = undefined; cwd = nextCwd; version++; busy = false; for (const key of ['plugins', 'skills', 'marketplaces'] as Tab[]) { limits[key] = 50; starts[key] = 0; } $('#extensions-executable').textContent = '…';
       if (cwd) { unbindText($('#extensions-project')); $('#extensions-project').textContent = cwd; } else text('#extensions-project', '사용자 구성 · 선택된 프로젝트 없음', 'User configuration · no project selected');

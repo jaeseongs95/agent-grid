@@ -66,6 +66,13 @@ fn admission() -> Result<std::sync::MutexGuard<'static, ()>, String> {
         std::sync::TryLockError::Poisoned(_) => "Extension operation lock is damaged; restart OpenDIY Desktop".into(),
     })
 }
+/// A non-Send permit covers an entire management operation, including its
+/// process/file cleanup and final readback. Shutdown uses this same admission
+/// boundary, then sets Engine.exiting before releasing it.
+pub(crate) struct ExtensionPermit { _request: std::sync::MutexGuard<'static, ()> }
+pub(crate) fn extension_admission() -> Result<ExtensionPermit, String> {
+    Ok(ExtensionPermit { _request: admission()? })
+}
 fn context(cwd: Option<&str>) -> Result<PathBuf, String> {
     if let Some(cwd) = cwd { argument(cwd, "Project path", 128 * 1024)?; }
     match cwd {
@@ -233,8 +240,7 @@ fn snapshot(exe: &OsString, directory: &Path, cwd: Option<&str>) -> ExtensionsSn
     }
     result
 }
-pub fn extensions_list_with_executable(exe: &OsString, cwd: Option<String>) -> Result<ExtensionsSnapshot, String> {
-    let _request = admission()?;
+pub(crate) fn extensions_list_with_executable(exe: &OsString, cwd: Option<String>, _permit: &ExtensionPermit) -> Result<ExtensionsSnapshot, String> {
     let directory = context(cwd.as_deref())?;
     Ok(snapshot(exe, &directory, cwd.as_deref()))
 }
@@ -405,8 +411,7 @@ fn import_skill(source: &str, name: &str, base: &Path) -> Result<PathBuf, String
     copied
 }
 
-pub fn extensions_mutate_with_executable(exe: &OsString, cwd: Option<String>, request: ExtensionMutation) -> Result<ExtensionsSnapshot, String> {
-    let _request = admission()?;
+pub(crate) fn extensions_mutate_with_executable(exe: &OsString, cwd: Option<String>, request: ExtensionMutation, _permit: &ExtensionPermit) -> Result<ExtensionsSnapshot, String> {
     let directory = context(cwd.as_deref())?;
     let mut expected_plugin: Option<(String, Option<bool>)> = None;
     let mut expected_skill: Option<(PathBuf, Option<bool>)> = None;
@@ -515,15 +520,11 @@ mod tests {
         assert!(parse_skills(&json!({"data":[{"skills":[],"errors":[{"path":"broken","message":"bad YAML"}]}]})).unwrap().1.len() == 1);
     }
     #[test]
-    fn output_capture_is_bounded_and_extension_admission_has_no_waiting_queue() {
+    fn output_capture_is_bounded() {
         let overflow = Arc::new(AtomicBool::new(false));
         let output = capture(io::Cursor::new(vec![b'x'; MAX_FRAME + 100]), overflow.clone()).join().unwrap().unwrap();
         assert_eq!(output.len(), MAX_FRAME);
         assert!(overflow.load(Ordering::Acquire));
-        let request = admission().unwrap();
-        assert!(admission().unwrap_err().contains("in progress"));
-        drop(request);
-        assert!(admission().is_ok());
     }
     #[test]
     #[cfg(windows)]

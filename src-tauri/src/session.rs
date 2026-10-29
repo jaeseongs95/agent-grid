@@ -426,12 +426,24 @@ impl Engine {
         codex::catalog_preview_with_executable(&self.codex_executable()?, thread_id, cursor)
     }
 
+    fn with_extension_operation<T>(&self, operation: impl FnOnce(&std::ffi::OsString, &codex::ExtensionPermit) -> Result<T, String>) -> Result<T, String> {
+        if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting; no extension operation was started".into()); }
+        // Resolve one executable snapshot without holding the extension permit
+        // or a metadata/session lock across admission or vendor I/O.
+        let exe = self.codex_executable()?;
+        let permit = codex::extension_admission()?;
+        // This check and shutdown's exiting.store share the same permit. A
+        // pre-admission flag check alone would allow a late mutation to race exit.
+        if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting; no extension operation was started".into()); }
+        operation(&exe, &permit)
+    }
+
     pub fn extensions_list(&self, cwd: Option<String>) -> Result<codex::ExtensionsSnapshot, String> {
-        codex::extensions_list_with_executable(&self.codex_executable()?, cwd)
+        self.with_extension_operation(|exe, permit| codex::extensions_list_with_executable(exe, cwd, permit))
     }
 
     pub fn extensions_mutate(&self, cwd: Option<String>, request: codex::ExtensionMutation) -> Result<codex::ExtensionsSnapshot, String> {
-        codex::extensions_mutate_with_executable(&self.codex_executable()?, cwd, request)
+        self.with_extension_operation(|exe, permit| codex::extensions_mutate_with_executable(exe, cwd, request, permit))
     }
 
     pub fn list_external(&self) -> Result<Vec<codex::ExternalSession>, String> {
@@ -439,6 +451,11 @@ impl Engine {
     }
 
     pub fn shutdown(&self) -> Result<(), String> {
+        // Never interrupt an extension install/config write/import. Refuse exit
+        // before changing exiting or stopping PTYs if management still owns the
+        // permit. All shutdown callees below only drain terminal resources and
+        // must not reacquire this permit. It is released after their cleanup.
+        let _extensions = codex::extension_admission().map_err(|error| format!("Cannot exit while extension management is busy: {error}"))?;
         self.inner.exiting.store(true, Ordering::Release);
         let sessions: Vec<_> = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?.values().cloned().collect();
         // Send every cancellation before waiting, so one slow session cannot
@@ -477,6 +494,56 @@ mod lifecycle_tests {
 
     fn request() -> StartRequest {
         StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), thread_id: None, cols: 80, rows: 24 }
+    }
+
+    #[test]
+    fn extension_work_and_complete_exit_share_one_admission_boundary() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        engine.set_codex_executable(Some(std::env::current_exe().unwrap().to_str().unwrap())).unwrap();
+        let root = std::env::temp_dir().join(format!("agent-grid-extension-exit-test-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let marker = root.join("committed.txt");
+        let (entered, entry) = std::sync::mpsc::sync_channel(0);
+        let (release, released) = std::sync::mpsc::sync_channel(0);
+        let worker_engine = engine.clone();
+        let worker_marker = marker.clone();
+        let worker = thread::spawn(move || worker_engine.with_extension_operation(|_, _permit| {
+            entered.send(()).map_err(|e| e.to_string())?;
+            released.recv_timeout(Duration::from_secs(5)).map_err(|e| e.to_string())?;
+            // The same production entry wrapper covers CLI commands, staging
+            // cleanup and readback. Keep it held through this visible commit.
+            std::fs::write(worker_marker, "mutation committed").map_err(|e| e.to_string())
+        }));
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = std::time::Instant::now();
+        let error = engine.shutdown().unwrap_err();
+        assert!(error.contains("extension management is busy"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2), "exit must refuse instead of waiting on a mutation");
+        assert!(!engine.inner.exiting.load(Ordering::Acquire), "refused exit must not shut the engine down");
+        assert!(!marker.exists());
+        assert!(engine.extensions_list(None).unwrap_err().contains("in progress"), "second entry must not accumulate a worker queue");
+        release.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "mutation committed");
+
+        // Hold a terminal registry lock to observe shutdown after it has won
+        // admission but before its cleanup returns. Late extension work must
+        // never enter, either while the permit is held or after it is released.
+        let registry = engine.inner.sessions.lock().unwrap();
+        let closing = engine.clone();
+        let shutdown = thread::spawn(move || closing.shutdown());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !engine.inner.exiting.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "shutdown must win admission after the mutation settles");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(engine.extensions_mutate(None, codex::ExtensionMutation::RemovePlugin { plugin_id: "sample@fixture".into() }).unwrap_err().contains("application is exiting"));
+        assert!(codex::extension_admission().err().unwrap().contains("in progress"), "shutdown must own admission through terminal cleanup");
+        drop(registry);
+        shutdown.join().unwrap().unwrap();
+        assert!(engine.extensions_list(None).unwrap_err().contains("application is exiting"));
+        engine.shutdown().unwrap(); // A retry does not recursively reacquire the permit.
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

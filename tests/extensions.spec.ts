@@ -21,10 +21,12 @@ async function fixture(page: Page) {
     const f = state.extensionsFixture = {
       calls: [] as any[], listFailure: '', mutationFailure: '', sectionFailure: false,
       holdLists: false, holdMutation: false, pendingLists: [] as any[], pendingMutations: [] as any[],
+      holdCompleteExit: false, completeExitFailure: '', pendingExits: [] as any[], exitObservations: [] as any[], settledMutations: 0,
       installed, available, marketplaces, importedSkill: null as any,
       emit(event: string, payload: any) { listeners.get(event)!({ event, id: 1, payload }); },
       releaseList(index = 0) { const pending = this.pendingLists.splice(index, 1)[0]; if (!pending) throw new Error('No pending extension list'); pending.resolve(pending.snapshot); },
       releaseMutation() { const pending = this.pendingMutations.shift(); if (!pending) throw new Error('No pending extension mutation'); pending(); },
+      releaseCompleteExit() { const pending = this.pendingExits.shift(); if (!pending) throw new Error('No pending native exit'); pending(); },
       snapshot(cwd?: string | null) {
         const project = projects.find(project => project.cwd === cwd);
         return {
@@ -55,6 +57,12 @@ async function fixture(page: Page) {
         if (command === 'list_projects') return projects;
         if (command === 'choose_skill_folder') return sourceFolder;
         if (command === 'get_codex_settings') return { savedPath: runtime, resolvedPath: runtime, source: 'saved', error: null };
+        if (command === 'complete_exit') {
+          f.exitObservations.push({ settledMutations: f.settledMutations, args: structuredClone(args) });
+          if (f.holdCompleteExit) await new Promise<void>(resolve => { f.pendingExits.push(resolve); });
+          if (f.completeExitFailure) throw new Error(f.completeExitFailure);
+          return null;
+        }
         if (command === 'extensions_list') {
           if (f.listFailure) throw new Error(f.listFailure);
           const snapshot = f.snapshot(args.cwd);
@@ -62,6 +70,7 @@ async function fixture(page: Page) {
           return snapshot;
         }
         if (command === 'extensions_mutate') {
+          try {
           if (f.holdMutation) await new Promise<void>(resolve => { f.pendingMutations.push(resolve); });
           if (f.mutationFailure) throw new Error(f.mutationFailure);
           const request = args.request;
@@ -89,6 +98,7 @@ async function fixture(page: Page) {
           const snapshot = f.snapshot(args.cwd);
           if ((f as any).skillOverride) snapshot.skills = snapshot.skills.map((skill: any) => skill.path === (f as any).skillOverride.path ? { ...skill, enabled: (f as any).skillOverride.enabled } : skill);
           return snapshot;
+          } finally { f.settledMutations++; }
         }
         return null;
       },
@@ -386,4 +396,61 @@ test('large catalogs bound rendered rows and close releases row and detail DOM w
   await page.locator('#extensions-close').click();
   await expect(rows(page)).toHaveCount(0);
   expect(await extensionCalls(page)).toEqual([]);
+});
+
+
+for (const nativeFailure of [false, true]) test(`confirmed app exit drains accepted extension mutation and ${nativeFailure ? 'unlocks management after native exit failure' : 'blocks new management until native exit completes'}`, async ({ page }) => {
+  await fixture(page); await open(page, 0);
+  await page.clock.install();
+  await page.evaluate((nativeFailure) => {
+    const f = (window as any).extensionsFixture;
+    f.holdMutation = true; f.holdCompleteExit = true;
+    f.completeExitFailure = nativeFailure ? 'Fixture native exit failed before shutdown' : '';
+  }, nativeFailure);
+  await page.locator('#extensions-plugin-toggle').click();
+  await page.locator('#extensions-review-confirm').click();
+  await expect.poll(() => page.evaluate(() => (window as any).extensionsFixture.pendingMutations.length)).toBe(1);
+  await page.locator('#extensions-close').click();
+  await page.locator('#exit').click();
+  await page.locator('#confirm-exit').click();
+  // Advance the app's 450ms save/exit debounce without wall-clock sleeps.
+  // A missing mutation drain would now enter complete_exit while the write is held.
+  await page.clock.runFor(500);
+  expect(await extensionCalls(page, 'complete_exit')).toEqual([]);
+  await expect(page.locator('#confirm-exit')).toBeDisabled();
+  await expect(page.locator('#exit-dialog [data-close]').first()).toBeDisabled();
+  await expect(page.locator('#exit-dialog [data-close]').last()).toBeDisabled();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#exit-dialog')).toBeVisible();
+  await expect(page.locator('#extensions-open')).toBeDisabled();
+  const before = await extensionCalls(page, 'extensions_list');
+  // Direct dispatch also checks manager admission, beyond the disabled sidebar control.
+  await page.locator('#extensions-open').dispatchEvent('click');
+  await expect(page.locator('#extensions-dialog')).toBeHidden();
+  expect(await extensionCalls(page, 'extensions_list')).toEqual(before);
+  await page.evaluate(() => (window as any).extensionsFixture.releaseMutation());
+  await expect.poll(async () => {
+    await page.clock.runFor(500);
+    return (await extensionCalls(page, 'complete_exit')).length;
+  }).toBe(1);
+  expect(await page.evaluate(() => (window as any).extensionsFixture.exitObservations)).toEqual([{ settledMutations: 1, args: { confirmed: true } }]);
+  await expect(page.locator('#extensions-open')).toBeDisabled();
+  await page.evaluate(() => (window as any).extensionsFixture.releaseCompleteExit());
+  if (nativeFailure) {
+    await expect(page.locator('#confirm-exit')).toBeEnabled();
+    await expect(page.locator('#extensions-open')).toBeEnabled();
+    await expect(page.locator('#exit-dialog [data-close]').first()).toBeEnabled();
+    await expect(page.locator('#exit-dialog [data-close]').last()).toBeEnabled();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#exit-dialog')).toBeHidden();
+    await open(page);
+    await expect(page.locator('#extensions-detail')).toContainText('설치됨 · 사용 안 함');
+    expect(await extensionCalls(page, 'extensions_list')).toHaveLength(before.length + 1);
+  } else {
+    await expect(page.locator('#extensions-open')).toBeDisabled();
+    await page.locator('#extensions-open').dispatchEvent('click');
+    await expect(page.locator('#extensions-dialog')).toBeHidden();
+    expect(await extensionCalls(page, 'extensions_list')).toEqual(before);
+  }
+  expect(await extensionCalls(page)).toHaveLength(1);
 });

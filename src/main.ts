@@ -637,16 +637,28 @@ async function refreshExternal() {
 $('#external-toggle').onclick = () => { $<HTMLDialogElement>('#external-dialog').showModal(); void refreshExternal(); };
 $('#external-refresh').onclick = () => void refreshExternal();
 $('#notifications').onclick = () => { notificationCount = 0; $('#notification-count').hidden = true; $<HTMLDialogElement>('#notification-dialog').showModal(); };
-$('#exit').onclick = () => $<HTMLDialogElement>('#exit-dialog').showModal();
+const exitDialog = $<HTMLDialogElement>('#exit-dialog');
+$('#exit').onclick = () => exitDialog.showModal();
+exitDialog.oncancel = event => { if ($<HTMLButtonElement>('#confirm-exit').disabled) event.preventDefault(); };
 $('#confirm-exit').onclick = async () => {
-  const button = $<HTMLButtonElement>('#confirm-exit'); const languageWasDisabled = languageSelect.disabled; let completed = false;
-  button.disabled = true; if (native) languageSelect.disabled = true;
+  const button = $<HTMLButtonElement>('#confirm-exit'); if (button.disabled) return;
+  const extensionsButton = $<HTMLButtonElement>('#extensions-open');
+  const dismissButtons = [...exitDialog.querySelectorAll<HTMLButtonElement>('[data-close]')];
+  const dismissStates = dismissButtons.map(control => control.disabled);
+  const languageWasDisabled = languageSelect.disabled; const extensionsWasDisabled = extensionsButton.disabled; let completed = false;
+  button.disabled = true; extensionsButton.disabled = true; for (const control of dismissButtons) control.disabled = true; if (native) languageSelect.disabled = true;
   try {
+    bindText(button, '확장 작업 완료를 기다리는 중…', 'Waiting for extension work to finish…');
+    await extensionsManager.beginExit();
+    bindText(button, '종료 중…', 'Exiting…');
     clearTimeout(saveTimer); scheduleSave(); await new Promise(resolve => setTimeout(resolve, 450)); await saveQueue;
     if (native) await nativeLanguageQueue;
     await call('complete_exit', { confirmed: true }); completed = true;
-  } catch (error) { notifyError('앱 종료 실패', 'Could not exit app', error); }
-  finally { button.disabled = false; if (native && !completed) languageSelect.disabled = languageWasDisabled; }
+  } catch (error) { extensionsManager.cancelExit(); notifyError('앱 종료 실패', 'Could not exit app', error); }
+  finally {
+    button.disabled = false; dismissButtons.forEach((control, index) => { control.disabled = dismissStates[index]; }); bindText(button, '세션 종료 후 앱 닫기', 'Stop sessions and exit');
+    if (!completed) { extensionsButton.disabled = extensionsWasDisabled; if (native) languageSelect.disabled = languageWasDisabled; }
+  }
 };
 
 function toggleSearch(force?: boolean) { searchVisible = force ?? !searchVisible; $('#search-bar').hidden = !searchVisible; if (searchVisible) $<HTMLInputElement>('#terminal-search').focus(); }
