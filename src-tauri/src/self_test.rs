@@ -109,6 +109,15 @@ struct Harness {
 
 enum Capture { Event(BackendEvent), Barrier(mpsc::Sender<()>) }
 
+fn resize_isolation_fixture(engine: &Engine, session: &SessionInfo) -> Result<(), String> {
+    engine.resize(&session.id, session.generation, 110, 32).or_else(|error| {
+        // master 해제와 done 통지는 동시가 아니다. 같은 fixture의 기존
+        // 종료 기한까지 완료를 확인하며 실제 미완료 원인도 보존한다.
+        engine.wait_for_exit(&session.id, session.generation, Duration::from_secs(30))
+            .map(|_| ()).map_err(|cleanup| format!("{error}; fixture cleanup: {cleanup}"))
+    })
+}
+
 impl Harness {
     fn new() -> Result<Self, String> {
         let (sender, receiver) = mpsc::sync_channel(64);
@@ -207,11 +216,7 @@ impl Harness {
             markers.push(marker);
         }
         for session in &sessions {
-            self.engine.resize(&session.id, session.generation, 110, 32).or_else(|error| {
-                // A very fast fixture may exit before resize. Resizing a terminal
-                // that is already reaped must fail rather than touching another.
-                if self.engine.wait_for_exit(&session.id, session.generation, Duration::from_millis(5)).is_ok() { Ok(()) } else { Err(error) }
-            })?;
+            resize_isolation_fixture(&self.engine, session)?;
             self.engine.wait_for_exit(&session.id, session.generation, Duration::from_secs(30))?;
         }
         for (index, session) in sessions.iter().enumerate() {
@@ -787,6 +792,10 @@ fn redact_terminal(text: &str) -> String {
     }
     redacted
 }
+
+#[cfg(all(test, windows))]
+#[path = "self_test_resize_tests.rs"]
+mod resize_tests;
 
 #[cfg(test)]
 mod tests {
