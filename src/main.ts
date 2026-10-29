@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
+import { version } from '../package.json';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
 import { MAX_WORKSPACE_SESSIONS, acceptOutput, chooseSavedSessions, parseLayout, projectGroups, sessionProjectKey, savedSessionMetadata, updateSession, type Layout, type Output, type SavedSession, type Session, type SessionInfo, type ProjectInfo } from './model';
@@ -49,7 +50,7 @@ let projectSelectionVersion = 0;
 if (native) $('#app').hidden = true;
 $('#app').innerHTML = `
   <aside class="sidebar">
-    <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">0.5.1</span></a>
+    <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">${version}</span></a>
     <div class="workspace-label">WORKSPACE <span class="local-pill">LOCAL</span></div>
     <button class="workspace-choice"><span class="folder-icon">▤</span><span>나의 작업 공간<small>독립된 터미널, 하나의 화면</small></span></button>
     <div class="sidebar-lists">
