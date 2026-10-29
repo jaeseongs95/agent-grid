@@ -590,6 +590,8 @@ fn validate_size(cols: u16, rows: u16) -> Result<(), String> {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    // 서로 다른 Engine도 같은 전역 확장 관리 입장권을 사용한다.
+    static EXTENSION_ADMISSION_TEST: Mutex<()> = Mutex::new(());
 
     fn request() -> StartRequest {
         StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 80, rows: 24 }
@@ -631,6 +633,7 @@ mod lifecycle_tests {
 
     #[test]
     fn deleting_automatic_folder_assignment_does_not_reclassify_an_explicit_unassigned_session() {
+        let _admission_test = EXTENSION_ADMISSION_TEST.lock().unwrap();
         let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
         let project = engine.import_project(&request().cwd).unwrap();
         let first = engine.allocate(&request()).unwrap();
@@ -661,8 +664,9 @@ mod lifecycle_tests {
         let project = engine.create_project("실제 터미널 시험", None).unwrap();
         let mut start = request();
         start.project_id = Some(project.id.clone());
-        let mut command = CommandBuilder::new("cmd.exe");
-        command.args(["/d", "/q", "/c", "echo PROJECT_MOVE_READY & set /p line= & echo PROJECT_MOVE_DONE"]);
+        let shell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut command = CommandBuilder::new(shell);
+        command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "[Console]::WriteLine('PROJECT_MOVE_READY'); $line = [Console]::ReadLine(); if ($line -ne 'keep-running') { exit 3 }; [Console]::WriteLine('PROJECT_MOVE_DONE')"]);
         let started = engine.start_fixture(start, command).unwrap();
         struct Cleanup(Engine, String, u64);
         impl Drop for Cleanup { fn drop(&mut self) { let _ = self.0.stop(&self.1, self.2); } }
@@ -671,9 +675,23 @@ mod lifecycle_tests {
         let process = session.process.lock().unwrap().clone().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut output = String::new();
+        let mut answered_queries = 0;
         while !output.contains("PROJECT_MOVE_READY") {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            match receiver.recv_timeout(remaining).unwrap() { BackendEvent::Output(chunk) => output.push_str(&chunk.data), _ => {} }
+            match receiver.recv_timeout(remaining).unwrap_or_else(|error| panic!("readiness receive failed: {error}; state={:?}; output={output:?}", session.info())) {
+                BackendEvent::Output(chunk) => {
+                    engine.acknowledge(&chunk.id, chunk.generation, chunk.seq).unwrap();
+                    output.push_str(&chunk.data);
+                    // 실제 xterm처럼 ConPTY의 커서 위치 질의에 응답한다.
+                    // 누적 문자열로 검사해 프레임 경계에 걸친 질의도 놓치지 않는다.
+                    let queries = output.matches("\x1b[6n").count();
+                    while answered_queries < queries {
+                        engine.write(&started.id, started.generation, "\x1b[1;1R").unwrap();
+                        answered_queries += 1;
+                    }
+                }
+                BackendEvent::Changed(info) => assert!(info.active, "fixture ended before readiness: {info:?}; output={output:?}"),
+            }
         }
         let moved = engine.move_session_to_project(&started.id, started.generation, None).unwrap();
         assert!(moved.active && moved.project_assigned && moved.project_id.is_none());
@@ -685,6 +703,8 @@ mod lifecycle_tests {
         engine.write(&started.id, started.generation, "keep-running\r").unwrap();
         let exited = engine.wait_for_exit(&started.id, started.generation, Duration::from_secs(10)).unwrap();
         assert_eq!(exited.state, "exited");
+        for event in receiver.try_iter() { if let BackendEvent::Output(chunk) = event { output.push_str(&chunk.data); } }
+        assert!(output.contains("PROJECT_MOVE_DONE"), "stdin fixture did not complete: {output:?}");
         assert!(!exited.active);
         assert_eq!(exited.cwd, started.cwd);
         assert!(exited.project_assigned && exited.project_id.is_none());
@@ -692,6 +712,7 @@ mod lifecycle_tests {
 
     #[test]
     fn extension_work_and_complete_exit_share_one_admission_boundary() {
+        let _admission_test = EXTENSION_ADMISSION_TEST.lock().unwrap();
         let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
         engine.set_codex_executable(Some(std::env::current_exe().unwrap().to_str().unwrap())).unwrap();
         let root = std::env::temp_dir().join(format!("agent-grid-extension-exit-test-{}", Uuid::new_v4()));

@@ -14,7 +14,7 @@ async function workspace(page: Page) {
     const callbacks = new Map<number, (value: any) => void>();
     const listeners = new Map<string, (value: any) => void>();
     const writes: (() => void)[] = []; const resizes: (() => void)[] = [];
-    state.flow = { calls: [], sent: [], holdWrites: false, holdResize: false, activeWrites: 0, maxWrites: 0,
+    state.flow = { calls: [], sent: [], holdWrites: false, holdResize: false, activeWrites: 0, maxWrites: 0, activeResizes: 0, maxResizes: 0,
       releaseWrites() { this.holdWrites = false; for (const release of writes.splice(0)) release(); },
       releaseResize() { this.holdResize = false; for (const release of resizes.splice(0)) release(); },
       emit(info: any) { Object.assign(sessions.find(item => item.id === info.id)!, info); listeners.get('session-changed')!({ event: 'session-changed', id: 1, payload: sessions.find(item => item.id === info.id) }); },
@@ -38,7 +38,11 @@ async function workspace(page: Page) {
           try { if (flow.holdWrites && args.id === 'flow-a') await new Promise<void>(resolve => writes.push(resolve)); flow.sent.push(args); }
           finally { flow.activeWrites--; }
         }
-        if (command === 'session_resize' && flow.holdResize && args.id === 'flow-a') await new Promise<void>(resolve => resizes.push(resolve));
+        if (command === 'session_resize' && args.id === 'flow-a') {
+          flow.activeResizes++; flow.maxResizes = Math.max(flow.maxResizes, flow.activeResizes);
+          try { if (flow.holdResize) await new Promise<void>(resolve => resizes.push(resolve)); }
+          finally { flow.activeResizes--; }
+        }
         return null;
       },
     };
@@ -118,21 +122,38 @@ test('disposing a terminal clears pending input while its one inflight request c
 });
 
 test('held native resize keeps one request and the latest pending geometry, not an IPC chain', async ({ page }) => {
+  await page.clock.install();
   await workspace(page);
-  // Let the normal60ms startup resize debounce run before holding a later resize.
   await expect.poll(() => page.evaluate(() => (window as any).flow.calls.some((call: any) => call.command === 'session_resize' && call.args.id === 'flow-a'))).toBe(true);
-  await page.evaluate(() => { const flow = (window as any).flow; flow.calls = []; flow.holdResize = true; });
-  await page.setViewportSize({ width: 1600, height: 1000 });
-  await expect.poll(() => page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_resize' && call.args.id === 'flow-a').length)).toBe(1);
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 1000));
+  const fitViewport = async (width: number) => {
+    await page.setViewportSize({ width, height: 1000 });
+    // Observe real layout before advancing the fit frame and its60ms debounce.
+    // Wall-clock sleeps do not establish either of those completion boundaries.
+    await card(page).locator('.terminal-host').evaluate(host => new Promise<void>(resolve => {
+      const observer = new ResizeObserver(() => { observer.disconnect(); resolve(); });
+      observer.observe(host);
+    }));
+    await page.clock.runFor(80);
+  };
+  await fitViewport(1440);
+  await page.evaluate(() => { const flow = (window as any).flow; flow.calls = []; flow.holdResize = true; flow.maxResizes = 0; });
+  await fitViewport(1600);
   for (let index = 1; index <= 8; index++) {
-    await page.setViewportSize({ width: 1600 + index * 40, height: 1000 });
-    await page.waitForTimeout(85); // Deliberately cross the production60ms debounce while IPC remains held.
+    await fitViewport(1600 + index * 40);
+    expect(await page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_resize' && call.args.id === 'flow-a').length)).toBe(1);
   }
+  // The other equal-width column sends freely and supplies the final geometry.
+  expect(await card(page).locator('.terminal-host').evaluate(host => host.clientWidth)).toBe(await card(page, 'flow-b').locator('.terminal-host').evaluate(host => host.clientWidth));
+  const latest = await page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_resize' && call.args.id === 'flow-b').at(-1).args);
   await page.evaluate(() => (window as any).flow.releaseResize());
-  await expect.poll(() => page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_resize' && call.args.id === 'flow-a').length)).toBe(2);
+  await expect.poll(() => page.evaluate(() => (window as any).flow.activeResizes)).toBe(0);
   const sizes = await page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_resize' && call.args.id === 'flow-a').map((call: any) => call.args));
+  expect(sizes).toHaveLength(2);
+  expect(sizes[1]).toEqual({ ...latest, id: 'flow-a' });
   expect(sizes[1].cols).toBeGreaterThan(sizes[0].cols);
   expect(sizes.map((item: any) => item.generation)).toEqual([7, 7]);
+  expect(await page.evaluate(() => (window as any).flow.maxResizes)).toBe(1);
 });
 
 test('queue disposal releases cancelled payload objects before its inflight request finishes', async ({ page }) => {

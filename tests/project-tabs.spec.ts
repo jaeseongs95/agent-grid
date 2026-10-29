@@ -14,7 +14,18 @@ const owned = [
   { id: 'sibling', title: 'Sibling session', cwd: 'D:\\Work\\Alphabet' },
 ].map(session => ({ ...session, generation: 7, state: 'idle', active: true, threadId: `thread-${session.id}` }));
 
+test.afterEach(async ({ page }, testInfo) => {
+  if (testInfo.status !== testInfo.expectedStatus) {
+    await testInfo.attach('workspace-document.html', { body: await page.content(), contentType: 'text/html' });
+  }
+});
+
 async function workspace(page: Page, options: { capacity?: boolean } = {}) {
+  const failures: string[] = [];
+  page.on('pageerror', error => failures.push(`스크립트 오류: ${error.message}`));
+  page.on('console', message => { if (message.type() === 'error') failures.push(`콘솔 오류: ${message.text()}`); });
+  page.on('requestfailed', request => failures.push(`요청 실패: ${request.method()} ${request.url()} ${request.failure()?.errorText}`));
+  page.on('response', response => { if (response.status() >= 400) failures.push(`응답 오류: ${response.status()} ${response.url()}`); });
   await page.addInitScript(({ projects, owned, options }) => {
     const state = window as any;
     state.isTauri = true;
@@ -80,8 +91,13 @@ async function workspace(page: Page, options: { capacity?: boolean } = {}) {
       },
     };
   }, { projects, owned, options });
-  await page.goto('/');
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  const response = await page.goto('/');
+  expect(response?.ok(), '작업 공간 문서 응답').toBe(true);
+  try {
+    await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  } finally {
+    await test.info().attach('workspace-load.json', { body: JSON.stringify({ url: page.url(), failures }, null, 2), contentType: 'application/json' });
+  }
   await expect(tab(page, 'Alpha')).toBeVisible();
 }
 const tab = (page: Page, name: string) => page.locator('#project-tabs [role=tab]').filter({ hasText: new RegExp(`^${name}(?:\\s|$)`) });
