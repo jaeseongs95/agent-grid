@@ -91,7 +91,7 @@ fn server_args(endpoint: &str, verifier: &str, no_remote_control: bool) -> Vec<S
 
 fn help_supports_no_remote_control(bytes: &[u8]) -> Result<bool, String> {
     let help = std::str::from_utf8(bytes).map_err(|e| format!("Codex app-server help is not valid UTF-8: {e}"))?;
-    if !help.lines().any(|line| line.trim_start().strip_prefix("Usage:").is_some_and(|usage| usage.split_ascii_whitespace().any(|token| token == "app-server"))) {
+    if !help.lines().any(|line| line.trim_start().strip_prefix("Usage:").or_else(|| line.trim_start().strip_prefix("사용법:")).is_some_and(|usage| usage.split_ascii_whitespace().any(|token| token == "app-server"))) {
         return Err("Codex returned unrecognized app-server help; startup capability is unknown".into());
     }
     let options = help.lines().skip_while(|line| line.trim() != "Options:").skip(1)

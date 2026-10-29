@@ -3,17 +3,24 @@ use super::*;
 
 #[test]
 fn startup_capability_requires_an_exact_declared_option_in_recognized_help() {
-    let normal = "Run the server\n\nUsage: alternate-name app-server [OPTIONS] [COMMAND]\n\nOptions:\n  -h, --help\n          Print help\n      --listen <URI>\n          Server listener\n";
-    assert!(!help_supports_no_remote_control(normal.as_bytes()).unwrap());
-    let supported = format!("{normal}      --no-remote-control\n          Disable automatic startup\n");
-    assert!(help_supports_no_remote_control(supported.as_bytes()).unwrap());
-    assert!(help_supports_no_remote_control(supported.replace('\n', "\r\n").as_bytes()).unwrap());
-    for suffix in [
-        "      --no-remote-control-extra\n          A different option\n",
-        "          --no-remote-control is described but not declared\n",
-        "\nExamples:\n      --no-remote-control\n",
-    ] { assert!(!help_supports_no_remote_control(format!("{normal}{suffix}").as_bytes()).unwrap(), "{suffix}"); }
-    for malformed in ["", "--no-remote-control", "Usage: alternate-name [OPTIONS]\nOptions:\n  -h, --help\n", "Usage: alternate-name app-server\nOptions:\n      --no-remote-control\n"] {
+    for prefix in ["Usage:", "사용법:"] {
+        let normal = format!("Run the server\n\n{prefix} alternate-name app-server [OPTIONS] [COMMAND]\n\nOptions:\n  -h, --help\n          Print help\n      --listen <URI>\n          Server listener\n");
+        assert!(!help_supports_no_remote_control(normal.as_bytes()).unwrap(), "{prefix}");
+        let supported = format!("{normal}      --no-remote-control\n          Disable automatic startup\n");
+        assert!(help_supports_no_remote_control(supported.as_bytes()).unwrap(), "{prefix}");
+        assert!(help_supports_no_remote_control(supported.replace('\n', "\r\n").as_bytes()).unwrap(), "{prefix}");
+        for suffix in [
+            "      --no-remote-control-extra\n          A different option\n",
+            "          --no-remote-control is described but not declared\n",
+            "\nExamples:\n      --no-remote-control\n",
+        ] { assert!(!help_supports_no_remote_control(format!("{normal}{suffix}").as_bytes()).unwrap(), "{prefix}: {suffix}"); }
+        for malformed in [
+            format!("{prefix} alternate-name [OPTIONS]\nOptions:\n  -h, --help\n"),
+            format!("{prefix} alternate-name app-server-extra\nOptions:\n  -h, --help\n"),
+            format!("{prefix} alternate-name app-server\nOptions:\n      --no-remote-control\n"),
+        ] { assert!(help_supports_no_remote_control(malformed.as_bytes()).is_err(), "{malformed}"); }
+    }
+    for malformed in ["", "--no-remote-control", "Example: alternate-name app-server\nOptions:\n  -h, --help\n"] {
         assert!(help_supports_no_remote_control(malformed.as_bytes()).is_err(), "{malformed}");
     }
     assert!(help_supports_no_remote_control(&[0xff]).is_err());
@@ -44,8 +51,8 @@ class StartupFixture {
    if (mode == "overflow") { Console.Write(new string('x', 8 * 1024 * 1024 + 1024)); Console.Out.Flush(); Thread.Sleep(30000); return 0; }
    if (mode == "invalid-utf8") { Console.OpenStandardOutput().WriteByte(255); return 0; }
    if (mode == "malformed") { Console.Write("not a help document"); return 0; }
-   Console.Write("Usage: fixture app-server [OPTIONS] [COMMAND]\n\nOptions:\n  -h, --help\n          Print help\n      --listen <URI>\n          Listener\n");
-   if (mode == "supported") Console.Write("      --no-remote-control\n          Disable automatic remote-control startup\n");
+   Console.Write((mode.StartsWith("ko-") ? "\uC0AC\uC6A9\uBC95:" : "Usage:") + " fixture app-server [OPTIONS] [COMMAND]\n\nOptions:\n  -h, --help\n          Print help\n      --listen <URI>\n          Listener\n");
+   if (mode == "supported" || mode == "ko-supported") Console.Write("      --no-remote-control\n          Disable automatic remote-control startup\n");
    return 0;
   }
   File.WriteAllText(Path.Combine(root, "server.args"), String.Join("\n", args));
@@ -73,7 +80,7 @@ class StartupFixture {
         }
     };
     // 같은 exe 경로에서 지원을 바꾸어 경로/브랜드/버전 캐시 분기를 배제한다.
-    for (mode, supported) in [("unsupported", false), ("supported", true), ("unsupported", false)] {
+    for (mode, supported) in [("unsupported", false), ("supported", true), ("ko-unsupported", false), ("ko-supported", true), ("unsupported", false)] {
         fs::write(root.join("mode"), mode).unwrap();
         let error = launch_server(&exe, &root, None).err().expect("fixture exits instead of implementing WebSocket RPC");
         assert!(error.contains("app-server exited before connecting"), "{error}");
