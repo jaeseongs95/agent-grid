@@ -426,6 +426,9 @@ fn unrelated_listener_receives_no_authentication() -> Result<(), String> {
                 Err(error) => return Err(format!("accept unrelated ownership fixture connection: {error}")),
             }
         };
+        // Accepted sockets can inherit the nonblocking listener mode on Windows.
+        // Wait for the rejected peer to close, within the existing read deadline.
+        socket.set_nonblocking(false).map_err(|e| e.to_string())?;
         socket.set_read_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
         let mut bytes = [0u8; 1024];
         match socket.read(&mut bytes) {
