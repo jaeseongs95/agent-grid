@@ -368,7 +368,7 @@ function bindRestored(request: SavedSession, info: SessionInfo) {
 }
 function restoreSaved(request: SavedSession, focus = true): Promise<SessionInfo> {
   const pending = restoringRequests.get(request); if (pending) return pending;
-  for (const id of failedRestoreCards) if (sessions.get(id)?.threadId === request.threadId && sessions.get(id)?.active === false) removeSession(id);
+  for (const id of failedRestoreCards) if (sessions.get(id)?.threadId === request.threadId && sessions.get(id)?.active === false) removeSession(id, true);
   const before = new Set(sessions.keys());
   const operation = start(request, focus).then(info => {
     if (!info.active || ['error', 'stopping'].includes(info.state)) throw new UiError('세션 연결이 아직 완료되지 않았습니다. 기존 세션 상태를 확인한 뒤 다시 연결하세요.', 'The session is not connected yet. Check its existing state before retrying.');
@@ -378,7 +378,7 @@ function restoreSaved(request: SavedSession, focus = true): Promise<SessionInfo>
     // but remove newly reaped error cards so the saved retry does not duplicate them.
     for (const info of [...sessions.values()]) if ((!before.has(info.id) || failedRestoreCards.has(info.id)) && info.threadId === request.threadId) {
       failedRestoreCards.add(info.id);
-      if (!info.active) removeSession(info.id);
+      if (!info.active) removeSession(info.id, true);
     }
     throw error;
   }).finally(() => { restoringRequests.delete(request); updateRestoreBanner(); scheduleSave(); });
@@ -490,7 +490,15 @@ function createTerminal(session: Session) {
 }
 
 function move(id: string, offset: number) { const visible = visibleOrder(); const index = visible.indexOf(id); const next = index + offset; if (index < 0 || next < 0 || next >= visible.length) return; const from = order.indexOf(id); const to = order.indexOf(visible[next]); [order[from], order[to]] = [order[to], order[from]]; renderGrid(); renderSide(); scheduleSave(); }
-function removeSession(id: string) { workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); const view = terminals.get(id); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
+function removeSession(id: string, preserveRestore = false) {
+  if (!preserveRestore && failedRestoreCards.has(id)) {
+    const threadId = sessions.get(id)?.threadId;
+    const removed = saved.filter(request => request.threadId === threadId);
+    saved = saved.filter(request => !removed.includes(request));
+    workspaceSlots = workspaceSlots.filter(slot => typeof slot === 'string' || !removed.includes(slot));
+    updateRestoreBanner();
+  }
+  workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); const view = terminals.get(id); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
 
 function receiveSession(info: SessionInfo, persist = true) {
   const previous = sessions.get(info.id); const session = updateSession(previous, info);

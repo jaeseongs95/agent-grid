@@ -201,3 +201,16 @@ test('실패한 시작의 소유권이 남으면 재시도가 중복 실행하�
   await expect.poll(async () => (await saved(page))?.sessions.length).toBe(2);
   expect(await calls(page, 'session_stop')).toEqual([]);
 });
+
+for (const active of [true, false]) test(`실패한 복원 카드를 ${active ? '소유 중 종료' : '회수 뒤 닫기'}하면 대기 복원 항목도 제거하여 다시 부활하지 않는다`, async ({ page }) => {
+  await workspace(page, { failFirst: true, failActive: true });
+  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  page.on('dialog', dialog => dialog.accept());
+  if (!active) await page.evaluate(() => { const f = (window as any).restoreFixture; const info = f.live.find((item: any) => item.id === 'new-1'); Object.assign(info, { active: false }); f.emit(info); });
+  await page.locator('.terminal-card').filter({ has: page.locator('.terminal-title', { hasText: a.title }) }).locator('.stop').click();
+  await expect(page.locator('.terminal-title')).toHaveText([b.title]);
+  await expect(page.locator('#restore-banner')).toBeHidden();
+  await expect.poll(async () => (await saved(page))?.sessions.map((item: any) => item.threadId)).toEqual(['thread-b']);
+  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  expect((await calls(page, 'start_session')).map((item: any) => item.args.request.threadId)).toEqual(['thread-b']);
+});
