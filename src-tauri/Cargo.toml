@@ -1,18 +1,18 @@
 [package]
-name = "agent-grid"
-version = "0.3.0"
+name = "opendiy-desktop"
+version = "0.4.0"
 description = "Independent terminal workspace for local coding agents"
-authors = ["Agent Grid contributors"]
+authors = ["OpenDIY Desktop contributors"]
 license = "MIT"
 edition = "2021"
-default-run = "agent-grid"
+default-run = "opendiy-desktop"
 
 [[bin]]
-name = "agent-grid"
+name = "opendiy-desktop"
 path = "src/main.rs"
 
 [[bin]]
-name = "agent-grid-helper"
+name = "opendiy-desktop-helper"
 path = "src/helper_main.rs"
 test = false
 

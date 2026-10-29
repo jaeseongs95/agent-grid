@@ -3,7 +3,7 @@ import { test, expect, type Page } from '@playwright/test';
 const alpha = { id: '01900000-0000-7000-8000-000000000001', title: 'API 구조 개선', cwd: 'D:\\프로젝트\\api', createdAt: 1700000000, updatedAt: 1700000200, status: 'idle' };
 const beta = { ...alpha, id: '01900000-0000-7000-8000-000000000002', title: '회귀 테스트 점검', updatedAt: 1700000300 };
 
-async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; holdStart?: boolean; failStartOnce?: boolean; holdInitialEvent?: boolean; holdOwnershipRefresh?: boolean; holdFailureEvent?: boolean; failStatusRefresh?: boolean; finishStartEarly?: boolean; owned?: boolean; ownedState?: string; saved?: boolean; pages?: boolean; titleOverride?: string } = {}) {
+async function mockNative(page: Page, options: { holdSearch?: boolean; holdPreview?: boolean; holdStart?: boolean; failStartOnce?: boolean; holdInitialEvent?: boolean; holdOwnershipRefresh?: boolean; holdFailureEvent?: boolean; failStatusRefresh?: boolean; finishStartEarly?: boolean; owned?: boolean; ownedState?: string; saved?: boolean; pages?: boolean; titleOverride?: string; historyPages?: number } = {}) {
   await page.addInitScript(({ alpha, beta, options }) => {
     const state = window as any;
     state.isTauri = true;
@@ -21,7 +21,7 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
         if (command === 'plugin:event|listen') { listeners.set(args.event, callbacks.get(args.handler)!); return callback; }
         if (command.startsWith('plugin:event|')) return callback;
         if (command === 'get_ui_language') return 'ko';
-        if (command === 'set_ui_language') return { show: args.language === 'en' ? 'Open Agent Grid' : 'Agent Grid 열기', exit: args.language === 'en' ? 'Exit…' : '종료…' };
+        if (command === 'set_ui_language') return { show: args.language === 'en' ? 'Open OpenDIY Desktop' : 'OpenDIY Desktop 열기', exit: args.language === 'en' ? 'Exit…' : '종료…' };
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: options.saved ? [{ title: alpha.title, cwd: alpha.cwd, threadId: alpha.id }] : [] };
         if (command === 'list_sessions') {
           if (fixture.created === 1 && options.failStartOnce) {
@@ -48,11 +48,19 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
               if (args.request.query === 'missing') return { sessions: [], nextCursor: null };
               if (args.request.query === 'failure') throw new Error('조회 연결 오류');
               if (args.request.query === 'latest') return { sessions: [{ ...beta, title: '최종 검색 결과' }] };
+              if (options.historyPages) {
+                const page = Number(args.request.cursor || 0);
+                return { sessions: Array.from({ length: 50 }, (_, index) => ({ ...alpha, id: '01900000-0000-7000-8000-' + String(page * 50 + index + 1).padStart(12, '0'), title: `세션 ${page * 50 + index + 1}` })), nextCursor: page + 1 < options.historyPages ? String(page + 1) : null };
+              }
               if (args.request.cursor) return { sessions: [beta] };
               const first = { ...alpha, title: options.titleOverride ?? alpha.title };
               return { sessions: options.pages ? [first] : [first, beta], nextCursor: options.pages ? 'next-list' : null };
             }
             if (options.holdPreview && args.threadId === alpha.id) await new Promise<void>(resolve => { fixture.releasePreview = resolve; });
+            if (options.historyPages) {
+              const page = Number(args.cursor || 0);
+              return { messages: Array.from({ length: 50 }, (_, index) => ({ id: `${args.threadId}-${page}-${index}`, role: 'assistant', text: `PAGE ${page} MESSAGE ${index} ` + '한😀'.repeat(180) })), nextCursor: page + 1 < options.historyPages ? String(page + 1) : null };
+            }
             const text = args.threadId === alpha.id ? 'ALPHA ONLY' : '최근 답변 <img src=x onerror="window.injected=true">';
             return { messages: [{ id: args.threadId + (args.cursor || ''), role: 'assistant', text: args.cursor ? '이전 대화 내용' : text }], nextCursor: args.threadId === beta.id && !args.cursor ? 'older' : null };
           } finally { fixture.active--; }
@@ -372,3 +380,83 @@ for (const [name, title, expectedTitle] of [
     expect(await page.evaluate(() => (window as any).fixture.created)).toBe(1);
   });
 }
+
+
+test('many explicit history pages retain a bounded window and refresh returns to recent records', async ({ page }) => {
+  await mockNative(page, { historyPages: 12 });
+  await page.locator('#catalog-open').click();
+  await expect(page.locator('#catalog-list [role=option]')).toHaveCount(50);
+  await expect(page.locator('#catalog-messages article')).toHaveCount(50);
+  for (let index = 1; index < 8; index++) {
+    await page.locator('#catalog-more').click();
+    await expect.poll(() => page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'catalog_list').length)).toBe(index + 1);
+    await expect(page.locator('#catalog-more')).toBeEnabled();
+    await expect(page.locator('#catalog-list [role=option]')).toHaveCount(Math.min(250, (index + 1) * 50));
+  }
+  await expect(page.locator('#catalog-list [role=option]').first()).toContainText('세션 151');
+  await expect(page.locator('#catalog-list [role=option]').last()).toContainText('세션 400');
+  await expect(page.locator('#catalog-list-status')).toContainText('최대 250개');
+  await page.locator('#catalog-refresh').click();
+  await expect(page.locator('#catalog-list [role=option]').first()).toContainText('세션 1');
+  await expect(page.locator('#catalog-messages article')).toHaveCount(50);
+  for (let index = 1; index < 8; index++) {
+    await page.locator('#catalog-preview-more').click();
+    await expect(page.locator('#catalog-messages article').first()).toContainText(`PAGE ${index} MESSAGE 0`);
+    await expect(page.locator('#catalog-messages article')).toHaveCount(100);
+    const bytes = await page.locator('#catalog-messages').evaluate(element => [...element.querySelectorAll('p')].reduce((sum, message) => sum + new TextEncoder().encode(message.textContent ?? '').byteLength, 0));
+    expect(bytes).toBeLessThanOrEqual(128 * 1024);
+  }
+  await expect(page.locator('#catalog-preview-status')).toContainText('최대 100개');
+  await page.locator('#catalog-list [role=option]').first().click();
+  await expect(page.locator('#catalog-messages article')).toHaveCount(50);
+  await expect(page.locator('#catalog-messages article').first()).toContainText('PAGE 0 MESSAGE 0');
+  expect(await page.evaluate(() => (window as any).fixture.maxActive)).toBe(1);
+});
+
+test('closing releases history nodes and selected text across repeated open and close cycles', async ({ page }, testInfo) => {
+  await mockNative(page, { historyPages: 2 });
+  const cdp = await page.context().newCDPSession(page);
+  for (let index = 0; index < 25; index++) {
+    await page.locator('#catalog-open').click();
+    await expect(page.locator('#catalog-messages article')).toHaveCount(50);
+    await page.evaluate(() => {
+      const sample = ['#catalog-list [role=option]', '#catalog-messages article', '#catalog-metadata dd'].map(selector => new WeakRef(document.querySelector(selector)!));
+      const state = window as any; state.historyWeakReferences ??= []; state.historyWeakReferences.push(...sample);
+    });
+    await page.locator('#catalog-close').click();
+    await expect(page.locator('#catalog-list [role=option]')).toHaveCount(0);
+    await expect(page.locator('#catalog-messages article')).toHaveCount(0);
+    await expect(page.locator('#catalog-metadata')).toBeEmpty();
+    await expect(page.locator('#catalog-session-title')).toBeEmpty();
+    await page.evaluate(() => { (window as any).fixture.calls = []; });
+  }
+  await cdp.send('HeapProfiler.collectGarbage');
+  await cdp.send('HeapProfiler.collectGarbage');
+  const retained = await page.evaluate(() => (window as any).historyWeakReferences.filter((reference: WeakRef<Element>) => reference.deref() !== undefined).length);
+  expect(retained).toBe(0);
+  const metrics = await cdp.send('Runtime.getHeapUsage');
+  await testInfo.attach('catalog-lifetime.json', { body: JSON.stringify({ cycles: 25, sampledNodes: 75, retainedSampledNodes: retained, heap: metrics, limitation: 'Renderer fixture and sampled node lifetime only; not a native-process or long-duration leak proof.' }, null, 2), contentType: 'application/json' });
+  await cdp.detach();
+});
+
+
+test('a preview completing after close cannot restore released history or overtake the reopened selection', async ({ page }) => {
+  await mockNative(page, { holdPreview: true });
+  await page.locator('#catalog-open').click();
+  await expect.poll(() => page.evaluate(() => (window as any).fixture.active)).toBe(1);
+  await page.locator('#catalog-close').click();
+  await expect(page.locator('#catalog-list [role=option]')).toHaveCount(0);
+  await page.evaluate(() => (window as any).fixture.releasePreview());
+  await expect.poll(() => page.evaluate(() => (window as any).fixture.active)).toBe(0);
+  await expect(page.locator('#catalog-list [role=option]')).toHaveCount(0);
+  await expect(page.locator('#catalog-messages article')).toHaveCount(0);
+  await expect(page.locator('#catalog-metadata')).toBeEmpty();
+  await page.locator('#catalog-open').click();
+  await expect.poll(() => page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'catalog_preview').length)).toBe(2);
+  await page.locator('#catalog-list [role=option]').nth(1).click();
+  await page.evaluate(() => (window as any).fixture.releasePreview());
+  await expect(page.locator('#catalog-session-title')).toHaveText(beta.title);
+  await expect(page.locator('#catalog-messages')).toContainText('최근 답변 <img');
+  await expect(page.locator('#catalog-messages')).not.toContainText('ALPHA ONLY');
+  expect(await page.evaluate(() => (window as any).fixture.maxActive)).toBe(1);
+});

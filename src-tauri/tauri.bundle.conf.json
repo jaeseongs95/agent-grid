@@ -4,7 +4,7 @@
     "resources": {
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
       "../LICENSE": "LICENSE",
-      "target/release/agent-grid-helper.exe": "agent-grid-helper.exe"
+      "target/release/opendiy-desktop-helper.exe": "opendiy-desktop-helper.exe"
     }
   }
 }

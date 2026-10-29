@@ -16,7 +16,7 @@ $currentSession = (Get-Process -Id $PID).SessionId
 if ($appProcess.StartTime.ToUniversalTime() -lt [DateTime]::UtcNow.AddMinutes(-20)) { throw 'Refusing a process older than 20 minutes; launch a fresh isolated app' }
 $windowHandle = $appProcess.MainWindowHandle
 if ($windowHandle -eq [IntPtr]::Zero) { throw 'Target has no visible main window handle' }
-if ($appProcess.MainWindowTitle -ne 'Agent Grid') { throw 'Unexpected main window title' }
+if ($appProcess.MainWindowTitle -ne 'OpenDIY Desktop') { throw 'Unexpected main window title' }
 
 Add-Type -TypeDefinition @'
 using System;

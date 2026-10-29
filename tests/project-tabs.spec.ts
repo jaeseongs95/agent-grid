@@ -35,7 +35,7 @@ async function workspace(page: Page, options: { capacity?: boolean } = {}) {
         if (command === 'plugin:event|listen') { listeners.set(args.event, callbacks.get(args.handler)!); return callback; }
         if (command.startsWith('plugin:event|')) return callback;
         if (command === 'get_ui_language') return 'ko';
-        if (command === 'set_ui_language') return { show: args.language === 'en' ? 'Open Agent Grid' : 'Agent Grid 열기', exit: args.language === 'en' ? 'Exit…' : '종료…' };
+        if (command === 'set_ui_language') return { show: args.language === 'en' ? 'Open OpenDIY Desktop' : 'OpenDIY Desktop 열기', exit: args.language === 'en' ? 'Exit…' : '종료…' };
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: options.capacity ? [{ title: 'Pending slot 32', cwd: projects[0].cwd, threadId: 'pending-slot32' }] : [] };
         if (command === 'list_sessions') {
           if (ownershipReads++ > 0 && state.tabsFixture.holdOwnership) await new Promise<void>(resolve => { state.tabsFixture.releaseOwnership = resolve; });

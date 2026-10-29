@@ -16,8 +16,12 @@ mod platform {
     fn wide(value: &OsStr) -> Vec<u16> { value.encode_wide().chain(Some(0)).collect() }
 
     fn helper_executable() -> Result<std::path::PathBuf, String> {
-        let application = std::env::current_exe().map_err(|e| format!("locate Agent Grid executable: {e}"))?;
-        let helper = application.parent().ok_or("Agent Grid executable has no parent directory")?.join("agent-grid-helper.exe");
+        let application = std::env::current_exe().map_err(|e| format!("locate OpenDIY Desktop executable: {e}"))?;
+        let helper = application.parent().ok_or("OpenDIY Desktop executable has no parent directory")?.join("opendiy-desktop-helper.exe");
+        #[cfg(test)]
+        let helper = if !helper.is_file() && application.parent().and_then(|path| path.file_name()) == Some(OsStr::new("deps")) {
+            application.parent().and_then(|path| path.parent()).ok_or("Test executable has no target directory")?.join("opendiy-desktop-helper.exe")
+        } else { helper };
         if !helper.is_file() { return Err(format!("required console helper is missing: {}", helper.display())); }
         Ok(helper)
     }

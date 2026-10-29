@@ -160,9 +160,9 @@ pub fn catalog_list_with_executable(exe: &OsString, request: CatalogQuery) -> Re
     })
 }
 
-fn message_text(item: &Value) -> Result<Option<(String, String)>, String> {
+fn message_text(item: &Value, maximum: usize) -> Result<Option<(String, String)>, String> {
     match item["type"].as_str() {
-        Some("agentMessage") => Ok(Some(("assistant".into(), item["text"].as_str().ok_or("Codex assistant message has no text")?.to_owned()))),
+        Some("agentMessage") => Ok(Some(("assistant".into(), bounded_text(item["text"].as_str().ok_or("Codex assistant message has no text")?, maximum)))),
         Some("userMessage") => {
             let content = item["content"].as_array().ok_or("Codex user message has no content array")?;
             let mut text = String::new();
@@ -186,16 +186,13 @@ fn parse_preview(value: &Value, previous: Option<&str>) -> Result<CatalogPreview
     let items = value["data"].as_array().ok_or("Codex preview response has no data array")?;
     if items.len() > CATALOG_PAGE_SIZE { return Err("Codex preview exceeded the requested item count".into()); }
     let mut messages = Vec::new();
-    let mut bytes = 0usize;
     for entry in items {
         let item = entry.get("item").ok_or("Codex preview entry has no item")?;
-        if let Some((role, text)) = message_text(item)? {
+        if let Some((role, text)) = message_text(item, PREVIEW_TEXT_BYTES / CATALOG_PAGE_SIZE)? {
             let id = item["id"].as_str().filter(|id| !id.is_empty() && id.len() <= 4096).ok_or("Codex preview message has no bounded ID")?;
-            // Share the page budget across the maximum possible message count.
-            // This keeps every returned item represented instead of consuming
-            // its cursor and silently losing older messages after one huge item.
-            let text = bounded_text(&text, (PREVIEW_TEXT_BYTES / CATALOG_PAGE_SIZE).min(PREVIEW_TEXT_BYTES.saturating_sub(bytes)));
-            bytes += text.len();
+            // Assistant text is bounded before copying; multipart user text
+            // keeps its existing 64KiB assembly cap and shared page budget.
+            let text = bounded_text(&text, PREVIEW_TEXT_BYTES / CATALOG_PAGE_SIZE);
             messages.push(PreviewMessage { id: id.into(), role, text });
         }
     }

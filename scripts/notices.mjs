@@ -3,7 +3,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 // Package notices come from the exact downloaded sources used by this build.
-const parts = ['# Third-party notices', 'Generated from the installed dependency sources. Agent Grid is MIT licensed.'];
+const parts = ['# Third-party notices', 'Generated from the installed dependency sources. OpenDIY Desktop is MIT licensed.'];
 function include(name, version, license, directory) {
   parts.push(`## ${name} ${version}\n\nLicense: ${license || 'See package source'}`);
   const files = fs.readdirSync(directory).filter(name => /^(licen[cs]e|copying|notice)([.-]|$)/i.test(name));

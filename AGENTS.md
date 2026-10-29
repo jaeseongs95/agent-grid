@@ -1,6 +1,7 @@
-# Agent Grid
+# OpenDIY Desktop
 
-Long-term product goal: replace the ChatGPT desktop app with Agent Grid.
+Long-term product goal: replace the ChatGPT desktop app with OpenDIY Desktop. Eventually benchmark both ChatGPT and Claude desktop apps and integrate the relevant features and usability into OpenDIY Desktop; this is future product direction, not authorization to start that broader work now.
+The user-selected Codex runtime source is https://github.com/jaeseongs95/opendiy-codex; verify its actual CLI/app-server capabilities and support its executable through the existing path setting.
 For plugin/skill management, the current Codex desktop app is the functional reference; registration, installation and activation must actually integrate with the Codex CLI.
 
 Independent MIT implementation. Never copy Claudes source, assets, or UI text.

@@ -19,7 +19,7 @@ async function mockSettings(page: Page, options: { holdChoose?: boolean; unavail
         fixture.calls.push({ command, args });
         if (command.startsWith('plugin:event|')) return callback;
         if (command === 'get_ui_language') return 'ko';
-        if (command === 'set_ui_language') return { show: args.language === 'en' ? 'Open Agent Grid' : 'Agent Grid 열기', exit: args.language === 'en' ? 'Exit…' : '종료…' };
+        if (command === 'set_ui_language') return { show: args.language === 'en' ? 'Open OpenDIY Desktop' : 'OpenDIY Desktop 열기', exit: args.language === 'en' ? 'Exit…' : '종료…' };
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: [] };
         if (command === 'list_projects') return [];
         if (command === 'list_sessions') return [{ id: 'live-owned', generation: 9, title: '열린 작업', cwd: 'D:\\fixture', threadId: '01900000-0000-7000-8000-000000000001', state: 'idle', active: true }];

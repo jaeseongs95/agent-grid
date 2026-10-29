@@ -10,8 +10,8 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not [IO.Path]::IsPathRooted($ExpectedExecutable)) { throw 'Expected executable must be an absolute file' }
 $expectedExecutablePath = [IO.Path]::GetFullPath($ExpectedExecutable)
-if (-not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or [IO.Path]::GetFileName($expectedExecutablePath) -ne 'agent-grid.exe') {
-    throw 'Expected executable must be an existing agent-grid.exe'
+if (-not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or [IO.Path]::GetFileName($expectedExecutablePath) -ne 'opendiy-desktop.exe') {
+    throw 'Expected executable must be an existing opendiy-desktop.exe'
 }
 if ($Mode -eq 'Select') {
     if (-not $ExpectedPath -or -not [IO.Path]::IsPathRooted($ExpectedPath) -or -not (Test-Path -LiteralPath $ExpectedPath -PathType Container)) {
@@ -27,7 +27,7 @@ if ($appProcess.StartTime.ToUniversalTime() -lt [DateTime]::UtcNow.AddMinutes(-2
 if ($appProcess.SessionId -ne $currentSession) { throw 'Target is in another Windows session' }
 if (-not [string]::Equals([IO.Path]::GetFullPath($appProcess.Path), $expectedExecutablePath, [StringComparison]::OrdinalIgnoreCase)) { throw 'Target executable path does not match' }
 $mainWindow = $appProcess.MainWindowHandle
-if ($mainWindow -eq [IntPtr]::Zero -or $appProcess.MainWindowTitle -ne 'Agent Grid') { throw 'Target does not have the expected Agent Grid main window' }
+if ($mainWindow -eq [IntPtr]::Zero -or $appProcess.MainWindowTitle -ne 'OpenDIY Desktop') { throw 'Target does not have the expected OpenDIY Desktop main window' }
 
 Add-Type -TypeDefinition @'
 using System;
@@ -52,6 +52,12 @@ public static class AgentGridPickerProbe {
     private static extern IntPtr WriteMessage(IntPtr hwnd, uint message, UIntPtr wParam, string text, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)]
     private static extern IntPtr PlainMessage(IntPtr hwnd, uint message, UIntPtr wParam, IntPtr data, uint flags, uint timeout, out UIntPtr result);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr VirtualAllocEx(IntPtr process, IntPtr address, UIntPtr size, uint allocationType, uint protection);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool WriteProcessMemory(IntPtr process, IntPtr address, byte[] data, UIntPtr size, out UIntPtr written);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool VirtualFreeEx(IntPtr process, IntPtr address, UIntPtr size, uint freeType);
+    [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
     public static string WindowClass(IntPtr hwnd) {
         var value = new StringBuilder(256);
         GetClassNameW(hwnd, value, value.Capacity);
@@ -99,6 +105,41 @@ public static class AgentGridPickerProbe {
         UIntPtr accepted;
         if (WriteMessage(edit, 0x000C, UIntPtr.Zero, text, 3, 2000, out accepted) == IntPtr.Zero || accepted == UIntPtr.Zero)
             throw new InvalidOperationException("Owned path edit did not accept WM_SETTEXT");
+    }
+    public static void SelectFolder(IntPtr dialog, uint pid, IntPtr owner, string body, long expectedStartFileTime, string path) {
+        if (!IsExpectedDialog(dialog, pid, owner, body)) throw new InvalidOperationException("Folder selection refused an unverified dialog");
+        byte[] text = Encoding.Unicode.GetBytes(path + "\0");
+        if (text.Length > 65534) throw new InvalidOperationException("Folder path exceeds the bounded Unicode buffer");
+        // BFFM_SETSELECTIONW is above WM_USER: USER32 does not marshal its path pointer across processes.
+        // Allocate only a bounded data buffer in the already verified, fresh fixture process; no code is written.
+        IntPtr process = OpenProcess(0x1028, false, pid); // QUERY_LIMITED_INFORMATION | VM_OPERATION | VM_WRITE
+        if (process == IntPtr.Zero) throw new InvalidOperationException("Cannot open the owned fixture process for its folder path buffer");
+        IntPtr remote = IntPtr.Zero;
+        bool pendingMessage = false;
+        try {
+            long creation, exit, kernel, user;
+            if (!GetProcessTimes(process, out creation, out exit, out kernel, out user) || creation != expectedStartFileTime)
+                throw new InvalidOperationException("Folder selection refused a reused process ID");
+            if (!IsExpectedDialog(dialog, pid, owner, body)) throw new InvalidOperationException("Owned folder dialog changed before selection");
+            remote = VirtualAllocEx(process, IntPtr.Zero, new UIntPtr((uint)text.Length), 0x3000, 0x04);
+            if (remote == IntPtr.Zero) throw new InvalidOperationException("Cannot allocate the owned folder path buffer");
+            UIntPtr written;
+            if (!WriteProcessMemory(process, remote, text, new UIntPtr((uint)text.Length), out written) || written.ToUInt64() != (ulong)text.Length)
+                throw new InvalidOperationException("Cannot write the complete owned folder path buffer");
+            UIntPtr ignored;
+            pendingMessage = true;
+            if (PlainMessage(dialog, 0x0467, new UIntPtr(1), remote, 3, 2000, out ignored) == IntPtr.Zero)
+                throw new InvalidOperationException("Owned BFFM_SETSELECTIONW did not complete; bounded path buffer retained until fixture exit");
+            pendingMessage = false; // The shell has finished consuming the path; the message return value itself is unspecified.
+        } finally {
+            // A timed-out message may still be consuming its pointer. Keep that one bounded allocation until fixture exit.
+            // The existing caller cancels this exact owned dialog and exits its own fixture on any failure.
+            if (remote != IntPtr.Zero && !pendingMessage && !VirtualFreeEx(process, remote, UIntPtr.Zero, 0x8000)) {
+                CloseHandle(process);
+                throw new InvalidOperationException("Cannot release the owned folder path buffer");
+            }
+            CloseHandle(process);
+        }
     }
     public static void Click(IntPtr button) {
         UIntPtr ignored;
@@ -152,6 +193,9 @@ try {
         $editId = [AgentGridPickerProbe]::GetDlgCtrlID($edits[0])
         [AgentGridPickerProbe]::SetEdit($edits[0], $ExpectedPath)
         $actions.Add('owned-edit-WM_SETTEXT')
+        Assert-DialogIdentity
+        [AgentGridPickerProbe]::SelectFolder($script:dialog, $AppProcessId, $mainWindow, $ExpectedDialogText, $appProcess.StartTime.ToUniversalTime().ToFileTimeUtc(), $ExpectedPath)
+        $actions.Add('owned-dialog-BFFM_SETSELECTIONW-remote-Unicode-path')
         Assert-DialogIdentity
         $button = [AgentGridPickerProbe]::GetDlgItem($script:dialog, 1)
         if ($button -eq [IntPtr]::Zero -or -not [AgentGridPickerProbe]::OwnedBy($button, $AppProcessId) -or -not [AgentGridPickerProbe]::IsWindowEnabled($button)) { throw 'Owned IDOK button is missing or disabled' }

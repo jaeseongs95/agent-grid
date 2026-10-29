@@ -10,7 +10,7 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not [IO.Path]::IsPathRooted($ExpectedExecutable)) { throw 'Expected executable must be absolute' }
 $expectedExecutablePath = [IO.Path]::GetFullPath($ExpectedExecutable)
-if (-not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or [IO.Path]::GetFileName($expectedExecutablePath) -ne 'agent-grid.exe') { throw 'Expected executable must be an existing agent-grid.exe' }
+if (-not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or [IO.Path]::GetFileName($expectedExecutablePath) -ne 'opendiy-desktop.exe') { throw 'Expected executable must be an existing opendiy-desktop.exe' }
 if ($Mode -eq 'Select') {
     if (-not $ExpectedPath -or -not [IO.Path]::IsPathRooted($ExpectedPath) -or -not (Test-Path -LiteralPath $ExpectedPath -PathType Leaf)) { throw 'Select mode requires an existing absolute file' }
     $ExpectedPath = [IO.Path]::GetFullPath($ExpectedPath)
@@ -23,7 +23,7 @@ if ($appProcess.StartTime.ToUniversalTime() -lt [DateTime]::UtcNow.AddMinutes(-2
 if ($appProcess.SessionId -ne $currentSession) { throw 'Target is in another Windows session' }
 if (-not [string]::Equals([IO.Path]::GetFullPath($appProcess.Path), $expectedExecutablePath, [StringComparison]::OrdinalIgnoreCase)) { throw 'Target executable path does not match' }
 $mainWindow = $appProcess.MainWindowHandle
-if ($mainWindow -eq [IntPtr]::Zero -or $appProcess.MainWindowTitle -ne 'Agent Grid') { throw 'Target does not have the expected Agent Grid main window' }
+if ($mainWindow -eq [IntPtr]::Zero -or $appProcess.MainWindowTitle -ne 'OpenDIY Desktop') { throw 'Target does not have the expected OpenDIY Desktop main window' }
 
 Add-Type -TypeDefinition @'
 using System;

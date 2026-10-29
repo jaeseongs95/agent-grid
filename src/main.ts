@@ -8,6 +8,7 @@ import './style.css';
 import { MAX_WORKSPACE_SESSIONS, acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, projectKey, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo } from './model';
 import { createSessionBrowser, type ProjectInfo } from './session-browser';
 import { createExecutableSettings } from './executable-settings';
+import { createExtensionsManager } from './extensions';
 import { bindAttribute, bindText, getLanguage, languageStorageError, onLanguageChange, setLanguage, t } from './i18n';
 
 const native = isTauri();
@@ -42,7 +43,7 @@ let projectSelectionVersion = 0;
 if (native) $('#app').hidden = true;
 $('#app').innerHTML = `
   <aside class="sidebar">
-    <a class="brand" href="#" aria-label="Agent Grid 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span>Agent Grid<span class="version">0.3</span></a>
+    <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">0.4.0</span></a>
     <div class="workspace-label">WORKSPACE <span class="local-pill">LOCAL</span></div>
     <button class="workspace-choice"><span class="folder-icon">▤</span><span>나의 작업 공간<small>독립된 터미널, 하나의 화면</small></span></button>
     <div class="side-heading">프로젝트 <span id="project-count">0</span></div>
@@ -52,6 +53,7 @@ $('#app').innerHTML = `
     <nav id="session-list" aria-label="세션 목록"></nav>
     <button id="external-toggle" class="side-link"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button>
     <button id="codex-settings-open" class="side-link"><span>⚙</span> 실행 파일 설정</button>
+    <button id="extensions-open" class="side-link"><span>◇</span> <span id="extensions-open-label">플러그인·스킬</span></button>
     <div class="language-setting"><label for="language-select">언어 / Language</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div>
     <div class="sidebar-bottom"><span class="connection-dot"></span><span id="connection">연결 확인 중</span><small>Windows · 로컬 실행</small></div>
   </aside>
@@ -72,12 +74,12 @@ $('#app').innerHTML = `
   <dialog id="restore-dialog"><div class="dialog-heading"><span class="eyebrow">SAVED WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>저장된 세션</h2><p>버튼을 누른 세션만 시작합니다. 스레드 ID가 있으면 해당 대화를 재개합니다.</p><div id="restore-list" class="restore-list"></div></dialog>
   <dialog id="external-dialog"><div class="dialog-heading"><span class="eyebrow">READ ONLY</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>외부 세션</h2><p>다른 앱에서 발견한 기록입니다. 관측 정보이며 현재 실행 상태는 미확인입니다. 입력하거나 종료할 수 없습니다.</p><button id="external-refresh" class="quiet-button">새로 고침</button><div id="external-list" class="external-list"></div></dialog>
   <dialog id="notification-dialog"><div class="dialog-heading"><span class="eyebrow">ACTIVITY</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>알림</h2><div id="notification-list" class="notification-list"><p class="muted">새로운 알림이 없습니다.</p></div></dialog>
-  <dialog id="exit-dialog"><div class="dialog-heading"><span class="eyebrow">EXIT WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>Agent Grid를 종료할까요?</h2><p>앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.</p><div class="dialog-actions"><button class="quiet-button" data-close>계속 작업</button><button id="confirm-exit" class="danger-button">세션 종료 후 앱 닫기</button></div></dialog>
+  <dialog id="exit-dialog"><div class="dialog-heading"><span class="eyebrow">EXIT WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>OpenDIY Desktop를 종료할까요?</h2><p>앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.</p><div class="dialog-actions"><button class="quiet-button" data-close>계속 작업</button><button id="confirm-exit" class="danger-button">세션 종료 후 앱 닫기</button></div></dialog>
 `;
 
 // Register only app-owned templates, before any terminal or user content is inserted.
 const markupLabels: Record<string, [string, string]> = {
-  "Agent Grid 홈": ["Agent Grid 홈", "Agent Grid home"],
+  "OpenDIY Desktop 홈": ["OpenDIY Desktop 홈", "OpenDIY Desktop home"],
   "WORKSPACE": ["작업 공간", "WORKSPACE"],
   "LOCAL": ["로컬", "LOCAL"],
   "나의 작업 공간": ["나의 작업 공간", "My workspace"],
@@ -158,7 +160,7 @@ const markupLabels: Record<string, [string, string]> = {
   "알림": ["알림", "Notifications"],
   "새로운 알림이 없습니다.": ["새로운 알림이 없습니다.", "No new notifications."],
   "EXIT WORKSPACE": ["작업 공간 종료", "EXIT WORKSPACE"],
-  "Agent Grid를 종료할까요?": ["Agent Grid를 종료할까요?", "Exit Agent Grid?"],
+  "OpenDIY Desktop를 종료할까요?": ["OpenDIY Desktop를 종료할까요?", "Exit OpenDIY Desktop?"],
   "앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.": ["앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.", "All running sessions owned by this app will stop. Sessions in other apps are unaffected. The window close button hides the app to the tray."],
   "계속 작업": ["계속 작업", "Keep working"],
   "세션 종료 후 앱 닫기": ["세션 종료 후 앱 닫기", "Stop sessions and exit"],
@@ -536,6 +538,9 @@ $('#project-tabs').addEventListener('keydown', event => {
   const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length;
   selectProject(tabs[next].dataset.projectCwd ?? ''); $('#project-tabs [aria-selected="true"]').focus();
 });
+const extensionsManager = createExtensionsManager({ call, notify });
+bindText($('#extensions-open-label'), '플러그인·스킬', 'Plugins & skills');
+$('#extensions-open').onclick = () => extensionsManager.open(selectedProject || undefined);
 const executableSettings = createExecutableSettings(call);
 $('#codex-settings-open').onclick = () => void executableSettings.open();
 for (const button of document.querySelectorAll<HTMLElement>('[data-close]')) button.onclick = () => button.closest('dialog')?.close();
@@ -661,7 +666,7 @@ document.addEventListener('keydown', event => {
 async function initialize() {
   if (!native) {
     bindText($('#connection'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'Design demo' : 'Browser preview'); bindText($('#mode-label'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'DESIGN DEMO' : 'BROWSER PREVIEW'); $('#runtime-banner').hidden = false;
-    bindText($('#runtime-banner'), demo ? '디자인 데모 · 아래 터미널은 정적인 예시입니다. 실제 프로세스 실행·입력·전송은 지원하지 않습니다.' : '브라우저 미리보기입니다. 실제 세션 실행은 Agent Grid 데스크톱 앱에서 사용할 수 있습니다.', demo ? 'Design demo · These terminals are static examples. Process execution, input and sending are unavailable.' : 'Browser preview. Run real sessions in the Agent Grid desktop app.');
+    bindText($('#runtime-banner'), demo ? '디자인 데모 · 아래 터미널은 정적인 예시입니다. 실제 프로세스 실행·입력·전송은 지원하지 않습니다.' : '브라우저 미리보기입니다. 실제 세션 실행은 OpenDIY Desktop 앱에서 사용할 수 있습니다.', demo ? 'Design demo · These terminals are static examples. Process execution, input and sending are unavailable.' : 'Browser preview. Run real sessions in the OpenDIY Desktop app.');
     bindText($('#save-status'), '미리보기 · 저장 안 함', 'Preview · not saved');
     if (demo) seedDemo(); renderAll(); return;
   }

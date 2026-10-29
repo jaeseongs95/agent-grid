@@ -4,7 +4,7 @@ fn main() {
     match agent_grid_lib::process_job::run_child() {
         Some(code) => std::process::exit(code),
         None => {
-            eprintln!("Agent Grid helper requires an owned launch gate");
+            eprintln!("OpenDIY Desktop helper requires an owned launch gate");
             std::process::exit(2);
         }
     }

@@ -1,19 +1,20 @@
-# Agent Grid
+# OpenDIY Desktop
 
 **English** | [한국어](README.ko.md)
 
 A Windows desktop grid for running coding-agent CLI sessions side by side.
 
-The first adapter supports the official Codex CLI. Arrange terminals in a
+The Codex adapter supports [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex),
+the selected runtime for this project, and compatible official Codex CLI versions. Arrange terminals in a
 resizable grid, group them by working directory, search terminal output and
 send input to selected sessions. Waiting and unknown sessions are excluded
 from group input. Each target reports its own delivery result.
 
-![Agent Grid design preview](docs/design-demo.png)
+![OpenDIY Desktop design preview](docs/design-demo.png)
 
-*Design demo with static terminal examples; this image is not runtime evidence.*
+*Original layout mock-up from the previous Agent Grid name, with static terminal examples; not runtime evidence.*
 
-Agent Grid is an independent MIT implementation. It does not include code,
+OpenDIY Desktop is an independent MIT implementation. It does not include code,
 assets or branding from Claudes. That project's multi-terminal workflow was
 a product reference; its source-available license does not permit unapproved
 modification or redistribution. See the [reference license](https://github.com/paulallington/Claudes/blob/v1.9.82/LICENSE).
@@ -30,13 +31,13 @@ in their original language; the app does not change the CLI or OS locale.
 ## Running
 
 Download the portable ZIP or per-user installer from
-[Releases](https://github.com/jaeseongs95/agent-grid/releases). Windows x64 and
+[Releases](https://github.com/jaeseongs95/opendiy-desktop/releases). Windows x64 and
 WebView2 are required. The application is unsigned.
-Extract the whole portable ZIP and run `agent-grid.exe`. Keep
-`agent-grid-helper.exe` beside it: Windows requires a console process for the
+Extract the whole portable ZIP and run `opendiy-desktop.exe`. Keep
+`opendiy-desktop-helper.exe` beside it: Windows requires a console process for the
 terminal side while the main application uses a normal desktop window.
 
-Install and sign in to the official Codex CLI first. Open **Executable settings**
+Install and sign in to OpenDIY Codex or a compatible official Codex CLI first. Open **Executable settings**
 and select its native `codex.exe`; the app saves that path for future starts
 and history queries. The screen shows the saved path, resolved executable and
 where it came from. Cancelling the chooser keeps the previous setting.
@@ -65,12 +66,44 @@ project on the left; inspect dates, the conversation ID and recent messages on
 the right before resuming. Already open conversations focus their existing
 terminal. Browsing uses read-only requests through a short-lived owned server,
 so it does not require an existing desktop daemon. Recent messages are fetched
-in bounded pages and are not stored in Agent Grid's database.
+in bounded pages and are not stored in OpenDIY Desktop's database.
 
 Use **New session** to enter a directory directly. Use the official TUI to choose
 a model, sign in or answer permission prompts. Select
 terminal cards before using group input. A reported delivery means bytes
 reached that terminal; it does not mean a model accepted or completed a turn.
+
+## Plugins and skills
+
+Open **Plugins & skills** in the sidebar. The popup uses the executable selected
+in **Executable settings**, and shows that executable and the selected project.
+Search installed/available plugins and skills, install/remove or enable/disable
+plugins, manage marketplace sources, and enable/disable skills. Import an existing
+skill folder containing `SKILL.md` into the selected project or your user skill
+folder. The review screen shows the exact target and scope before applying a change.
+Existing destination folders are never overwritten; links and oversized imports
+are rejected. Errors and unsupported CLI capabilities remain visible.
+
+Plugin installation and marketplace changes use the CLI's own commands; skill
+and setting changes use its app-server APIs. Existing CLI authentication and
+configuration remain owned by that CLI. Changes are read back after applying.
+Start a new session to use changed extensions; running terminals are not restarted.
+This version does not claim shared mobile/daemon backend integration.
+
+## Memory and history
+
+History is loaded only on request: up to 50 sessions or conversation items per
+page. The popup retains at most 250 session rows and 100 preview messages (128 KiB
+of preview text), dropping older displayed pages as more are requested. Select a
+session again to return to recent messages. Closing the popup releases its rows,
+preview and selection; conversation bodies are not copied into the app database.
+The extensions popup initially renders 50 rows, keeps at most 250 row elements,
+and releases fetched data on close.
+These bounds and lifecycle tests are not a claim of a completed long-duration leak test.
+
+Existing saved settings and projects from Agent Grid are preserved. The longer-term
+product direction is to learn from ChatGPT and Claude desktop workflows; the full
+benchmark and broader feature migration are future work.
 
 ## Development
 
@@ -88,17 +121,17 @@ npm run tauri -- dev
 Package the console helper before the desktop bundle:
 
 ```powershell
-cargo build --locked --manifest-path src-tauri/Cargo.toml --release --bin agent-grid-helper
+cargo build --locked --manifest-path src-tauri/Cargo.toml --release --bin opendiy-desktop-helper
 npm run tauri -- build --config src-tauri/tauri.bundle.conf.json --bundles nsis
 ```
 If Unicode workspace paths cause native tool failures, build in a separate
-checkout under `D:/codex/build/agent-grid`.
+checkout under `D:/codex/build/opendiy-desktop`.
 Generate third-party notices before native compilation; they are bundled
 with the installer and distributed alongside the portable executable.
 
 ## Codex
 
-Install and sign in to the official Codex CLI separately. Agent Grid uses
+Install and sign in to OpenDIY Codex or a compatible official Codex CLI separately. OpenDIY Desktop uses
 your existing login and honors `CODEX_HOME`. It never installs or updates the
 CLI and never changes its global permission settings. Model selection stays
 in Codex's own `/model` interface.
@@ -128,8 +161,8 @@ build is not evidence of long-duration stability or complete CLI compatibility.
 The packaged executable provides separate diagnostic modes:
 
 ```powershell
-agent-grid.exe --self-test --duration-seconds 60 --report D:/codex/build/pty-result.json
-agent-grid.exe --codex-smoke --sessions 2 --cwd D:/projects/already-trusted --report D:/codex/build/codex-result.json
+opendiy-desktop.exe --self-test --duration-seconds 60 --report D:/codex/build/pty-result.json
+opendiy-desktop.exe --codex-smoke --sessions 2 --cwd D:/projects/already-trusted --report D:/codex/build/codex-result.json
 ```
 
 The first exercises real native PTYs with local shell fixtures, including

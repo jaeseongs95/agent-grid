@@ -426,6 +426,14 @@ impl Engine {
         codex::catalog_preview_with_executable(&self.codex_executable()?, thread_id, cursor)
     }
 
+    pub fn extensions_list(&self, cwd: Option<String>) -> Result<codex::ExtensionsSnapshot, String> {
+        codex::extensions_list_with_executable(&self.codex_executable()?, cwd)
+    }
+
+    pub fn extensions_mutate(&self, cwd: Option<String>, request: codex::ExtensionMutation) -> Result<codex::ExtensionsSnapshot, String> {
+        codex::extensions_mutate_with_executable(&self.codex_executable()?, cwd, request)
+    }
+
     pub fn list_external(&self) -> Result<Vec<codex::ExternalSession>, String> {
         codex::list_external_with_executable(&self.codex_executable()?)
     }

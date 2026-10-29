@@ -34,7 +34,7 @@ async fn set_ui_language(settings: State<'_, UiSettings>, engine: State<'_, Engi
     let engine = engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move || engine.set_ui_language(language)).await.map_err(|e| format!("Save app language worker: {e}"))??;
     // The store lock has been released before dispatching native menu updates.
-    settings.show.set_text(language.text("Agent Grid 열기", "Open Agent Grid")).map_err(|e| format!("Update tray open label: {e}"))?;
+    settings.show.set_text(language.text("OpenDIY Desktop 열기", "Open OpenDIY Desktop")).map_err(|e| format!("Update tray open label: {e}"))?;
     settings.exit.set_text(language.text("종료…", "Exit…")).map_err(|e| format!("Update tray exit label: {e}"))?;
     settings.english.store(language == ui_language::UiLanguage::En, Ordering::Release);
     Ok(serde_json::json!({
@@ -144,6 +144,26 @@ async fn catalog_preview(engine: State<'_, Engine>, thread_id: String, cursor: O
     tauri::async_runtime::spawn_blocking(move || engine.catalog_preview(&thread_id, cursor)).await.map_err(|e| format!("Session preview worker: {e}"))?
 }
 #[tauri::command]
+async fn extensions_list(engine: State<'_, Engine>, cwd: Option<String>) -> Result<codex::ExtensionsSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.extensions_list(cwd)).await.map_err(|e| format!("Extension list worker: {e}"))?
+}
+#[tauri::command]
+async fn extensions_mutate(engine: State<'_, Engine>, cwd: Option<String>, request: codex::ExtensionMutation) -> Result<codex::ExtensionsSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.extensions_mutate(cwd, request)).await.map_err(|e| format!("Extension mutation worker: {e}"))?
+}
+#[tauri::command]
+async fn choose_skill_folder(app: tauri::AppHandle, picker: State<'_, project::FolderPicker>, ui: State<'_, UiSettings>) -> Result<Option<String>, String> {
+    let picker = picker.inner().clone();
+    let language = if ui.english.load(Ordering::Acquire) { ui_language::UiLanguage::En } else { ui_language::UiLanguage::Ko };
+    #[cfg(windows)]
+    let owner = app.get_webview_window("main").ok_or("Main window is unavailable")?.hwnd().map_err(|e| format!("Get skill chooser parent window: {e}"))?.0 as isize;
+    #[cfg(not(windows))]
+    let owner = { let _ = app; 0 };
+    tauri::async_runtime::spawn_blocking(move || picker.choose_skill(owner, language)).await.map_err(|e| format!("Skill folder chooser worker: {e}"))?
+}
+#[tauri::command]
 async fn complete_exit(app: tauri::AppHandle, engine: State<'_, Engine>, confirmed: bool) -> Result<(), String> {
     if !confirmed { return Err("explicit exit confirmation is required".into()); }
     let engine = engine.inner().clone();
@@ -164,7 +184,7 @@ fn show_main(app: &tauri::AppHandle) {
 pub fn run() {
     if let Err(error) = process_job::install_app_job() {
         // Fail closed: starting unowned background processes is never a fallback.
-        eprintln!("Agent Grid startup failed: {error}");
+        eprintln!("OpenDIY Desktop startup failed: {error}");
         std::process::exit(1);
     }
     let result = tauri::Builder::default()
@@ -183,11 +203,11 @@ pub fn run() {
                 BackendEvent::Changed(info) => handle.emit("session-changed", info),
             }.map_err(|e| format!("deliver renderer event: {e}")));
             app.manage(Engine::new(&directory.join("workspace.sqlite3"), sink).map_err(std::io::Error::other)?);
-            let show = MenuItem::with_id(app, "show", "Agent Grid 열기", true, None::<&str>)?;
+            let show = MenuItem::with_id(app, "show", "OpenDIY Desktop 열기", true, None::<&str>)?;
             let exit = MenuItem::with_id(app, "exit", "종료…", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &exit])?;
             app.manage(UiSettings { english: AtomicBool::new(false), show, exit });
-            let mut tray = TrayIconBuilder::new().tooltip("Agent Grid").menu(&menu).show_menu_on_left_click(false)
+            let mut tray = TrayIconBuilder::new().tooltip("OpenDIY Desktop").menu(&menu).show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main(app),
                     "exit" => { show_main(app); let _ = app.emit("exit-requested", ()); }
@@ -200,7 +220,7 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, complete_exit])
+        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, extensions_list, extensions_mutate, choose_skill_folder, complete_exit])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<ExitState>().0.load(Ordering::Acquire) {
@@ -220,7 +240,7 @@ pub fn run() {
                 }
             }
         }),
-        Err(error) => { eprintln!("Agent Grid initialization failed: {error}"); std::process::exit(1); }
+        Err(error) => { eprintln!("OpenDIY Desktop initialization failed: {error}"); std::process::exit(1); }
     }
 }
 

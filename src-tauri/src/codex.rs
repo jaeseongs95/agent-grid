@@ -28,6 +28,10 @@ static CATALOG_REQUEST: Mutex<()> = Mutex::new(());
 mod catalog;
 pub use catalog::{catalog_list, catalog_list_with_executable, catalog_preview, catalog_preview_with_executable, CatalogPage, CatalogPreview, CatalogQuery};
 
+#[path = "codex_extensions.rs"]
+mod extensions;
+pub use extensions::{extensions_list_with_executable, extensions_mutate_with_executable, ExtensionMutation, ExtensionsSnapshot};
+
 #[derive(Debug)]
 pub enum CodexEvent { ThreadId(String), Status(String) }
 
@@ -100,7 +104,7 @@ fn tui_command(exe: &OsString, cwd: &Path, endpoint: &str, token: &str, id: Opti
 }
 
 fn initialize() -> Value {
-    json!({"clientInfo":{"name":"agent_grid","title":"Agent Grid","version":env!("CARGO_PKG_VERSION")}})
+    json!({"clientInfo":{"name":"agent_grid","title":"OpenDIY Desktop","version":env!("CARGO_PKG_VERSION")}})
 }
 
 fn response(message: &Value, id: u64) -> Option<Result<Value, String>> {

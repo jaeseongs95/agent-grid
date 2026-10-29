@@ -1,14 +1,15 @@
-# Agent Grid
+# OpenDIY Desktop
 
 [English](README.md) | **한국어**
 
 여러 코딩 에이전트 CLI 세션을 한 화면에 배치하는 Windows 데스크톱 앱입니다.
-현재 공식 Codex CLI를 지원합니다. 터미널 격자의 크기와 순서를 바꾸고,
+Codex 실행 기반은 [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex)이며,
+호환되는 공식 Codex CLI도 지원합니다. 터미널 격자의 크기와 순서를 바꾸고,
 프로젝트별로 세션을 보거나 터미널 출력을 검색할 수 있습니다.
 선택한 세션에 입력을 함께 보낼 수 있으며, 대기 중이거나 상태가 불명확한
 세션은 전송 대상에서 제외합니다. 전송 결과는 세션마다 표시합니다.
 
-![Agent Grid 디자인 미리보기](docs/design-demo.png)
+![이전 Agent Grid 이름의 디자인 미리보기](docs/design-demo.png)
 
 *정적인 터미널 예시를 사용한 디자인 데모이며, 실제 실행 검증 자료가 아닙니다.*
 
@@ -29,14 +30,14 @@ CLI와 운영체제의 언어 설정은 바꾸지 않습니다.
 
 ## 실행
 
-[Releases](https://github.com/jaeseongs95/agent-grid/releases)에서 포터블 ZIP이나
+[Releases](https://github.com/jaeseongs95/opendiy-desktop/releases)에서 포터블 ZIP이나
 사용자 단위 설치 파일을 내려받으세요. Windows x64와 WebView2가 필요하며,
 실행 파일은 서명되지 않았습니다.
-포터블 ZIP 전체를 압축 해제한 뒤 `agent-grid.exe`를 실행하세요.
-`agent-grid-helper.exe`는 같은 폴더에 두어야 합니다. Windows 터미널 처리는
+포터블 ZIP 전체를 압축 해제한 뒤 `opendiy-desktop.exe`를 실행하세요.
+`opendiy-desktop-helper.exe`는 같은 폴더에 두어야 합니다. Windows 터미널 처리는
 콘솔용 보조 프로세스가 담당하고, 메인 앱은 일반 데스크톱 창으로 실행됩니다.
 
-먼저 공식 Codex CLI를 별도로 설치하고 로그인하세요. **실행 파일 설정**에서
+먼저 OpenDIY Codex 또는 호환되는 공식 Codex CLI를 별도로 설치하고 로그인하세요. **실행 파일 설정**에서
 네이티브 `codex.exe`를 선택하면 새 세션과 세션 조회에 사용할 경로가 저장됩니다.
 저장한 경로·실제 적용 경로·찾은 위치를 확인할 수 있습니다.
 파일 선택을 취소하면 기존 설정을 유지하고, 경로를 바꿔도 열린 터미널은 유지합니다.
@@ -67,6 +68,34 @@ CLI는 인증된 app-server WebSocket과 `--remote`를 지원해야 합니다.
 전송 완료는 해당 터미널에 입력 바이트가 전달됐다는 뜻이며,
 모델이 요청을 수락하거나 작업을 완료했다는 뜻은 아닙니다.
 
+## 플러그인과 스킬
+
+사이드바의 **플러그인·스킬**을 열면 실행파일 설정에서 선택한 CLI와 현재 프로젝트를
+기준으로 관리합니다. 설치됨·설치 가능 플러그인과 스킬을 검색하고, 플러그인 설치·제거·
+활성화, 마켓플레이스 소스 관리, 스킬 활성화를 수행할 수 있습니다. `SKILL.md`가 들어 있는
+로컬 스킬 폴더를 현재 프로젝트나 사용자 스킬 폴더로 가져올 수 있습니다.
+적용 전 검토 화면에서 실제 대상과 범위를 확인합니다. 기존 폴더를 덮어쓰지 않으며,
+링크나 크기 제한을 넘는 폴더는 거부합니다. CLI가 지원하지 않는 기능과 오류도 표시합니다.
+
+플러그인·마켓플레이스는 CLI 명령으로, 스킬·설정은 app-server API로 실제 반영하고
+결과를 다시 조회합니다. CLI 인증과 설정은 해당 CLI가 관리합니다. 변경된 확장 기능은
+새 세션에서 사용하며, 실행 중인 터미널을 강제로 재시작하지 않습니다.
+모바일·공유 daemon과 같은 백엔드를 사용하는 기능은 이번 버전의 완료 범위가 아닙니다.
+
+## 메모리와 대화 조회
+
+필요할 때만 세션·대화를 한 페이지에 최대 50개씩 조회합니다. 화면에는 세션 목록 250개,
+미리보기 메시지 100개·텍스트 128 KiB까지 유지하며, 더 불러오면 오래된 표시 페이지부터
+비웁니다. 같은 세션을 다시 선택하면 최근 대화로 돌아갑니다. 팝업을 닫을 때 행·미리보기·
+선택 정보를 해제하며, 대화 본문을 앱 데이터베이스에 복사하지 않습니다.
+확장 관리 팝업도 처음에 50개 행을 표시하고, 닫을 때 조회한 데이터를 해제합니다.
+상한과 객체 해제 시험을 장시간 메모리 누수 시험 완료로 표현하지 않습니다.
+
+이전 Agent Grid의 설정과 등록 프로젝트는 유지합니다. Codex 실행 기반은
+[OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex)이며, 호환되는 공식 CLI도
+선택할 수 있습니다. 장기적으로 ChatGPT·Claude 데스크톱 앱의 기능과 사용성을 참고하되,
+전체 벤치마킹과 더 넓은 기능 이전은 이후 작업입니다.
+
 ## 개발
 
 Windows에서 Node.js 24, Rust stable, MSVC 빌드 도구와 WebView2가 필요합니다.
@@ -83,11 +112,11 @@ npm run tauri -- dev
 콘솔 보조 실행 파일을 먼저 빌드한 뒤 데스크톱 앱을 패키징합니다.
 
 ```powershell
-cargo build --locked --manifest-path src-tauri/Cargo.toml --release --bin agent-grid-helper
+cargo build --locked --manifest-path src-tauri/Cargo.toml --release --bin opendiy-desktop-helper
 npm run tauri -- build --config src-tauri/tauri.bundle.conf.json --bundles nsis
 ```
 
-한글 경로로 네이티브 도구에 문제가 생기면 `D:/codex/build/agent-grid` 아래의
+한글 경로로 네이티브 도구에 문제가 생기면 `D:/codex/build/opendiy-desktop` 아래의
 별도 체크아웃에서 빌드하세요. 네이티브 빌드 전에 생성한 외부 라이선스 고지는
 설치 파일과 포터블 실행 파일에 함께 배포합니다.
 
@@ -116,8 +145,8 @@ Windows CI에서 프런트엔드 검사·Rust 시험·패키징을 실행합니�
 패키지 실행 파일의 진단 모드는 다음과 같습니다.
 
 ```powershell
-agent-grid.exe --self-test --duration-seconds 60 --report D:/codex/build/pty-result.json
-agent-grid.exe --codex-smoke --sessions 2 --cwd D:/projects/already-trusted --report D:/codex/build/codex-result.json
+opendiy-desktop.exe --self-test --duration-seconds 60 --report D:/codex/build/pty-result.json
+opendiy-desktop.exe --codex-smoke --sessions 2 --cwd D:/projects/already-trusted --report D:/codex/build/codex-result.json
 ```
 
 첫 모드는 로컬 셸로 실제 PTY를 사용해 2/8/16개 격리·오래된 세대 거부·출력 제한·취소·

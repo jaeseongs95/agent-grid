@@ -5,6 +5,10 @@ export interface CatalogSession { id: string; title: string; cwd: string; create
 interface CatalogPage { sessions: CatalogSession[]; nextCursor?: string | null }
 interface PreviewMessage { id: string; role: 'user' | 'assistant'; text: string }
 interface CatalogPreview { messages: PreviewMessage[]; nextCursor?: string | null; unavailableReason?: string | null }
+// Retain only a small window while explicit paging can still reach older records.
+const MAX_SESSION_ROWS = 250;
+const MAX_PREVIEW_MESSAGES = 100;
+
 interface BrowserHost {
   call<T>(command: string, args?: Record<string, unknown>): Promise<T>;
   projectsChanged(projects: ProjectInfo[]): void;
@@ -86,6 +90,7 @@ export function createSessionBrowser(host: BrowserHost) {
   const search = $<HTMLInputElement>('#catalog-search'); const queue = new CatalogQueue();
   let projects: ProjectInfo[] = []; let rows: CatalogSession[] = []; let selected: CatalogSession | undefined;
   let listVersion = 0; let previewVersion = 0; let listCursor: string | null = null; let previewCursor: string | null = null;
+  let listTrimmed = false; let previewTrimmed = false;
   let listLoading = false; let previewLoading = false; let opening = false; let openAttempt = 0; let timer: ReturnType<typeof setTimeout> | undefined;
   const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
   const date = (seconds: number) => Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000).toLocaleString(locale()) : t('기록 없음', 'No record');
@@ -117,12 +122,14 @@ export function createSessionBrowser(host: BrowserHost) {
     selected = undefined; previewVersion++; previewCursor = null; previewLoading = false;
     $('#catalog-selected').hidden = true; $('#catalog-placeholder').hidden = false;
     text($('#catalog-placeholder'), '왼쪽에서 이어갈 세션을 선택하세요.', 'Select a session on the left to continue.');
-    $('#catalog-messages').replaceChildren(); $('#catalog-resume-error').hidden = true;
+    $('#catalog-messages').replaceChildren(); $('#catalog-metadata').replaceChildren();
+    text($('#catalog-session-title'), ''); text($('#catalog-preview-status'), ''); text($('#catalog-resume-error'), '');
+    $('#catalog-resume-error').hidden = true; previewTrimmed = false;
     $<HTMLButtonElement>('#catalog-resume').disabled = true;
     $('#catalog-preview-more').hidden = true;
   }
   function querySoon(delay = 0) {
-    clearTimeout(timer); const version = ++listVersion; clearSelection(); rows = []; listCursor = null;
+    clearTimeout(timer); const version = ++listVersion; clearSelection(); rows = []; listCursor = null; listTrimmed = false;
     listLoading = true; text($('#catalog-list-status'), '세션을 찾는 중…', 'Finding sessions…'); renderRows();
     timer = setTimeout(() => loadList(version), delay);
   }
@@ -137,8 +144,10 @@ export function createSessionBrowser(host: BrowserHost) {
         if (!current()) return;
         const known = new Set(rows.map(row => row.id));
         rows.push(...page.sessions.filter(row => !known.has(row.id)));
+        if (rows.length > MAX_SESSION_ROWS) { rows = rows.slice(-MAX_SESSION_ROWS); listTrimmed = true; }
+        if (selected && !rows.some(row => row.id === selected?.id)) clearSelection();
         listCursor = page.nextCursor ?? null;
-        text($('#catalog-list-status'), rows.length ? `${rows.length}개 세션${listCursor ? ' · 더 불러올 수 있습니다' : ''}` : '검색 결과가 없습니다. 이 프로젝트에서 새 세션을 시작할 수 있습니다.', rows.length ? `${rows.length} session${rows.length === 1 ? '' : 's'}${listCursor ? ' · More available' : ''}` : 'No results. You can start a new session in this project.');
+        text($('#catalog-list-status'), rows.length ? `${rows.length}개 세션${listCursor ? ' · 더 불러올 수 있습니다' : ''}${listTrimmed ? ' · 화면에는 최대 250개 유지, 새로 고침하면 처음으로 돌아갑니다' : ''}` : '검색 결과가 없습니다. 이 프로젝트에서 새 세션을 시작할 수 있습니다.', rows.length ? `${rows.length} session${rows.length === 1 ? '' : 's'}${listCursor ? ' · More available' : ''}${listTrimmed ? ' · Up to 250 kept on screen; refresh to return to the start' : ''}` : 'No results. You can start a new session in this project.');
         if (!selected && rows.length) select(rows[0]);
         else if (!rows.length) text($('#catalog-placeholder'), '조건에 맞는 세션이 없습니다. 다른 제목으로 찾거나 새 세션을 시작하세요.', 'No matching sessions. Try another title or start a new session.');
       } catch (error) { if (current()) text($('#catalog-list-status'), `세션 조회 실패: ${errorMessage(error)}`, `Failed to find sessions: ${errorMessage(error)}`); }
@@ -147,7 +156,7 @@ export function createSessionBrowser(host: BrowserHost) {
   }
   function select(row: CatalogSession) {
     if (opening) return;
-    selected = row; const version = ++previewVersion; previewCursor = null; previewLoading = false;
+    selected = row; const version = ++previewVersion; previewCursor = null; previewLoading = false; previewTrimmed = false;
     $('#catalog-placeholder').hidden = true; $('#catalog-selected').hidden = false;
     text($('#catalog-session-title'), row.title || '이름 없는 세션', row.title || 'Untitled session');
     const metadata = $('#catalog-metadata'); metadata.replaceChildren();
@@ -178,10 +187,12 @@ export function createSessionBrowser(host: BrowserHost) {
           const body = document.createElement('p'); body.textContent = item.text; message.append(role, body); fragment.append(message);
         }
         if (cursor) $('#catalog-messages').prepend(fragment); else $('#catalog-messages').replaceChildren(fragment);
+        const messages = $('#catalog-messages');
+        while (messages.childElementCount > MAX_PREVIEW_MESSAGES) { messages.lastElementChild!.remove(); previewTrimmed = true; }
         previewCursor = page.nextCursor ?? null;
         const emptyPage = '이 페이지에는 사용자 메시지나 답변이 없습니다. 이전 대화를 더 불러올 수 있습니다.';
         if (page.unavailableReason) text($('#catalog-preview-status'), page.unavailableReason, page.unavailableReason === emptyPage ? 'This page has no user messages or replies. You can load earlier messages.' : page.unavailableReason);
-        else text($('#catalog-preview-status'), $('#catalog-messages').children.length ? '대화 미리보기 · 읽기 전용' : '아직 표시할 대화가 없습니다.', $('#catalog-messages').children.length ? 'Conversation preview · Read only' : 'No messages to display yet.');
+        else text($('#catalog-preview-status'), $('#catalog-messages').children.length ? `대화 미리보기 · 읽기 전용${previewTrimmed ? ' · 화면에는 최대 100개 유지, 세션을 다시 선택하면 최근 대화로 돌아갑니다' : ''}` : '아직 표시할 대화가 없습니다.', $('#catalog-messages').children.length ? `Conversation preview · Read only${previewTrimmed ? ' · Up to 100 kept on screen; select the session again for recent messages' : ''}` : 'No messages to display yet.');
       } catch (error) { if (current()) text($('#catalog-preview-status'), `미리보기 조회 실패: ${errorMessage(error)}`, `Failed to load preview: ${errorMessage(error)}`); }
       finally { done(); }
     }, done);
@@ -209,7 +220,7 @@ export function createSessionBrowser(host: BrowserHost) {
     finally { button.disabled = false; }
   }
   $('#catalog-close').onclick = () => dialog.close();
-  dialog.addEventListener('close', () => { clearTimeout(timer); listVersion++; previewVersion++; openAttempt++; opening = false; queue.cancel(); clearSelection(); });
+  dialog.addEventListener('close', () => { clearTimeout(timer); listVersion++; previewVersion++; openAttempt++; opening = false; queue.cancel(); clearSelection(); rows = []; listCursor = null; listLoading = false; listTrimmed = false; renderRows(); text($('#catalog-list-status'), ''); });
   search.addEventListener('compositionstart', () => clearTimeout(timer));
   search.oninput = event => { if (!(event as InputEvent).isComposing) querySoon(250); };
   search.addEventListener('compositionend', () => querySoon(250));

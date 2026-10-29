@@ -1,4 +1,4 @@
-// Opt-in test of a root-launched packaged Agent Grid WebView2. Never starts a browser,
+// Opt-in test of a root-launched packaged OpenDIY Desktop WebView2. Never starts a browser,
 // changes global config, approves a terminal prompt, or sends Enter to a terminal.
 // Opt-in executable settings tests change only the fresh isolated fixture database.
 import assert from 'node:assert/strict';
@@ -186,11 +186,11 @@ try {
       const matches = [];
       for (const context of browser.contexts()) for (const candidate of context.pages()) {
         let url; try { url = new URL(candidate.url()); } catch { continue; }
-        if (url.hostname === 'tauri.localhost' && ['http:', 'https:'].includes(url.protocol) && !url.searchParams.has('demo') && await candidate.title() === 'Agent Grid') matches.push(candidate);
+        if (url.hostname === 'tauri.localhost' && ['http:', 'https:'].includes(url.protocol) && !url.searchParams.has('demo') && await candidate.title() === 'OpenDIY Desktop') matches.push(candidate);
       }
-      assert(matches.length <= 1, 'Multiple Agent Grid targets found; refusing ambiguous ownership');
+      assert(matches.length <= 1, 'Multiple OpenDIY Desktop targets found; refusing ambiguous ownership');
       return matches;
-    }, matches => matches.length === 1, 'exactly one Agent Grid tauri.localhost target');
+    }, matches => matches.length === 1, 'exactly one OpenDIY Desktop tauri.localhost target');
     page = candidates[0]; page.setDefaultTimeout(10_000);
     page.on('pageerror', error => report.errors.push(shortError(error)));
     page.on('dialog', async dialog => {
@@ -204,7 +204,7 @@ try {
     return { title: await page.title(), origin: new URL(page.url()).origin, initialTiles: 0 };
   });
   if (process.env.AGENT_GRID_NATIVE_PROJECT_PICKER === '1') {
-    assert(process.env.AGENT_GRID_WORKSPACE_DIR && path.isAbsolute(process.env.AGENT_GRID_WORKSPACE_DIR), 'Picker validation requires an explicitly isolated Agent Grid workspace');
+    assert(process.env.AGENT_GRID_WORKSPACE_DIR && path.isAbsolute(process.env.AGENT_GRID_WORKSPACE_DIR), 'Picker validation requires an explicitly isolated OpenDIY Desktop workspace');
     await check('native project picker cancel preserves empty isolated registry', async () => {
       assert.equal((await nativeCall('list_projects')).length, 0, 'Fixture workspace must start with no imported projects');
       const picker = await projectPicker('Cancel');
@@ -254,7 +254,7 @@ try {
       const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
       // Fixed code reads the explicitly supplied fixture identity from its own
       // environment. No path or command text is interpolated into this script.
-      const command = `$ErrorActionPreference='Stop'; $targetProcessId=[int]$env:AGENT_GRID_NATIVE_PID; $target=Get-Process -Id $targetProcessId; if(-not [string]::Equals([IO.Path]::GetFullPath($target.Path),[IO.Path]::GetFullPath($env:AGENT_GRID_NATIVE_EXE),[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected fixture process'}; $children=@(Get-CimInstance Win32_Process -Filter ('ParentProcessId='+$targetProcessId)); $connections=@(Get-NetTCPConnection -ErrorAction Stop); @{ownedHelperChildren=@($children|Where-Object Name -eq 'agent-grid-helper.exe').Count; closeWaitSockets=@($connections|Where-Object {$_.OwningProcess -eq $targetProcessId -and $_.State -eq 'CloseWait'}).Count}|ConvertTo-Json -Compress`;
+      const command = `$ErrorActionPreference='Stop'; $targetProcessId=[int]$env:AGENT_GRID_NATIVE_PID; $target=Get-Process -Id $targetProcessId; if(-not [string]::Equals([IO.Path]::GetFullPath($target.Path),[IO.Path]::GetFullPath($env:AGENT_GRID_NATIVE_EXE),[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected fixture process'}; $children=@(Get-CimInstance Win32_Process -Filter ('ParentProcessId='+$targetProcessId)); $connections=@(Get-NetTCPConnection -ErrorAction Stop); @{ownedHelperChildren=@($children|Where-Object Name -eq 'opendiy-desktop-helper.exe').Count; closeWaitSockets=@($connections|Where-Object {$_.OwningProcess -eq $targetProcessId -and $_.State -eq 'CloseWait'}).Count}|ConvertTo-Json -Compress`;
       const deadline = Date.now() + 15_000; let sample;
       do {
         const { stdout } = await execFileAsync(powershell, ['-NoProfile', '-NonInteractive', '-Command', command], { windowsHide: true, timeout: 10_000, maxBuffer: 64 * 1024 });
@@ -283,7 +283,7 @@ try {
       assert.match((await page.locator('#connection').textContent()) ?? '', /connected/i);
       assert.equal(await page.evaluate(() => localStorage.getItem('agent-grid-language')), 'en');
       const menu = await nativeCall('set_ui_language', { language: 'en' });
-      assert.deepEqual(menu, { show: 'Open Agent Grid', exit: 'Exit…' }, 'Native menu readback did not match English');
+      assert.deepEqual(menu, { show: 'Open OpenDIY Desktop', exit: 'Exit…' }, 'Native menu readback did not match English');
       let invalidRejected = false;
       try { await nativeCall('set_ui_language', { language: 'unsupported-language' }); } catch { invalidRejected = true; }
       assert(invalidRejected, 'Native language command silently accepted an unsupported value');
@@ -324,7 +324,7 @@ try {
       if (await page.locator('dialog[open]').count()) await page.keyboard.press('Escape');
       await page.locator('#language-select').selectOption('ko');
       await until(() => page.locator('#connection').textContent(), value => value === '로컬 연결됨', 'Korean restored for existing smoke checks');
-      assert.deepEqual(await nativeCall('set_ui_language', { language: 'ko' }), { show: 'Agent Grid 열기', exit: '종료…' });
+      assert.deepEqual(await nativeCall('set_ui_language', { language: 'ko' }), { show: 'OpenDIY Desktop 열기', exit: '종료…' });
       for (const previous of retained) await previous.screen?.dispose();
     }
   });
@@ -474,7 +474,7 @@ try {
       await check('native invalid executable choice exposes error and preserves saved setting and live PTYs', async () => {
         const before = await nativeCall('get_codex_settings');
         const invalidExecutable = path.join(outDir, 'invalid-native-cli.exe');
-        await writeFile(invalidExecutable, 'Agent Grid fixture: this is not a Windows PE executable.\n', { encoding: 'utf8', flag: 'wx' });
+        await writeFile(invalidExecutable, 'OpenDIY Desktop fixture: this is not a Windows PE executable.\n', { encoding: 'utf8', flag: 'wx' });
         const picker = await executablePicker('Select', invalidExecutable);
         await page.locator('#codex-settings-error').waitFor({ state: 'visible' });
         const visibleError = (await page.locator('#codex-settings-error').textContent()) ?? '';
