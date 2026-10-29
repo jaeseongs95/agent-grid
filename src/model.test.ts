@@ -1,8 +1,38 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, updateSession, type SessionInfo } from './model.ts';
+import { acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, projectGroups, sessionProjectKey, updateSession, type SessionInfo, type ProjectInfo } from './model.ts';
 
 const base: SessionInfo = { id: 'owned', generation: 2, title: 'test', cwd: 'C:\\work', state: 'running', active: true };
+
+test('logical project ownership overrides cwd while legacy sessions match only the exact Windows folder', () => {
+  const projects: ProjectInfo[] = [{ id: 'folder', name: '폴더', cwd: 'D:\\Work\\Alpha', createdAt: 1, favorite: false }, { id: 'logical', name: '논리 묶음', cwd: null, createdAt: 2, favorite: true }, { id: 'empty', name: '빈 프로젝트', cwd: null, createdAt: 3, favorite: false }];
+  const legacy = { ...base, cwd: '\\\\?\\D:\\work\\ALPHA\\' };
+  assert.equal(sessionProjectKey(legacy, projects), 'id:folder');
+  assert.equal(sessionProjectKey({ ...legacy, projectId: null, projectAssigned: true }, projects), 'unassigned');
+  assert.equal(sessionProjectKey({ ...legacy, projectId: 'logical', projectAssigned: true }, projects), 'id:logical');
+  assert.equal(sessionProjectKey({ ...legacy, projectId: 'deleted', projectAssigned: true }, projects), 'unassigned');
+  assert.equal(sessionProjectKey({ ...legacy, cwd: 'D:\\Work\\Alphabet' }, projects), 'cwd:d:\\work\\alphabet');
+  const groups = projectGroups(projects, [legacy, { ...legacy, id: 'moved', projectId: 'logical', projectAssigned: true }, { ...legacy, id: 'unassigned', projectId: null, projectAssigned: true }]);
+  assert.deepEqual(groups.map(({ key, count }) => ({ key, count })), [{ key: 'id:logical', count: 1 }, { key: 'id:folder', count: 1 }, { key: 'id:empty', count: 0 }, { key: 'unassigned', count: 1 }]);
+});
+
+test('saved layout and restored metadata preserve authoritative project membership including explicit unassigned', () => {
+  const sessions = [{ title: '미분류', cwd: 'D:\\work', projectId: null, projectAssigned: true, projectRevision: 4 }, { title: '논리 묶음', cwd: 'D:\\other', threadId: 'thread-1', projectId: 'logical', projectAssigned: true }, { title: '이전 기록', cwd: 'D:\\legacy' }];
+  assert.deepEqual(parseLayout({ version: 1, sessions })?.sessions, sessions);
+  assert.deepEqual(chooseSavedSessions(undefined, [{ ...base, state: 'restored', projectId: null, projectAssigned: true }]), [{ title: base.title, cwd: base.cwd, projectId: null, projectAssigned: true }]);
+});
+
+test('delayed membership metadata cannot undo a move while newer session status and generation still update', () => {
+  const moved = { ...base, projectId: null, projectAssigned: true, projectRevision: 4, seq: 9 };
+  const updated = updateSession(moved, { ...base, state: 'waiting', projectId: 'previous', projectAssigned: true, projectRevision: 3 });
+  assert.equal(updated.state, 'waiting');
+  assert.equal(updated.projectId, null);
+  assert.equal(updated.projectAssigned, true);
+  assert.equal(updated.projectRevision, 4);
+  assert.equal(updated.seq, 9);
+  assert.equal(updateSession(moved, { ...base, projectId: 'latest', projectAssigned: true, projectRevision: 5 }).projectId, 'latest');
+  assert.equal(updateSession(moved, { ...base, generation: 3, projectId: 'new-process', projectRevision: 0 }).projectId, 'new-process');
+});
 
 test('late process generations and duplicate output cannot replace or write to the current terminal', () => {
   const current = { ...base, seq: 10 };

@@ -34,6 +34,14 @@ mod extensions;
 pub use extensions::{ExtensionMutation, ExtensionsSnapshot};
 pub(crate) use extensions::{extension_admission, extensions_list_with_executable, extensions_mutate_with_executable, ExtensionPermit};
 
+#[path = "codex_mobile.rs"]
+mod mobile;
+pub use mobile::{MobileAction, MobileConnection, MobileReply, MobileStatus, MobilePairing};
+
+#[path = "codex_usage.rs"]
+mod usage;
+pub use usage::{weekly_usage_with_executable, WeeklyUsageSnapshot};
+
 #[derive(Debug)]
 pub enum CodexEvent { ThreadId(String), Status(String) }
 
@@ -51,16 +59,24 @@ pub struct ExternalSession {
 pub struct CodexSession {
     pub command: CommandBuilder,
     server: Child,
-    job: Option<ProcessJob>,
+    job: Option<Arc<ProcessJob>>,
     _launch_gate: LaunchGate,
     stopped: Arc<AtomicBool>,
     socket: Option<TcpStream>,
     observer: Option<JoinHandle<()>>,
+    mobile: Option<MobileConnection>,
+}
+
+impl CodexSession {
+    pub fn mobile_connection(&self) -> MobileConnection {
+        self.mobile.as_ref().expect("connected sessions have a mobile management handle").clone()
+    }
 }
 
 impl Drop for CodexSession {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        if let Some(mobile) = &self.mobile { mobile.cancel(); }
         if let Some(socket) = self.socket.take() { let _ = socket.shutdown(Shutdown::Both); }
         if let Some(job) = self.job.take() { let _ = job.terminate(); }
         // kill may report that the owned process already exited; wait still reaps it.
@@ -82,14 +98,15 @@ fn hidden(command: &mut Command) {
     #[cfg(not(windows))] let _ = command;
 }
 
-fn server_args(endpoint: &str, verifier: &str, no_remote_control: bool) -> Vec<String> {
+fn server_args(endpoint: &str, verifier: &str, no_remote_control: bool, remote_client_name: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = ["app-server", "--listen", endpoint, "--ws-auth", "capability-token", "--ws-token-sha256", verifier]
         .into_iter().map(str::to_owned).collect();
     if no_remote_control { args.push("--no-remote-control".into()); }
+    if let Some(name) = remote_client_name { args.extend(["--remote-control-client-name".into(), name.into()]); }
     args
 }
 
-fn help_supports_no_remote_control(bytes: &[u8]) -> Result<bool, String> {
+fn help_supports_option(bytes: &[u8], option: &str) -> Result<bool, String> {
     let help = std::str::from_utf8(bytes).map_err(|e| format!("Codex app-server help is not valid UTF-8: {e}"))?;
     if !help.lines().any(|line| line.trim_start().strip_prefix("Usage:").or_else(|| line.trim_start().strip_prefix("사용법:")).is_some_and(|usage| usage.split_ascii_whitespace().any(|token| token == "app-server"))) {
         return Err("Codex returned unrecognized app-server help; startup capability is unknown".into());
@@ -105,16 +122,19 @@ fn help_supports_no_remote_control(bytes: &[u8]) -> Result<bool, String> {
     }).min().ok_or("Codex returned app-server help without a recognized options section; startup capability is unknown")?;
     Ok(options.into_iter().any(|line| line.trim_start().starts_with('-')
         && line.get(column..).is_some_and(|tail| tail.starts_with("--")
-            && tail.split_ascii_whitespace().next().is_some_and(|token| token.trim_end_matches(',') == "--no-remote-control"))))
+            && tail.split_ascii_whitespace().next().is_some_and(|token| token.trim_end_matches(',') == option))))
 }
 
-fn supports_no_remote_control(exe: &OsString, cwd: &Path) -> Result<bool, String> {
+#[cfg(test)]
+fn help_supports_no_remote_control(bytes: &[u8]) -> Result<bool, String> { help_supports_option(bytes, "--no-remote-control") }
+
+fn server_capabilities(exe: &OsString, cwd: &Path) -> Result<(bool, bool), String> {
     // 실행 파일별 캐시를 두지 않아 같은 경로의 교체나 설정 변경도 다음
     // launch에서 실제 도움말로 판별한다. 실패를 미지원으로 삼키지 않는다.
     let args = vec!["app-server".into(), "--help".into()];
     let output = extensions::command_stdout(exe, cwd, &args, HELP_TIMEOUT)
         .map_err(|error| format!("Cannot inspect app-server startup capabilities: {error}"))?;
-    help_supports_no_remote_control(&output)
+    Ok((help_supports_option(&output, "--no-remote-control")?, help_supports_option(&output, "--remote-control-client-name")?))
 }
 
 fn tui_command(exe: &OsString, cwd: &Path, endpoint: &str, token: &str, id: Option<&str>) -> CommandBuilder {
@@ -230,21 +250,26 @@ fn connect(endpoint: &str, token: &str, server: &mut Child, job: &ProcessJob) ->
             // A released ephemeral port may have been claimed by an unrelated listener.
             job.verify_tcp_peer(&stream)
                 .map_err(|error| format!("Codex app-server TCP peer ownership verification failed: {error}"))?;
-            stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|e| e.to_string())?;
-            stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e| e.to_string())?;
-            let mut request = endpoint.into_client_request().map_err(|e| e.to_string())?;
-            request.headers_mut().insert("Authorization", format!("Bearer {token}").parse().map_err(|_| "Invalid capability token")?);
-            // Do not include handshake errors: an error can contain the authorization header.
-            let mut config = tungstenite::protocol::WebSocketConfig::default();
-            config.max_message_size = Some(MAX_FRAME);
-            config.max_frame_size = Some(MAX_FRAME);
-            let (ws, _) = tungstenite::client::client_with_config(request, stream, Some(config))
-                .map_err(|_| "Codex authenticated WebSocket handshake failed".to_string())?;
-            return Ok(Rpc {ws, next_id:0});
+            return authenticated_socket(endpoint, token, stream);
         }
         if Instant::now() >= deadline { return Err("Codex app-server did not become ready within 12 seconds".into()); }
         thread::sleep(Duration::from_millis(80));
     }
+}
+
+// The caller must verify the connected peer before this sends a credential.
+fn authenticated_socket(endpoint: &str, token: &str, stream: TcpStream) -> Result<Rpc<TcpStream>, String> {
+    stream.set_read_timeout(Some(Duration::from_millis(500))).map_err(|_| "Cannot set Codex read timeout")?;
+    stream.set_write_timeout(Some(Duration::from_secs(5))).map_err(|_| "Cannot set Codex write timeout")?;
+    let mut request = endpoint.into_client_request().map_err(|_| "Invalid Codex endpoint")?;
+    request.headers_mut().insert("Authorization", format!("Bearer {token}").parse().map_err(|_| "Invalid capability token")?);
+    let mut config = tungstenite::protocol::WebSocketConfig::default();
+    config.max_message_size = Some(MAX_FRAME);
+    config.max_frame_size = Some(MAX_FRAME);
+    // Handshake errors can contain the authorization header; never return them.
+    let (ws, _) = tungstenite::client::client_with_config(request, stream, Some(config))
+        .map_err(|_| "Codex authenticated WebSocket handshake failed".to_string())?;
+    Ok(Rpc {ws, next_id:0})
 }
 
 #[cfg(windows)]
@@ -300,7 +325,10 @@ fn publish_status(previous: &mut Option<String>, state: String, on_event: &dyn F
 /// Both terminal sessions and short-lived catalog requests use the same owned,
 /// authenticated server. Browsing never creates/resumes a conversation.
 fn launch_server(exe: &OsString, cwd: &Path, thread_id: Option<&str>) -> Result<(CodexSession, Rpc<TcpStream>), String> {
-    let no_remote_control = supports_no_remote_control(exe, cwd)?;
+    let (no_remote_control, namespaced_remote) = server_capabilities(exe, cwd)?;
+    // Opt-in namespace isolates this owned process from all existing servers'
+    // enrollment records. Older CLIs remain usable with mobile mutations gated.
+    let remote_client_name = namespaced_remote.then(|| format!("opendiy-desktop-{}", Uuid::new_v4().simple()));
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     let endpoint = format!("ws://{}", listener.local_addr().map_err(|e| e.to_string())?);
     drop(listener);
@@ -308,15 +336,16 @@ fn launch_server(exe: &OsString, cwd: &Path, thread_id: Option<&str>) -> Result<
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let verifier = format!("{:x}", Sha256::digest(token.as_bytes()));
     let (mut process, launch_gate) = LaunchGate::wrap_std(exe.as_os_str())?;
-    process.args(server_args(&endpoint, &verifier, no_remote_control)).current_dir(&cwd)
+    process.args(server_args(&endpoint, &verifier, no_remote_control, remote_client_name.as_deref())).current_dir(&cwd)
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     hidden(&mut process);
     let server = process.spawn().map_err(|e| format!("Cannot start Codex app-server: {e}"))?;
     let mut session = CodexSession {
         command: tui_command(exe, cwd, &endpoint, &token, thread_id), server, job:None, _launch_gate:launch_gate,
-        stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None,
+        stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None, mobile:None,
     };
-    session.job = Some(ProcessJob::assign_std(&session.server)?);
+    session.job = Some(Arc::new(ProcessJob::assign_std(&session.server)?));
+    session.mobile = Some(MobileConnection::new(endpoint.clone(), token.clone(), session.job.as_ref().unwrap(), session.stopped.clone(), namespaced_remote));
     session._launch_gate.release()?;
     let job = session.job.as_ref().ok_or("Codex server has no owned process job")?;
     let mut rpc = connect(&endpoint, &token, &mut session.server, job)?;
@@ -559,14 +588,16 @@ mod tests {
     fn command_keeps_bearer_out_of_argv_and_preserves_exact_resume() {
         let token = "secret-capability";
         let digest = format!("{:x}", Sha256::digest(token.as_bytes()));
-        let args = server_args("ws://127.0.0.1:1234", &digest, false);
+        let args = server_args("ws://127.0.0.1:1234", &digest, false, None);
         assert!(!args.iter().any(|a| a.contains(token)));
         assert!(args.contains(&digest));
         assert!(!args.iter().any(|arg| arg == "--no-remote-control"));
-        let isolated = server_args("ws://127.0.0.1:1234", &digest, true);
+        let isolated = server_args("ws://127.0.0.1:1234", &digest, true, None);
         assert_eq!(&isolated[..args.len()], args.as_slice());
         assert_eq!(isolated.last().unwrap(), "--no-remote-control");
         assert!(!isolated.iter().any(|arg| arg.contains(token)));
+        let namespaced = server_args("ws://127.0.0.1:1234", &digest, true, Some("owned-process-uuid"));
+        assert_eq!(&namespaced[namespaced.len()-2..], ["--remote-control-client-name", "owned-process-uuid"]);
         let cmd = tui_command(&OsString::from("codex"), Path::new("."), "ws://127.0.0.1:1234", token, Some("exact-id"));
         let args: Vec<_> = cmd.get_argv().iter().map(|s| s.to_string_lossy().into_owned()).collect();
         assert_eq!(&args[1..3], ["resume", "exact-id"]);

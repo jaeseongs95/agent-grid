@@ -72,7 +72,10 @@ async function projectPicker(mode, cwd) {
   await page.locator('#project-import').click();
   try {
     const { stdout } = await execFileAsync(powershell, args, { windowsHide: true, timeout: 25_000, maxBuffer: 64 * 1024 });
-    return JSON.parse(stdout.trim());
+    const probe = JSON.parse(stdout.trim());
+    assert.equal(probe.schema, 'agent-grid-project-picker-probe-v2');
+    assert(probe.exactProcessAndDialogVerified && probe.modernFolderDialogVerified && probe.directUIHWNDVerified && probe.dialogClosed && !probe.externalProcessesTouched, 'Project picker must verify an owned modern folder dialog');
+    return probe;
   } catch (error) {
     error.windowProbe = { script: 'tests/project-picker-probe.ps1', code: error.code ?? null, stdout: probeDiagnostic(error.stdout), stderr: probeDiagnostic(error.stderr) };
     throw error;

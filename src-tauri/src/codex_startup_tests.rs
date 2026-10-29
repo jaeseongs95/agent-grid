@@ -25,6 +25,16 @@ fn startup_capability_requires_an_exact_declared_option_in_recognized_help() {
     }
     assert!(help_supports_no_remote_control(&[0xff]).is_err());
 }
+
+#[test]
+fn enrollment_namespace_requires_a_declared_option_and_never_a_description() {
+    let base = "Usage: codex app-server [OPTIONS]\n\nOptions:\n  -h, --help\n          Print help\n";
+    assert!(!help_supports_option(base.as_bytes(), "--remote-control-client-name").unwrap());
+    for suffix in ["          --remote-control-client-name in description\n", "      --remote-control-client-name-extra <NAME>\n", "\nExamples:\n      --remote-control-client-name <NAME>\n"] {
+        assert!(!help_supports_option(format!("{base}{suffix}").as_bytes(), "--remote-control-client-name").unwrap());
+    }
+    assert!(help_supports_option(format!("{base}      --remote-control-client-name <NAME>\n          Enrollment namespace\n").as_bytes(), "--remote-control-client-name").unwrap());
+}
 #[test]
 #[cfg(windows)]
 fn owned_server_startup_probes_help_and_propagates_probe_failures_before_launch() {

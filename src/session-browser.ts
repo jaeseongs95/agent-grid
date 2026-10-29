@@ -1,6 +1,7 @@
 import { locale, onLanguageChange, t } from './i18n';
 
-export interface ProjectInfo { id: string; name: string; cwd: string; createdAt: number }
+import type { ProjectInfo } from './model';
+export type { ProjectInfo } from './model';
 export interface CatalogSession { id: string; title: string; cwd: string; createdAt: number; updatedAt: number; status: string }
 interface CatalogPage { sessions: CatalogSession[]; nextCursor?: string | null }
 interface PreviewMessage { id: string; role: 'user' | 'assistant'; text: string }
@@ -88,6 +89,7 @@ export function createSessionBrowser(host: BrowserHost) {
   }
   const list = $('#catalog-list'); const projectSelect = $<HTMLSelectElement>('#catalog-project');
   const search = $<HTMLInputElement>('#catalog-search'); const queue = new CatalogQueue();
+  let projectsVersion = 0;
   let projects: ProjectInfo[] = []; let rows: CatalogSession[] = []; let selected: CatalogSession | undefined;
   let listVersion = 0; let previewVersion = 0; let listCursor: string | null = null; let previewCursor: string | null = null;
   let listTrimmed = false; let previewTrimmed = false;
@@ -97,13 +99,18 @@ export function createSessionBrowser(host: BrowserHost) {
   refreshLabels(); onLanguageChange(refreshLabels);
 
   function setProjects(value: ProjectInfo[]) {
-    projects = value; host.projectsChanged(projects);
+    projectsVersion++; projects = value; host.projectsChanged(projects);
     const current = projectSelect.value; const allProjects = new Option('', ''); text(allProjects, '모든 프로젝트', 'All projects'); projectSelect.replaceChildren(allProjects);
-    for (const project of projects) projectSelect.add(new Option(project.name, project.cwd));
+    for (const project of projects) if (project.cwd) projectSelect.add(new Option(project.name, project.cwd));
     if (current && !projects.some(project => project.cwd === current)) projectSelect.add(new Option(current, current));
     projectSelect.value = current;
   }
-  async function refreshProjects() { const value = await host.call<ProjectInfo[]>('list_projects'); setProjects(value); }
+  async function refreshProjects() {
+    const version = ++projectsVersion;
+    const value = await host.call<ProjectInfo[]>('list_projects');
+    // A registry read started before a later mutation must not restore old names or deleted groups.
+    if (version === projectsVersion) setProjects(value);
+  }
   function renderRows() {
     list.replaceChildren();
     for (const row of rows) {
@@ -215,7 +222,7 @@ export function createSessionBrowser(host: BrowserHost) {
   }
   async function importProject() {
     const button = document.querySelector<HTMLButtonElement>('#project-import')!; button.disabled = true;
-    try { const project = await host.call<ProjectInfo | null>('choose_project'); if (project) { setProjects([...projects.filter(item => item.id !== project.id && item.cwd !== project.cwd), project]); host.projectImported(project); await open(project.cwd); } }
+    try { const project = await host.call<ProjectInfo | null>('choose_project'); if (project) { setProjects([...projects.filter(item => item.id !== project.id && item.cwd !== project.cwd), project]); host.projectImported(project); await open(project.cwd ?? undefined); } }
     catch (error) { host.notify(`프로젝트 가져오기 실패: ${errorMessage(error)}`, true, `Failed to import project: ${errorMessage(error)}`); }
     finally { button.disabled = false; }
   }

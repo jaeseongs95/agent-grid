@@ -100,7 +100,7 @@ impl Harness {
         // Engine must declare the capabilities of its actual PTY renderer.
         command.env("TERM", "dumb");
         command.env("COLORTERM", "");
-        let info = self.engine.start_fixture(StartRequest { cwd: cwd.to_string_lossy().into_owned(), title: "Headless PTY fixture".into(), thread_id: None, cols: 100, rows: 30 }, command)?;
+        let info = self.engine.start_fixture(StartRequest { cwd: cwd.to_string_lossy().into_owned(), title: "Headless PTY fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 100, rows: 30 }, command)?;
         self.sessions_started.fetch_add(1, Ordering::Relaxed);
         Ok(info)
     }
@@ -632,7 +632,7 @@ pub fn run_codex_smoke() -> i32 {
             let engine = harness.engine.clone();
             let title = format!("Codex smoke {index}");
             let path = cwd.to_string_lossy().into_owned();
-            let request = StartRequest { cwd: path.clone(), title, thread_id: None, cols: 100, rows: 30 };
+            let request = StartRequest { cwd: path.clone(), title, project_id: None, project_assigned: false, thread_id: None, cols: 100, rows: 30 };
             starters.push((path, thread::spawn(move || engine.start(request))));
         }
         let mut started = Vec::new();

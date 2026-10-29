@@ -37,7 +37,8 @@ Extract the whole portable ZIP and run `opendiy-desktop.exe`. Keep
 `opendiy-desktop-helper.exe` beside it: Windows requires a console process for the
 terminal side while the main application uses a normal desktop window.
 
-Install and sign in to OpenDIY Codex or a compatible official Codex CLI first. Open **Executable settings**
+Install and sign in to OpenDIY Codex or a compatible official Codex CLI first. Desktop
+packages do not bundle a CLI binary, and the app does not download one. Open **Executable settings**
 and select its native `codex.exe`; the app saves that path for future starts
 and history queries. The screen shows the saved path, resolved executable and
 where it came from. Cancelling the chooser keeps the previous setting.
@@ -50,16 +51,23 @@ are reported explicitly instead of silently using a different program.
 The CLI must support authenticated app-server WebSockets and `--remote`.
 Older CLI versions are not silently downgraded to a different connection mode.
 
-Choose **Import project** to select an existing local folder. Imported
-projects remain in the sidebar after their terminals stop. The session browser
-opens for that project; choose an existing conversation or start a new session
-with its working directory already filled in.
+Choose **Import project** to select an existing local folder in the native Windows
+folder chooser (`IFileOpenDialog`). Imported projects remain in the sidebar after
+their terminals stop. The session browser opens for that project; choose an existing
+conversation or start a new session with its working directory already filled in.
+
+Use **New project** to create a named session group with an optional existing default
+working folder; this does not create a disk folder. Open **⋯** beside a project to
+rename it, mark it as a favorite or delete it. Deletion removes only the app's project
+metadata and moves its sessions to **Unassigned**. It preserves running terminals,
+original conversations and disk folders. **Move to project** on a session changes
+its group without restarting its terminal or changing its actual working directory.
 
 Use the project tabs above the grid, or click a project in the sidebar, to
 view that project's sessions. **All** shows every session. Switching tabs keeps
 all terminals running and retains their output; group input and keyboard
-session shortcuts apply only to the visible project. New sessions and the
-session browser start with the selected project's directory.
+session shortcuts apply only to the visible project. When the selected project has
+a default folder, new sessions and the session browser start with that directory.
 
 **Load sessions** opens a two-pane popup. Search session titles and filter by
 project on the left; inspect dates, the conversation ID and recent messages on
@@ -80,7 +88,8 @@ in **Executable settings**, and shows that executable and the selected project.
 Search installed/available plugins and skills, install/remove or enable/disable
 plugins, manage marketplace sources, and enable/disable skills. Import an existing
 skill folder containing `SKILL.md` into the selected project or your user skill
-folder. The review screen shows the exact target and scope before applying a change.
+folder using the native Windows folder chooser. The review screen shows the exact
+target and scope before applying a change.
 Existing destination folders are never overwritten; links and oversized imports
 are rejected. Errors and unsupported CLI capabilities remain visible.
 
@@ -88,7 +97,34 @@ Plugin installation and marketplace changes use the CLI's own commands; skill
 and setting changes use its app-server APIs. Existing CLI authentication and
 configuration remain owned by that CLI. Changes are read back after applying.
 Start a new session to use changed extensions; running terminals are not restarted.
-This version does not claim shared mobile/daemon backend integration.
+
+## Mobile remote control
+
+Open **Mobile remote control**, select a running session and read its status. Enable
+remote control, refresh until the remote service is connected, then create a pairing
+code to enter in mobile Codex. A connected remote service means the session server
+has connected to the relay; it does not confirm that a phone is paired.
+
+The selected CLI must support the remote-control app-server APIs and
+`--remote-control-client-name`, and must be signed in with a ChatGPT account.
+API key authentication is unsupported. Without that startup option, existing
+session operation remains available, but mobile enable, disable and pairing requests
+are blocked to protect other remote registrations. After choosing a supported CLI,
+start a new session to use mobile control.
+
+Management requests use the selected session's existing app-owned server. Hiding
+the desktop window keeps it running; stopping the session or exiting the app ends
+its mobile connection. Pairing codes are not saved. Physical phone pairing and
+control have not yet been validated.
+
+## Weekly usage
+
+The lower-left indicator reads the selected CLI account's representative weekly
+rate-limit window: an explicit 10,080-minute window, its used percentage and reset
+time when provided. It is account usage, not a total calculated from this app's
+sessions. Missing weekly data and read failures are shown separately and never
+treated as 0%. Reads are at least five minutes apart, with one request at a time;
+automatic polling pauses while the window is hidden.
 
 ## Memory and history
 

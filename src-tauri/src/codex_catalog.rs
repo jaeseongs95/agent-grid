@@ -43,7 +43,7 @@ pub struct CatalogPreview {
     pub unavailable_reason: Option<String>,
 }
 
-fn with_reader<T>(exe: &OsString, read: impl FnOnce(&mut Rpc<TcpStream>) -> Result<T, String>) -> Result<T, String> {
+pub(super) fn with_reader<T>(exe: &OsString, read: impl FnOnce(&mut Rpc<TcpStream>) -> Result<T, String>) -> Result<T, String> {
     // No blocking admission queue: frontends coalesce pending intentions, and a
     // second caller cannot accumulate workers or additional protocol processes.
     let _request = CATALOG_REQUEST.try_lock().map_err(|error| match error {

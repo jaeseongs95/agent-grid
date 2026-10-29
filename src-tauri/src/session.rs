@@ -15,6 +15,12 @@ pub struct SessionInfo {
     pub generation: u64,
     pub title: String,
     pub cwd: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_assigned: bool,
+    #[serde(default)]
+    pub project_revision: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     pub state: String,
@@ -27,6 +33,10 @@ pub struct SessionInfo {
 pub struct StartRequest {
     pub cwd: String,
     pub title: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub project_assigned: bool,
     pub thread_id: Option<String>,
     pub cols: u16,
     pub rows: u16,
@@ -219,11 +229,11 @@ impl Engine {
         if sessions.values().filter(|session| session.phase.load(Ordering::Acquire) < 3).count() >= MAX_ACTIVE_SESSIONS { return Err("32 concurrent sessions limit reached".into()); }
         // Bound metadata in memory as well as output. Remove oldest terminal
         // entries only from the live registry; persisted restore metadata survives.
-        if sessions.len() >= MAX_METADATA_SESSIONS {
-            if let Some(id) = sessions.iter().find(|(_, session)| session.phase.load(Ordering::Acquire) == 3).map(|(id, _)| id.clone()) { sessions.remove(&id); }
+        let retired_id = if sessions.len() >= MAX_METADATA_SESSIONS {
+            if let Some(id) = sessions.iter().find(|(_, session)| session.phase.load(Ordering::Acquire) == 3).map(|(id, _)| id.clone()) { Some(id) }
             else { return Err("session metadata limit reached".into()); }
-        }
-        let info = SessionInfo { id: Uuid::new_v4().to_string(), generation: 1, title: request.title.clone(), cwd: cwd.to_string_lossy().into_owned(), thread_id: request.thread_id.clone(), state: "starting".into(), active: true };
+        } else { None };
+        let info = SessionInfo { id: Uuid::new_v4().to_string(), generation: 1, title: request.title.clone(), cwd: cwd.to_string_lossy().into_owned(), project_id: request.project_id.clone(), project_assigned: request.project_assigned || request.project_id.is_some(), project_revision: 0, thread_id: request.thread_id.clone(), state: "starting".into(), active: true };
         {
             let store = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?;
             store.save_session(&info)?;
@@ -232,6 +242,7 @@ impl Engine {
             store.prune_sessions(&live_ids)?;
         }
         let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone() });
+        if let Some(id) = retired_id { sessions.remove(&id); }
         sessions.insert(info.id.clone(), session.clone());
         drop(sessions);
         if let Err(error) = (self.inner.sink)(BackendEvent::Changed(info)) {
@@ -389,7 +400,76 @@ impl Engine {
         // Canonicalization may touch a network filesystem. Do it before taking
         // the metadata lock so terminal lifecycle updates remain independent.
         let directory = crate::project::directory(cwd)?;
-        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.import_project(&directory)
+        let store = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?;
+        self.check_project_admission()?;
+        store.import_project(&directory)
+    }
+
+    fn check_project_admission(&self) -> Result<(), String> {
+        if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting".into()); }
+        Ok(())
+    }
+
+    pub fn create_project(&self, name: &str, cwd: Option<&str>) -> Result<crate::project::ProjectInfo, String> {
+        self.check_project_admission()?;
+        let directory = cwd.map(crate::project::directory).transpose()?;
+        let store = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?;
+        self.check_project_admission()?;
+        store.create_project(name, directory.as_ref())
+    }
+
+    pub fn rename_project(&self, id: &str, name: &str) -> Result<crate::project::ProjectInfo, String> {
+        let store = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?;
+        self.check_project_admission()?;
+        store.rename_project(id, name)
+    }
+
+    pub fn set_project_favorite(&self, id: &str, favorite: bool) -> Result<crate::project::ProjectInfo, String> {
+        let store = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?;
+        self.check_project_admission()?;
+        store.set_project_favorite(id, favorite)
+    }
+
+    pub fn move_session_to_project(&self, id: &str, generation: u64, project_id: Option<&str>) -> Result<SessionInfo, String> {
+        let sessions = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?;
+        self.check_project_admission()?;
+        let session = sessions.get(id).ok_or("session not found")?;
+        let mut info = session.info.lock().map_err(|_| "session metadata lock poisoned")?;
+        if info.generation != generation { return Err("stale session generation".into()); }
+        let mut next = info.clone();
+        next.project_id = project_id.map(str::to_owned);
+        next.project_assigned = true;
+        next.project_revision = crate::project::next_revision(next.project_revision)?;
+        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.save_session(&next)?;
+        *info = next.clone();
+        drop(info);
+        drop(sessions);
+        (self.inner.sink)(BackendEvent::Changed(next.clone())).map_err(|e| format!("Session project saved; notification failed: {e}"))?;
+        Ok(next)
+    }
+
+    pub fn delete_project(&self, id: &str) -> Result<(), String> {
+        // 기존 update 경로와 같은 info→store 순서를 따른다. registry와
+        // 모든 info를 잡은 동안 시작·이동·상태 저장이 삭제를 추월하지 못한다.
+        let sessions = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?;
+        self.check_project_admission()?;
+        let mut infos = sessions.values().map(|session| session.info.lock().map_err(|_| "session metadata lock poisoned"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let detached = self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.delete_project(id)?;
+        let mut changed = Vec::new();
+        for info in &mut infos {
+            if let Some((_, revision)) = detached.iter().find(|(id, _)| id == &info.id) {
+                info.project_id = None;
+                info.project_assigned = true;
+                info.project_revision = *revision;
+                changed.push((**info).clone());
+            }
+        }
+        drop(infos);
+        drop(sessions);
+        let mut failures = Vec::new();
+        for info in changed { if let Err(error) = (self.inner.sink)(BackendEvent::Changed(info)) { failures.push(error); } }
+        if failures.is_empty() { Ok(()) } else { Err(format!("Project removed; session notifications failed: {}", failures.join("; "))) }
     }
 
     pub fn get_ui_language(&self) -> Result<crate::ui_language::UiLanguage, String> {
@@ -446,6 +526,25 @@ impl Engine {
         self.with_extension_operation(|exe, permit| codex::extensions_mutate_with_executable(exe, cwd, request, permit))
     }
 
+    pub fn weekly_usage(&self) -> Result<codex::WeeklyUsageSnapshot, String> {
+        self.with_extension_operation(|exe, _permit| codex::weekly_usage_with_executable(exe))
+    }
+
+    pub fn mobile_control(&self, id: &str, generation: u64, action: codex::MobileAction) -> Result<codex::MobileReply, String> {
+        // The exit permit serializes management admission, but metadata and PTY
+        // locks are released before connecting or waiting for a remote reply.
+        let _permit = codex::extension_admission()?;
+        if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting; mobile management was not started".into()); }
+        let session = self.lookup(id, generation)?;
+        if session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) {
+            return Err("mobile management requires a running session".into());
+        }
+        let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone().ok_or("session process is unavailable")?;
+        let connection = process.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().ok_or("session server is unavailable")?.mobile_connection();
+        drop(process);
+        connection.request(action)
+    }
+
     pub fn list_external(&self) -> Result<Vec<codex::ExternalSession>, String> {
         codex::list_external_with_executable(&self.codex_executable()?)
     }
@@ -493,7 +592,102 @@ mod lifecycle_tests {
     use super::*;
 
     fn request() -> StartRequest {
-        StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), thread_id: None, cols: 80, rows: 24 }
+        StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 80, rows: 24 }
+    }
+
+    #[test]
+    fn project_moves_check_generation_and_deletion_preserves_live_session_ownership() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(move |event| sender.send(event).map_err(|e| e.to_string()))).unwrap();
+        let project = engine.create_project("명시 소속", None).unwrap();
+        let mut start = request();
+        start.project_id = Some(project.id.clone());
+        let session = engine.allocate(&start).unwrap();
+        let before = session.info().unwrap();
+        assert_eq!(before.project_id.as_deref(), Some(project.id.as_str()));
+        assert!(before.project_assigned && before.active);
+        assert!(engine.move_session_to_project(&before.id, before.generation + 1, None).unwrap_err().contains("stale"));
+        assert!(engine.move_session_to_project(&before.id, before.generation, Some("missing")).is_err());
+        assert_eq!(session.info().unwrap().project_id, before.project_id);
+        assert_eq!(engine.inner.store.lock().unwrap().sessions().unwrap()[0].project_id, before.project_id);
+        let unassigned = engine.move_session_to_project(&before.id, before.generation, None).unwrap();
+        assert!(unassigned.project_assigned && unassigned.project_id.is_none());
+        engine.move_session_to_project(&before.id, before.generation, Some(&project.id)).unwrap();
+        engine.delete_project(&project.id).unwrap();
+        let after = session.info().unwrap();
+        assert!(after.project_assigned && after.project_id.is_none() && after.active);
+        assert_eq!(after.cwd, before.cwd);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.state, before.state);
+        assert_eq!(session.phase.load(Ordering::Acquire), 0);
+        assert!(!session.stop_requested.load(Ordering::Acquire));
+        assert!(!*session.done.0.lock().unwrap());
+        assert!(engine.list_projects().unwrap().is_empty());
+        assert!(receiver.try_iter().any(|event| matches!(event, BackendEvent::Changed(info) if info.project_assigned && info.project_id.is_none())));
+        assert!(engine.allocate(&start).is_err());
+        assert_eq!(engine.list().unwrap().len(), 1);
+        session.finish("exited").unwrap();
+    }
+
+    #[test]
+    fn deleting_automatic_folder_assignment_does_not_reclassify_an_explicit_unassigned_session() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let project = engine.import_project(&request().cwd).unwrap();
+        let first = engine.allocate(&request()).unwrap();
+        assert!(!first.info().unwrap().project_assigned);
+        engine.delete_project(&project.id).unwrap();
+        let detached = first.info().unwrap();
+        assert!(detached.project_assigned && detached.project_id.is_none());
+        let reimported = engine.import_project(&request().cwd).unwrap();
+        assert_ne!(reimported.id, project.id);
+        assert!(first.info().unwrap().project_assigned);
+        assert!(first.info().unwrap().project_id.is_none());
+        let persisted = engine.inner.store.lock().unwrap().sessions().unwrap();
+        assert!(persisted[0].project_assigned && persisted[0].project_id.is_none());
+        first.finish("exited").unwrap();
+        engine.shutdown().unwrap();
+        assert!(engine.create_project("종료 뒤 생성", None).is_err());
+        assert!(engine.rename_project(&reimported.id, "종료 뒤 변경").is_err());
+        assert!(engine.set_project_favorite(&reimported.id, true).is_err());
+        assert!(engine.delete_project(&reimported.id).is_err());
+        assert!(engine.move_session_to_project(&detached.id, detached.generation, None).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn project_changes_keep_the_same_running_pty_and_input_until_its_normal_exit() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(move |event| sender.send(event).map_err(|e| e.to_string()))).unwrap();
+        let project = engine.create_project("실제 터미널 시험", None).unwrap();
+        let mut start = request();
+        start.project_id = Some(project.id.clone());
+        let mut command = CommandBuilder::new("cmd.exe");
+        command.args(["/d", "/q", "/c", "echo PROJECT_MOVE_READY & set /p line= & echo PROJECT_MOVE_DONE"]);
+        let started = engine.start_fixture(start, command).unwrap();
+        struct Cleanup(Engine, String, u64);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = self.0.stop(&self.1, self.2); } }
+        let _cleanup = Cleanup(engine.clone(), started.id.clone(), started.generation);
+        let session = engine.lookup(&started.id, started.generation).unwrap();
+        let process = session.process.lock().unwrap().clone().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut output = String::new();
+        while !output.contains("PROJECT_MOVE_READY") {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match receiver.recv_timeout(remaining).unwrap() { BackendEvent::Output(chunk) => output.push_str(&chunk.data), _ => {} }
+        }
+        let moved = engine.move_session_to_project(&started.id, started.generation, None).unwrap();
+        assert!(moved.active && moved.project_assigned && moved.project_id.is_none());
+        engine.move_session_to_project(&started.id, started.generation, Some(&project.id)).unwrap();
+        engine.delete_project(&project.id).unwrap();
+        assert!(Arc::ptr_eq(&process, session.process.lock().unwrap().as_ref().unwrap()));
+        assert_eq!(session.phase.load(Ordering::Acquire), 1);
+        assert!(!session.stop_requested.load(Ordering::Acquire));
+        engine.write(&started.id, started.generation, "keep-running\r").unwrap();
+        let exited = engine.wait_for_exit(&started.id, started.generation, Duration::from_secs(10)).unwrap();
+        assert_eq!(exited.state, "exited");
+        assert!(!exited.active);
+        assert_eq!(exited.cwd, started.cwd);
+        assert!(exited.project_assigned && exited.project_id.is_none());
     }
 
     #[test]

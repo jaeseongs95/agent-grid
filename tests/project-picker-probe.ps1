@@ -8,15 +8,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-if (-not [IO.Path]::IsPathRooted($ExpectedExecutable)) { throw 'Expected executable must be an absolute file' }
+if (-not [IO.Path]::IsPathRooted($ExpectedExecutable)) { throw 'Expected executable must be absolute' }
 $expectedExecutablePath = [IO.Path]::GetFullPath($ExpectedExecutable)
-if (-not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or [IO.Path]::GetFileName($expectedExecutablePath) -ne 'opendiy-desktop.exe') {
-    throw 'Expected executable must be an existing opendiy-desktop.exe'
-}
+if (-not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or [IO.Path]::GetFileName($expectedExecutablePath) -ne 'opendiy-desktop.exe') { throw 'Expected executable must be an existing opendiy-desktop.exe' }
 if ($Mode -eq 'Select') {
-    if (-not $ExpectedPath -or -not [IO.Path]::IsPathRooted($ExpectedPath) -or -not (Test-Path -LiteralPath $ExpectedPath -PathType Container)) {
-        throw 'Select mode requires an existing absolute directory'
-    }
+    if (-not $ExpectedPath -or -not [IO.Path]::IsPathRooted($ExpectedPath) -or -not (Test-Path -LiteralPath $ExpectedPath -PathType Container)) { throw 'Select mode requires an existing absolute directory' }
     $ExpectedPath = [IO.Path]::GetFullPath($ExpectedPath)
 }
 $appProcess = Get-Process -Id $AppProcessId -ErrorAction Stop
@@ -39,12 +35,14 @@ public static class AgentGridPickerProbe {
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowProc callback, IntPtr data);
     [DllImport("user32.dll")] private static extern bool EnumChildWindows(IntPtr hwnd, EnumWindowProc callback, IntPtr data);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassNameW(IntPtr hwnd, StringBuilder value, int length);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowTextW(IntPtr hwnd, StringBuilder value, int length);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
-    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
-    [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
+    [DllImport("user32.dll")] private static extern IntPtr GetParent(IntPtr hwnd);
+    [DllImport("user32.dll")] private static extern IntPtr GetDlgItem(IntPtr hwnd, int id);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr hwnd);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", CharSet=CharSet.Unicode, SetLastError=true)]
     private static extern IntPtr ReadMessage(IntPtr hwnd, uint message, UIntPtr wParam, StringBuilder text, uint flags, uint timeout, out UIntPtr result);
@@ -52,99 +50,58 @@ public static class AgentGridPickerProbe {
     private static extern IntPtr WriteMessage(IntPtr hwnd, uint message, UIntPtr wParam, string text, uint flags, uint timeout, out UIntPtr result);
     [DllImport("user32.dll", EntryPoint="SendMessageTimeoutW", ExactSpelling=true, SetLastError=true)]
     private static extern IntPtr PlainMessage(IntPtr hwnd, uint message, UIntPtr wParam, IntPtr data, uint flags, uint timeout, out UIntPtr result);
-    [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
-    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
-    [DllImport("kernel32.dll", SetLastError=true)] private static extern IntPtr VirtualAllocEx(IntPtr process, IntPtr address, UIntPtr size, uint allocationType, uint protection);
-    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool WriteProcessMemory(IntPtr process, IntPtr address, byte[] data, UIntPtr size, out UIntPtr written);
-    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool VirtualFreeEx(IntPtr process, IntPtr address, UIntPtr size, uint freeType);
-    [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
-    public static string WindowClass(IntPtr hwnd) {
-        var value = new StringBuilder(256);
-        GetClassNameW(hwnd, value, value.Capacity);
-        return value.ToString();
-    }
-    private static string ControlText(IntPtr hwnd) {
-        var value = new StringBuilder(1024);
-        UIntPtr ignored;
-        if (ReadMessage(hwnd, 0x000D, new UIntPtr((uint)value.Capacity), value, 3, 1000, out ignored) == IntPtr.Zero) return null;
-        return value.ToString();
-    }
-    public static bool OwnedBy(IntPtr hwnd, uint pid) {
-        uint observed;
-        GetWindowThreadProcessId(hwnd, out observed);
-        return observed == pid;
-    }
-    public static bool IsExpectedDialog(IntPtr hwnd, uint pid, IntPtr owner, string body) {
-        if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || !OwnedBy(hwnd, pid) || WindowClass(hwnd) != "#32770" || GetWindow(hwnd, 4) != owner) return false;
-        bool found = false;
-        int visited = 0;
-        EnumChildWindows(hwnd, delegate(IntPtr child, IntPtr unused) {
-            if (++visited > 128) return false;
-            if (OwnedBy(child, pid) && WindowClass(child) == "Static" && ControlText(child) == body) { found = true; return false; }
+    private static string WindowClass(IntPtr hwnd) { var text=new StringBuilder(256); GetClassNameW(hwnd,text,text.Capacity); return text.ToString(); }
+    public static bool OwnedBy(IntPtr hwnd, uint pid) { uint observed; GetWindowThreadProcessId(hwnd,out observed); return observed==pid; }
+    public static bool HasModernFolderView(IntPtr dialog, uint pid) {
+        bool found=false; int visited=0;
+        EnumChildWindows(dialog,delegate(IntPtr child,IntPtr unused) {
+            if(++visited>512) return false;
+            if(OwnedBy(child,pid) && IsWindowVisible(child) && WindowClass(child)=="DirectUIHWND") { found=true; return false; }
             return true;
-        }, IntPtr.Zero);
+        },IntPtr.Zero);
         return found;
     }
-    public static IntPtr[] FindDialogs(uint pid, IntPtr owner, string body) {
-        var found = new List<IntPtr>();
-        EnumWindows(delegate(IntPtr hwnd, IntPtr unused) {
-            if (OwnedBy(hwnd, pid) && IsExpectedDialog(hwnd, pid, owner, body)) found.Add(hwnd);
-            return true;
-        }, IntPtr.Zero);
-        return found.ToArray();
+    public static bool IsExpectedDialog(IntPtr hwnd, uint pid, IntPtr owner, string title) {
+        if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || !OwnedBy(hwnd,pid) || WindowClass(hwnd)!="#32770" || GetWindow(hwnd,4)!=owner) return false;
+        var text=new StringBuilder(256); GetWindowTextW(hwnd,text,text.Capacity); return text.ToString()==title && HasModernFolderView(hwnd,pid);
     }
-    public static IntPtr[] Edits(IntPtr dialog, uint pid) {
-        var found = new List<IntPtr>();
-        EnumChildWindows(dialog, delegate(IntPtr child, IntPtr unused) {
-            if (OwnedBy(child, pid) && IsWindowVisible(child) && WindowClass(child) == "Edit") found.Add(child);
-            return true;
-        }, IntPtr.Zero);
-        return found.ToArray();
+    public static IntPtr[] FindDialogs(uint pid, IntPtr owner, string title) {
+        var matches=new List<IntPtr>();
+        EnumWindows(delegate(IntPtr hwnd,IntPtr unused) { if(OwnedBy(hwnd,pid) && IsExpectedDialog(hwnd,pid,owner,title)) matches.Add(hwnd); return true; },IntPtr.Zero);
+        return matches.ToArray();
     }
-    public static void SetEdit(IntPtr edit, string text) {
-        UIntPtr accepted;
-        if (WriteMessage(edit, 0x000C, UIntPtr.Zero, text, 3, 2000, out accepted) == IntPtr.Zero || accepted == UIntPtr.Zero)
-            throw new InvalidOperationException("Owned path edit did not accept WM_SETTEXT");
-    }
-    public static void SelectFolder(IntPtr dialog, uint pid, IntPtr owner, string body, long expectedStartFileTime, string path) {
-        if (!IsExpectedDialog(dialog, pid, owner, body)) throw new InvalidOperationException("Folder selection refused an unverified dialog");
-        byte[] text = Encoding.Unicode.GetBytes(path + "\0");
-        if (text.Length > 65534) throw new InvalidOperationException("Folder path exceeds the bounded Unicode buffer");
-        // BFFM_SETSELECTIONW is above WM_USER: USER32 does not marshal its path pointer across processes.
-        // Allocate only a bounded data buffer in the already verified, fresh fixture process; no code is written.
-        IntPtr process = OpenProcess(0x1028, false, pid); // QUERY_LIMITED_INFORMATION | VM_OPERATION | VM_WRITE
-        if (process == IntPtr.Zero) throw new InvalidOperationException("Cannot open the owned fixture process for its folder path buffer");
-        IntPtr remote = IntPtr.Zero;
-        bool pendingMessage = false;
-        try {
-            long creation, exit, kernel, user;
-            if (!GetProcessTimes(process, out creation, out exit, out kernel, out user) || creation != expectedStartFileTime)
-                throw new InvalidOperationException("Folder selection refused a reused process ID");
-            if (!IsExpectedDialog(dialog, pid, owner, body)) throw new InvalidOperationException("Owned folder dialog changed before selection");
-            remote = VirtualAllocEx(process, IntPtr.Zero, new UIntPtr((uint)text.Length), 0x3000, 0x04);
-            if (remote == IntPtr.Zero) throw new InvalidOperationException("Cannot allocate the owned folder path buffer");
-            UIntPtr written;
-            if (!WriteProcessMemory(process, remote, text, new UIntPtr((uint)text.Length), out written) || written.ToUInt64() != (ulong)text.Length)
-                throw new InvalidOperationException("Cannot write the complete owned folder path buffer");
-            UIntPtr ignored;
-            pendingMessage = true;
-            if (PlainMessage(dialog, 0x0467, new UIntPtr(1), remote, 3, 2000, out ignored) == IntPtr.Zero)
-                throw new InvalidOperationException("Owned BFFM_SETSELECTIONW did not complete; bounded path buffer retained until fixture exit");
-            pendingMessage = false; // The shell has finished consuming the path; the message return value itself is unspecified.
-        } finally {
-            // A timed-out message may still be consuming its pointer. Keep that one bounded allocation until fixture exit.
-            // The existing caller cancels this exact owned dialog and exits its own fixture on any failure.
-            if (remote != IntPtr.Zero && !pendingMessage && !VirtualFreeEx(process, remote, UIntPtr.Zero, 0x8000)) {
-                CloseHandle(process);
-                throw new InvalidOperationException("Cannot release the owned folder path buffer");
+    public static IntPtr[] FolderEdits(IntPtr dialog, uint pid) {
+        var matches=new List<IntPtr>(); int visited=0;
+        EnumChildWindows(dialog,delegate(IntPtr child,IntPtr unused) {
+            if(++visited>512) return false;
+            if(!OwnedBy(child,pid) || !IsWindowVisible(child) || !IsWindowEnabled(child) || WindowClass(child)!="Edit") return true;
+            // The modern file dialog's folder input is inside cmb13=1148.
+            // Do not use an address-bar Edit or accept the classic edt1 control.
+            bool filename=false;
+            IntPtr parent=GetParent(child);
+            for(int depth=0; !filename && depth<8 && parent!=IntPtr.Zero && parent!=dialog; depth++) {
+                if(!OwnedBy(parent,pid)) break;
+                if(GetDlgCtrlID(parent)==1148) filename=true;
+                parent=GetParent(parent);
             }
-            CloseHandle(process);
-        }
+            if(filename) matches.Add(child);
+            return true;
+        },IntPtr.Zero);
+        return matches.ToArray();
     }
-    public static void Click(IntPtr button) {
+    public static void SetFolderPath(IntPtr edit,string value) {
+        UIntPtr accepted;
+        if(WriteMessage(edit,0x000C,UIntPtr.Zero,value,3,2000,out accepted)==IntPtr.Zero || accepted==UIntPtr.Zero) throw new InvalidOperationException("Owned folder Edit rejected WM_SETTEXT");
+        // WM_SETTEXT/WM_GETTEXT are system-marshalled Unicode messages; no remote buffer is needed.
+        var observed=new StringBuilder(value.Length+1);
+        if(ReadMessage(edit,0x000D,new UIntPtr((uint)observed.Capacity),observed,3,2000,out accepted)==IntPtr.Zero || observed.ToString()!=value)
+            throw new InvalidOperationException("Owned folder Edit did not retain the exact fixture path");
+    }
+    public static void Click(IntPtr dialog,uint pid,int id) {
+        var button=GetDlgItem(dialog,id);
+        if(button==IntPtr.Zero || !OwnedBy(button,pid) || !IsWindowVisible(button) || !IsWindowEnabled(button) || WindowClass(button)!="Button") throw new InvalidOperationException("Owned dialog button missing or disabled");
         UIntPtr ignored;
-        if (PlainMessage(button, 0x00F5, UIntPtr.Zero, IntPtr.Zero, 3, 2000, out ignored) == IntPtr.Zero)
-            throw new InvalidOperationException("Owned dialog button did not respond to BM_CLICK");
+        if(PlainMessage(button,0x00F5,UIntPtr.Zero,IntPtr.Zero,3,2000,out ignored)==IntPtr.Zero) throw new InvalidOperationException("Owned button did not respond to BM_CLICK");
     }
 }
 '@
@@ -158,28 +115,28 @@ function Assert-ProcessIdentity {
 }
 function Assert-DialogIdentity {
     Assert-ProcessIdentity
-    if (-not [AgentGridPickerProbe]::IsExpectedDialog($script:dialog, $AppProcessId, $mainWindow, $ExpectedDialogText)) { throw 'Original owned folder dialog identity changed' }
+    if (-not [AgentGridPickerProbe]::IsExpectedDialog($script:dialog, $AppProcessId, $mainWindow, $ExpectedDialogText)) { throw 'Original owned modern folder dialog identity changed' }
 }
 function Wait-DialogClosed([int]$Seconds) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     do {
         Assert-ProcessIdentity
         if (-not [AgentGridPickerProbe]::IsWindow($script:dialog) -or -not [AgentGridPickerProbe]::IsWindowVisible($script:dialog)) { return }
+        Assert-DialogIdentity
         Start-Sleep -Milliseconds 50
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw 'Owned folder dialog did not close within the bounded wait'
+    throw 'Owned modern folder dialog did not close within the bounded wait'
 }
-
 $deadline = [DateTime]::UtcNow.AddSeconds(7)
 $script:dialog = [IntPtr]::Zero
 do {
     Assert-ProcessIdentity
     $matches = [AgentGridPickerProbe]::FindDialogs($AppProcessId, $mainWindow, $ExpectedDialogText)
-    if ($matches.Length -gt 1) { throw 'Multiple matching owned folder dialogs; refusing ambiguous action' }
+    if ($matches.Length -gt 1) { throw 'Multiple matching owned modern folder dialogs; refusing ambiguous action' }
     if ($matches.Length -eq 1) { $script:dialog = $matches[0]; break }
     Start-Sleep -Milliseconds 50
 } while ([DateTime]::UtcNow -lt $deadline)
-if ($script:dialog -eq [IntPtr]::Zero) { throw 'Expected owned folder dialog was not found; no UI action was sent' }
+if ($script:dialog -eq [IntPtr]::Zero) { throw 'Expected owned modern folder dialog not found; no UI action was sent' }
 
 $actions = New-Object 'System.Collections.Generic.List[string]'
 $editId = $null
@@ -188,23 +145,16 @@ $cleanupFailure = $null
 try {
     Assert-DialogIdentity
     if ($Mode -eq 'Select') {
-        $edits = [AgentGridPickerProbe]::Edits($script:dialog, $AppProcessId)
-        if ($edits.Length -ne 1) { throw 'Expected one visible owned folder path edit; refusing ambiguous action' }
+        $edits = [AgentGridPickerProbe]::FolderEdits($script:dialog, $AppProcessId)
+        if ($edits.Length -ne 1) { throw 'Expected one owned modern folder Edit; refusing ambiguous action' }
         $editId = [AgentGridPickerProbe]::GetDlgCtrlID($edits[0])
-        [AgentGridPickerProbe]::SetEdit($edits[0], $ExpectedPath)
-        $actions.Add('owned-edit-WM_SETTEXT')
+        [AgentGridPickerProbe]::SetFolderPath($edits[0], $ExpectedPath)
+        $actions.Add('owned-folder-WM_SETTEXT-verified-Unicode')
         Assert-DialogIdentity
-        [AgentGridPickerProbe]::SelectFolder($script:dialog, $AppProcessId, $mainWindow, $ExpectedDialogText, $appProcess.StartTime.ToUniversalTime().ToFileTimeUtc(), $ExpectedPath)
-        $actions.Add('owned-dialog-BFFM_SETSELECTIONW-remote-Unicode-path')
-        Assert-DialogIdentity
-        $button = [AgentGridPickerProbe]::GetDlgItem($script:dialog, 1)
-        if ($button -eq [IntPtr]::Zero -or -not [AgentGridPickerProbe]::OwnedBy($button, $AppProcessId) -or -not [AgentGridPickerProbe]::IsWindowEnabled($button)) { throw 'Owned IDOK button is missing or disabled' }
-        [AgentGridPickerProbe]::Click($button)
+        [AgentGridPickerProbe]::Click($script:dialog, $AppProcessId, 1)
         $actions.Add('owned-IDOK-BM_CLICK')
     } else {
-        $button = [AgentGridPickerProbe]::GetDlgItem($script:dialog, 2)
-        if ($button -eq [IntPtr]::Zero -or -not [AgentGridPickerProbe]::OwnedBy($button, $AppProcessId)) { throw 'Owned IDCANCEL button is missing' }
-        [AgentGridPickerProbe]::Click($button)
+        [AgentGridPickerProbe]::Click($script:dialog, $AppProcessId, 2)
         $actions.Add('owned-IDCANCEL-BM_CLICK')
     }
     Wait-DialogClosed 5
@@ -213,9 +163,7 @@ try {
     try {
         Assert-ProcessIdentity
         if ([AgentGridPickerProbe]::IsExpectedDialog($script:dialog, $AppProcessId, $mainWindow, $ExpectedDialogText)) {
-            $cancel = [AgentGridPickerProbe]::GetDlgItem($script:dialog, 2)
-            if ($cancel -eq [IntPtr]::Zero -or -not [AgentGridPickerProbe]::OwnedBy($cancel, $AppProcessId)) { throw 'Cleanup refused an unverified cancel control' }
-            [AgentGridPickerProbe]::Click($cancel)
+            [AgentGridPickerProbe]::Click($script:dialog, $AppProcessId, 2)
             $actions.Add('failure-cleanup-owned-IDCANCEL')
             Wait-DialogClosed 2
         }
@@ -223,17 +171,19 @@ try {
 }
 if ($primaryFailure) {
     if ($cleanupFailure) { throw "Picker probe failed: $primaryFailure; cleanup failed: $cleanupFailure" }
-    throw "Picker probe failed: $primaryFailure; original owned dialog is closed or no longer matches"
+    throw "Picker probe failed: $primaryFailure; original owned dialog closed or no longer matches"
 }
 Assert-ProcessIdentity
 [ordered]@{
-    schema = 'agent-grid-project-picker-probe-v1'
+    schema = 'agent-grid-project-picker-probe-v2'
     mode = $Mode
     processId = $AppProcessId
     processStartedAt = $appProcess.StartTime.ToUniversalTime().ToString('o')
     dialogHandle = $script:dialog.ToInt64().ToString()
     parentHandle = $mainWindow.ToInt64().ToString()
     exactProcessAndDialogVerified = $true
+    modernFolderDialogVerified = $true
+    directUIHWNDVerified = $true
     dialogClosed = $true
     editControlId = $editId
     actions = @($actions.ToArray())

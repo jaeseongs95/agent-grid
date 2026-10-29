@@ -1,9 +1,9 @@
 import { test, expect, type Page } from '@playwright/test';
 
 const projects = [
-  { id: 'alpha', name: 'Alpha', cwd: 'D:\\Work\\Alpha', createdAt: 1700000000 },
-  { id: 'beta', name: 'Beta', cwd: 'D:\\Work\\Beta', createdAt: 1700000000 },
-  { id: 'empty', name: 'Empty', cwd: 'D:\\Work\\Empty', createdAt: 1700000000 },
+  { id: 'alpha', name: 'Alpha', cwd: 'D:\\Work\\Alpha', createdAt: 1700000000, favorite: false },
+  { id: 'beta', name: 'Beta', cwd: 'D:\\Work\\Beta', createdAt: 1700000000, favorite: false },
+  { id: 'empty', name: 'Empty', cwd: 'D:\\Work\\Empty', createdAt: 1700000000, favorite: false },
 ];
 const owned = [
   { id: 'a1', title: 'Alpha first', cwd: 'd:/work/ALPHA/' },
@@ -21,7 +21,9 @@ async function workspace(page: Page, options: { capacity?: boolean } = {}) {
     let callback = 0;
     const callbacks = new Map<number, (event: any) => void>();
     const listeners = new Map<string, (event: any) => void>();
-    const existing = options.capacity ? Array.from({ length: 31 }, (_, index) => ({ ...owned[0], id: 'capacity-' + index, threadId: 'capacity-thread-' + index })) : owned;
+    const existing = JSON.parse(localStorage.getItem('tabs-sessions') || 'null') ?? (options.capacity ? Array.from({ length: 31 }, (_, index) => ({ ...owned[0], id: 'capacity-' + index, threadId: 'capacity-thread-' + index })) : owned);
+    const projectList = () => JSON.parse(localStorage.getItem('tabs-projects') || JSON.stringify(projects));
+    const saveProjects = (value: any[]) => localStorage.setItem('tabs-projects', JSON.stringify(value));
     let ownershipReads = 0;
     state.tabsFixture = { calls: [], nodes: [], holdNextWrite: false, holdStart: false, holdOwnership: false, catalog: false, catalogOwned: false, releaseOwnership: () => {}, releaseWrite: () => {}, releaseStart: () => {},
       emit(event: string, payload: any) { listeners.get(event)!({ event, id: 1, payload }); },
@@ -41,9 +43,27 @@ async function workspace(page: Page, options: { capacity?: boolean } = {}) {
           if (ownershipReads++ > 0 && state.tabsFixture.holdOwnership) await new Promise<void>(resolve => { state.tabsFixture.releaseOwnership = resolve; });
           return existing;
         }
-        if (command === 'list_projects') return JSON.parse(localStorage.getItem('tabs-projects') || JSON.stringify(projects));
+        if (command === 'list_projects') {
+          const snapshot = projectList();
+          if (state.tabsFixture.holdNextProjects) { state.tabsFixture.holdNextProjects = false; await new Promise<void>(resolve => { state.tabsFixture.releaseProjects = resolve; }); }
+          return snapshot;
+        }
+        if (command === 'choose_project_folder') return state.tabsFixture.chosenFolder ?? null;
+        if (command === 'create_project') { const project = { id: 'project-' + projectList().length, name: args.name, cwd: args.cwd, createdAt: 1700000000, favorite: false }; saveProjects([...projectList(), project]); return project; }
+        if (command === 'rename_project' || command === 'set_project_favorite') { if (command === 'set_project_favorite' && state.tabsFixture.failFavoriteOnce) { state.tabsFixture.failFavoriteOnce = false; throw new Error('즐겨찾기 저장 실패'); } const values = projectList(); const item = values.find((project: any) => project.id === args.id); if (!item) throw new Error('Project not found'); if (command === 'rename_project') item.name = args.name; else item.favorite = args.favorite; saveProjects(values); return item; }
+        if (command === 'delete_project') {
+          saveProjects(projectList().filter((project: any) => project.id !== args.id));
+          for (const session of existing) if (session.projectId === args.id || (args.id === 'alpha' && ['a1', 'a2'].includes(session.id) && !session.projectAssigned)) { session.projectId = null; session.projectAssigned = true; session.projectRevision = (session.projectRevision ?? 0) + 1; }
+          localStorage.setItem('tabs-sessions', JSON.stringify(existing)); return null;
+        }
+        if (command === 'move_session_to_project') {
+          if (state.tabsFixture.failMove) throw new Error('Generation changed');
+          const session = existing.find((item: any) => item.id === args.id && item.generation === args.generation); if (!session) throw new Error('Generation changed');
+          session.projectId = args.projectId; session.projectAssigned = true; session.projectRevision = (session.projectRevision ?? 0) + 1; localStorage.setItem('tabs-sessions', JSON.stringify(existing)); return { ...session };
+        }
+        if (command === 'save_layout') { state.tabsFixture.savedLayout = args.layout; return null; }
         if (command === 'choose_project') {
-          const imported = { id: 'new', name: 'Imported', cwd: 'D:\\Work\\Imported', createdAt: 1700000000 };
+          const imported = { id: 'new', name: 'Imported', cwd: 'D:\\Work\\Imported', createdAt: 1700000000, favorite: false };
           localStorage.setItem('tabs-projects', JSON.stringify([...projects, imported])); return imported;
         }
         if (command === 'catalog_list') return { sessions: state.tabsFixture.catalog ? [{ id: state.tabsFixture.catalogOwned ? owned[0].threadId : 'new-alpha-thread', title: 'Catalog Alpha', cwd: projects[0].cwd, createdAt: 1700000000, updatedAt: 1700000000, status: 'idle' }] : [], nextCursor: null };
@@ -54,7 +74,7 @@ async function workspace(page: Page, options: { capacity?: boolean } = {}) {
         }
         if (command === 'start_session') {
           if (state.tabsFixture.holdStart) await new Promise<void>(resolve => { state.tabsFixture.releaseStart = resolve; });
-          return { ...args.request, id: 'started-alpha', generation: 1, state: 'idle', active: true };
+          return { ...args.request, ...(Object.hasOwn(args.request, 'projectId') ? { projectAssigned: true } : {}), id: 'started-alpha', generation: 1, state: 'idle', active: true };
         }
         return null;
       },
@@ -257,4 +277,155 @@ test('global capacity includes 31 hidden sessions and a pending start when an em
   await expect(page.locator('.terminal-card')).toHaveCount(32);
   await expect(visibleCards(page)).toHaveCount(0);
   await expect(tab(page, 'Beta')).toHaveAttribute('aria-selected', 'true');
+});
+
+async function createProject(page: Page, name = '논리 프로젝트') {
+  await page.locator('#project-create').click();
+  await page.locator('#project-name').fill(name);
+  await page.locator('#project-save').click();
+  await expect(page.locator('#project-dialog')).toBeHidden();
+  return page.locator('#project-tabs [data-project-key="id:project-3"]');
+}
+
+test('project folder selection and cancellation never import a project; folderless creation supplies explicit session membership', async ({ page }) => {
+  await workspace(page);
+  await page.locator('#project-create').click();
+  await page.evaluate(() => { (window as any).tabsFixture.chosenFolder = 'D:\\한글 작업\\테스트'; });
+  await page.locator('#project-folder-choose').click();
+  await expect(page.locator('#project-folder')).toHaveValue('D:\\한글 작업\\테스트');
+  await page.locator('#project-dialog-close').click();
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((item: any) => ['create_project', 'choose_project'].includes(item.command)))).toEqual([]);
+  const created = await createProject(page);
+  await expect(created).toHaveAttribute('aria-selected', 'true');
+  await expect(visibleCards(page)).toHaveCount(0);
+  await page.locator('#new-session').click();
+  await expect(page.locator('#session-cwd')).toHaveValue('');
+  await page.locator('#session-title').fill('폴더와 묶음은 별개');
+  await page.locator('#session-cwd').fill('D:\\별도 실행 폴더');
+  await page.locator('#create-submit').click();
+  await expect(card(page, 'started-alpha')).toBeVisible();
+  const request = await page.evaluate(() => (window as any).tabsFixture.calls.find((item: any) => item.command === 'start_session').args.request);
+  expect(request).toMatchObject({ projectId: 'project-3', cwd: 'D:\\별도 실행 폴더' });
+  await expect(created).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('.terminal-card')).toHaveCount(7);
+});
+
+test('project names are text, favorites sort first and repeated management keeps one dialog', async ({ page }) => {
+  await workspace(page);
+  const name = '<img src=x onerror="window.injected=true"> 묶음';
+  await createProject(page, name);
+  const manage = page.locator('#projects [data-project-id="project-3"]');
+  await manage.click();
+  await page.locator('#project-name').fill('이름 변경');
+  await page.locator('#project-favorite').check();
+  await page.locator('#project-save').click();
+  const tabs = page.locator('#project-tabs [role=tab]');
+  await expect(tabs.nth(1)).toContainText('이름 변경');
+  await expect(tabs.nth(1)).toContainText('★');
+  await expect(tabs.nth(1)).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('#projects img')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).injected)).toBeUndefined();
+  for (let attempt = 0; attempt < 3; attempt++) { await manage.click(); await page.locator('#project-dialog-close').click(); }
+  await expect(page.locator('#project-dialog')).toHaveCount(1);
+  await expect(page.locator('#project-delete-dialog')).toHaveCount(1);
+  await page.locator('#language-select').selectOption('en');
+  await manage.click();
+  await expect(page.locator('#project-dialog-title')).toHaveText('Manage project');
+  await expect(page.getByLabel('Project name', { exact: true })).toHaveValue('이름 변경');
+  await expect(page.locator('#project-delete')).toHaveText('Delete project');
+});
+
+test('moving a running session preserves its terminal, generation and actual cwd; explicit unassigned wins over cwd', async ({ page }) => {
+  await workspace(page);
+  await createProject(page);
+  await page.locator('#project-tabs [role=tab]').first().click();
+  await page.evaluate(() => { (window as any).tabsFixture.movedNode = document.querySelector('.terminal-card[data-id="a1"] .xterm'); });
+  await card(page, 'a1').getByLabel('프로젝트로 이동', { exact: true }).click();
+  await page.locator('#project-move-target').selectOption('project-3');
+  await page.locator('#project-move-confirm').click();
+  await expect(card(page, 'a1')).toBeVisible();
+  await expect(page.locator('#project-tabs [data-project-key="id:project-3"]')).toHaveAttribute('aria-selected', 'true');
+  await expect(card(page, 'a1').locator('.terminal-path')).toContainText(owned[0].cwd);
+  expect(await page.evaluate(() => (window as any).tabsFixture.movedNode === document.querySelector('.terminal-card[data-id="a1"] .xterm'))).toBe(true);
+  await card(page, 'a1').getByLabel('프로젝트로 이동', { exact: true }).click();
+  await page.locator('#project-move-target').selectOption('');
+  await page.locator('#project-move-confirm').click();
+  await expect(page.locator('#project-tabs [data-project-key="unassigned"]')).toHaveAttribute('aria-selected', 'true');
+  await tab(page, 'Alpha').click();
+  await expect.poll(() => visibleIds(page)).toEqual(['a2']);
+  const calls = await page.evaluate(() => (window as any).tabsFixture.calls);
+  expect(calls.filter((item: any) => item.command === 'move_session_to_project').map((item: any) => item.args)).toEqual([{ id: 'a1', generation: 7, projectId: 'project-3' }, { id: 'a1', generation: 7, projectId: null }]);
+  expect(calls.filter((item: any) => ['session_stop', 'start_session', 'session_write'].includes(item.command))).toEqual([]);
+  await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.savedLayout?.sessions.find((item: any) => item.threadId === 'thread-a1'))).toMatchObject({ projectId: null, projectAssigned: true, cwd: owned[0].cwd });
+  await page.reload();
+  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await tab(page, 'Alpha').click();
+  await expect.poll(() => visibleIds(page)).toEqual(['a2']);
+});
+
+test('project deletion requires confirmation and preserves running sessions, code paths and conversations', async ({ page }) => {
+  await workspace(page);
+  await tab(page, 'Alpha').click();
+  await page.locator('#projects [data-project-id="alpha"]').click();
+  await page.locator('#project-delete').click();
+  await expect(page.locator('#project-delete-dialog')).toContainText('코드 폴더와 대화는 보존');
+  await page.locator('#project-delete-cancel').click();
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((item: any) => item.command === 'delete_project'))).toEqual([]);
+  await page.locator('#project-delete').click();
+  await page.locator('#project-delete-confirm').click();
+  await expect(page.locator('#project-delete-dialog')).toBeHidden();
+  await expect(page.locator('#project-tabs [data-project-key="id:alpha"]')).toHaveCount(0);
+  await expect(page.locator('#project-tabs [role=tab]').first()).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('.terminal-card')).toHaveCount(6);
+  await page.locator('#project-tabs [data-project-key="unassigned"]').click();
+  await expect.poll(() => visibleIds(page)).toEqual(['a1', 'a2']);
+  const calls = await page.evaluate(() => (window as any).tabsFixture.calls);
+  expect(calls.filter((item: any) => item.command === 'delete_project').map((item: any) => item.args)).toEqual([{ id: 'alpha' }]);
+  expect(calls.filter((item: any) => ['session_stop', 'start_session', 'session_write', 'delete_conversation', 'delete_folder'].includes(item.command))).toEqual([]);
+  const registry = await page.evaluate(() => JSON.parse(localStorage.getItem('tabs-sessions')!));
+  expect(registry.find((item: any) => item.id === 'a1')).toMatchObject({ cwd: owned[0].cwd, generation: 7, active: true, threadId: 'thread-a1', projectId: null, projectAssigned: true });
+});
+
+test('retry after a favorite save failure updates the created project without duplicating it', async ({ page }) => {
+  await workspace(page);
+  await page.locator('#project-create').click();
+  await page.locator('#project-name').fill('부분 저장 재시도');
+  await page.locator('#project-favorite').check();
+  await page.evaluate(() => { (window as any).tabsFixture.failFavoriteOnce = true; });
+  await page.locator('#project-save').click();
+  await expect(page.locator('#project-error')).toContainText('즐겨찾기 저장 실패');
+  await page.locator('#project-save').click();
+  await expect(page.locator('#project-dialog')).toBeHidden();
+  await expect(page.locator('#project-tabs [role=tab]').nth(1)).toContainText('★ 부분 저장 재시도');
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((item: any) => item.command === 'create_project').length)).toBe(1);
+});
+
+test('a delayed status snapshot cannot reverse a completed project move', async ({ page }) => {
+  await workspace(page);
+  await tab(page, 'Alpha').click();
+  await card(page, 'a1').getByLabel('프로젝트로 이동', { exact: true }).click();
+  await page.locator('#project-move-target').selectOption('beta');
+  await page.locator('#project-move-confirm').click();
+  await expect(tab(page, 'Beta')).toHaveAttribute('aria-selected', 'true');
+  await expect(card(page, 'a1')).toBeVisible();
+  await page.evaluate(session => (window as any).tabsFixture.emit('session-changed', { ...session, state: 'waiting', projectRevision: 0 }), owned[0]);
+  await expect(card(page, 'a1')).toBeVisible();
+  await expect(card(page, 'a1').locator('.session-state')).toContainText('응답 대기');
+  await tab(page, 'Alpha').click();
+  await expect.poll(() => visibleIds(page)).toEqual(['a2']);
+  await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.savedLayout?.sessions.find((item: any) => item.threadId === 'thread-a1'))).toMatchObject({ projectId: 'beta', projectAssigned: true, projectRevision: 1 });
+});
+
+
+test('an older catalog registry read cannot remove a project created while that read was pending', async ({ page }) => {
+  await workspace(page);
+  await page.evaluate(() => { (window as any).tabsFixture.holdNextProjects = true; });
+  await page.locator('#catalog-open').click();
+  await expect.poll(() => page.evaluate(() => typeof (window as any).tabsFixture.releaseProjects)).toBe('function');
+  await page.locator('#catalog-close').click();
+  const created = await createProject(page);
+  await expect(created).toHaveAttribute('aria-selected', 'true');
+  await page.evaluate(() => (window as any).tabsFixture.releaseProjects());
+  await expect(created).toHaveAttribute('aria-selected', 'true');
+  await expect(page.locator('#projects [data-project-id="project-3"]')).toBeVisible();
 });

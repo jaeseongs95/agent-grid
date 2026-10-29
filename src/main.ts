@@ -5,10 +5,14 @@ import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
-import { MAX_WORKSPACE_SESSIONS, acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, projectKey, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo } from './model';
-import { createSessionBrowser, type ProjectInfo } from './session-browser';
+import { MAX_WORKSPACE_SESSIONS, acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, projectGroups, sessionProjectKey, savedSessionMetadata, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo, type ProjectInfo } from './model';
+import { createSessionBrowser } from './session-browser';
+import { createProjectManager } from './project-manager';
 import { createExecutableSettings } from './executable-settings';
 import { createExtensionsManager } from './extensions';
+import { createMobileControl } from './mobile-control';
+import { createWeeklyUsage } from './weekly-usage';
+import './weekly-usage.css';
 import { InputQueueError, TerminalInputQueue, TerminalResizeQueue } from './terminal-flow';
 import { bindAttribute, bindText, getLanguage, languageStorageError, onLanguageChange, setLanguage, t } from './i18n';
 
@@ -46,10 +50,11 @@ let projectSelectionVersion = 0;
 if (native) $('#app').hidden = true;
 $('#app').innerHTML = `
   <aside class="sidebar">
-    <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">0.4.0</span></a>
+    <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">0.5.0</span></a>
     <div class="workspace-label">WORKSPACE <span class="local-pill">LOCAL</span></div>
     <button class="workspace-choice"><span class="folder-icon">▤</span><span>나의 작업 공간<small>독립된 터미널, 하나의 화면</small></span></button>
     <div class="side-heading">프로젝트 <span id="project-count">0</span></div>
+    <button id="project-create" class="project-import quiet-button">+ 새 프로젝트</button>
     <button id="project-import" class="project-import quiet-button">+ 프로젝트 가져오기</button>
     <div id="projects" class="projects"></div>
     <div class="side-heading sessions-heading">세션 <span id="side-count">0</span><button id="side-add" class="icon-button" aria-label="새 세션 만들기">+</button></div>
@@ -88,6 +93,7 @@ const markupLabels: Record<string, [string, string]> = {
   "나의 작업 공간": ["나의 작업 공간", "My workspace"],
   "독립된 터미널, 하나의 화면": ["독립된 터미널, 하나의 화면", "Independent terminals, one view"],
   "프로젝트": ["프로젝트", "Projects"],
+  "+ 새 프로젝트": ["+ 새 프로젝트", "+ New project"],
   "+ 프로젝트 가져오기": ["+ 프로젝트 가져오기", "+ Import project"],
   "세션": ["세션", "Sessions"],
   "새 세션 만들기": ["새 세션 만들기", "Create a session"],
@@ -262,11 +268,13 @@ function resumeTitle(value: string) {
   return title.trim() || t('이름 없는 세션', 'Untitled session');
 }
 function projectPath(cwd: string) { return cwd.replace(/^\\\\\?\\UNC\\/i, '\\\\').replace(/^\\\\\?\\/, '').replace(/\//g, '\\'); }
-function visibleOrder() { return order.filter(id => !selectedProject || projectKey(sessions.get(id)!.cwd) === projectKey(selectedProject)); }
+function selectedProjectCwd() { return projectGroups(importedProjects, [...sessions.values()]).find(project => project.key === selectedProject)?.cwd ?? undefined; }
+function selectedProjectId() { return importedProjects.find(project => `id:${project.id}` === selectedProject)?.id; }
+function visibleOrder() { return order.filter(id => isVisible(id)); }
 function visibleSessions() { return visibleOrder().map(id => sessions.get(id)!); }
-function isVisible(id: string) { const session = sessions.get(id); return !!session && (!selectedProject || projectKey(session.cwd) === projectKey(selectedProject)); }
-function selectProject(cwd: string) {
-  projectSelectionVersion++; selectedProject = cwd; maximized = ''; dragging = '';
+function isVisible(id: string) { const session = sessions.get(id); return !!session && (!selectedProject || sessionProjectKey(session, importedProjects) === selectedProject); }
+function selectProject(key: string) {
+  projectSelectionVersion++; selectedProject = key; maximized = ''; dragging = '';
   for (const id of selected) if (!isVisible(id)) selected.delete(id);
   if (!isVisible(active)) active = visibleOrder()[0] ?? '';
   for (const [id, view] of terminals) { view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); refreshInputState(id); if (!isVisible(id)) view.terminal.blur(); }
@@ -275,7 +283,7 @@ function selectProject(cwd: string) {
 }
 function focusSession(id: string) {
   const session = sessions.get(id); if (!session) return;
-  if (!isVisible(id)) selectProject(session.cwd);
+  if (!isVisible(id)) selectProject(sessionProjectKey(session, importedProjects));
   if (maximized) maximized = id;
   renderGrid(); setActive(id);
 }
@@ -300,7 +308,7 @@ function scheduleSave() {
   if (!native) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const layout: Layout = { version: 1, columns, columnSizes: [...columnSizes], rowSizes: [...rowSizes], sessions: order.map(id => sessions.get(id)!).filter(Boolean).map(({ title, cwd, threadId }) => ({ title, cwd, threadId })) };
+    const layout: Layout = { version: 1, columns, columnSizes: [...columnSizes], rowSizes: [...rowSizes], sessions: order.map(id => sessions.get(id)!).filter(Boolean).map(savedSessionMetadata) };
     bindText($('#save-status'), '저장 중…', 'Saving…');
     saveQueue = saveQueue.then(() => call('save_layout', { layout })).then(() => { bindText($('#save-status'), '레이아웃 저장됨', 'Layout saved'); }).catch(error => { bindText($('#save-status'), '레이아웃 저장 실패', 'Could not save layout'); notifyError('저장 실패', 'Could not save', error); });
   }, 400);
@@ -389,6 +397,7 @@ function createTerminal(session: Session) {
       }).catch(error => notifyError('종료 실패', 'Could not stop session', error));
     }
   });
+  const projectMove = document.createElement('button'); projectMove.className = 'project-move icon-button'; projectMove.textContent = '▱'; bindAttribute(projectMove, 'aria-label', '프로젝트로 이동', 'Move to project'); bindAttribute(projectMove, 'title', '프로젝트로 이동', 'Move to project'); projectMove.onclick = () => projectManager.move(sessions.get(session.id)!); card.querySelector('.card-actions')!.prepend(projectMove);
   card.querySelector('.move-left')!.addEventListener('click', () => move(session.id, -1));
   card.querySelector('.move-right')!.addEventListener('click', () => move(session.id, 1));
   card.querySelector('.drag-handle')!.addEventListener('dragstart', event => { dragging = session.id; (event as DragEvent).dataTransfer!.effectAllowed = 'move'; (event as DragEvent).dataTransfer!.setData('text/plain', session.id); card.classList.add('dragging'); });
@@ -457,23 +466,31 @@ function renderCounts() {
 }
 
 function renderSide() {
-  const projects = new Map<string, { cwd: string; name: string; count: number }>();
-  const addProject = (cwd: string, name = projectPath(cwd).split(/[\\/]/).filter(Boolean).at(-1) ?? cwd) => { const key = projectKey(cwd); if (!projects.has(key)) projects.set(key, { cwd, name, count: 0 }); };
-  for (const project of importedProjects) addProject(project.cwd, project.name);
-  for (const session of sessions.values()) { addProject(session.cwd); projects.get(projectKey(session.cwd))!.count++; }
-  if (selectedProject) addProject(selectedProject);
-  $('#project-count').textContent = String(projects.size);
+  const projects = projectGroups(importedProjects, [...sessions.values()]);
+  if (selectedProject === 'unassigned' && !projects.some(project => project.key === 'unassigned')) projects.push({ key: 'unassigned', name: '', cwd: null, count: 0, favorite: false });
+  $('#project-count').textContent = String(importedProjects.length);
   $('#projects').replaceChildren();
-  for (const [key, { cwd, name, count }] of projects) { const row = document.createElement('button'); row.className = `project-row${selectedProject && projectKey(selectedProject) === key ? ' active' : ''}`; row.setAttribute('aria-pressed', String(!!selectedProject && projectKey(selectedProject) === key)); const label = document.createElement('span'); label.textContent = name; row.title = cwd; row.dataset.projectCwd = cwd; const total = document.createElement('small'); total.textContent = String(count); row.append(document.createTextNode('▱ '), label, total); row.onclick = () => selectProject(cwd); $('#projects').append(row); }
-  if (!projects.size) { const p = document.createElement('p'); p.className = 'side-empty'; bindText(p, '폴더를 가져와 작업을 시작하세요', 'Import a folder to get started'); $('#projects').append(p); }
-  const tabs = $('#project-tabs'); const focused = tabs.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.projectCwd : undefined; tabs.replaceChildren();
-  [{ cwd: '', name: '', count: sessions.size }, ...projects.values()].forEach(({ cwd, name, count }, index) => {
-    const tab = document.createElement('button'); const chosen = projectKey(cwd) === projectKey(selectedProject);
-    tab.id = `project-tab-${index}`; tab.className = `project-tab${chosen ? ' active' : ''}`; tab.dataset.projectCwd = cwd; tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(chosen)); tab.setAttribute('aria-controls', 'grid-area'); tab.tabIndex = chosen ? 0 : -1; if (cwd) tab.title = cwd; else bindAttribute(tab, 'title', '모든 프로젝트의 세션', 'Sessions from all projects');
-    const label = document.createElement('span'); if (cwd) label.textContent = name; else bindText(label, '전체', 'All'); const total = document.createElement('small'); total.textContent = String(count); tab.append(label, document.createTextNode(' '), total); tab.onclick = () => { selectProject(cwd); $('#project-tabs [aria-selected="true"]').focus(); }; tabs.append(tab);
+  for (const project of projects) {
+    const { key, cwd, name, count } = project;
+    const container = document.createElement('div'); container.className = 'project-item';
+    const row = document.createElement('button'); row.className = `project-row${selectedProject === key ? ' active' : ''}`; row.setAttribute('aria-pressed', String(selectedProject === key));
+    const label = document.createElement('span'); if (key === 'unassigned') bindText(label, '미분류', 'Unassigned'); else label.textContent = name;
+    row.title = cwd ?? t('실행 폴더 없음', 'No working folder'); row.dataset.projectCwd = cwd ?? ''; row.dataset.projectKey = key;
+    const total = document.createElement('small'); total.textContent = String(count); row.append(document.createTextNode(project.favorite ? '★ ' : '▱ '), label, total); row.onclick = () => selectProject(key); container.append(row);
+    if (project.id) { const manage = document.createElement('button'); manage.className = 'project-manage icon-button'; manage.dataset.projectId = project.id; manage.textContent = '⋯'; bindAttribute(manage, 'aria-label', `${name} 프로젝트 관리`, `Manage project ${name}`); manage.onclick = () => projectManager.open(importedProjects.find(item => item.id === project.id)!); row.oncontextmenu = event => { event.preventDefault(); manage.click(); }; container.append(manage); }
+    $('#projects').append(container);
+  }
+  if (!projects.length) { const p = document.createElement('p'); p.className = 'side-empty'; bindText(p, '프로젝트를 만들거나 폴더를 가져오세요', 'Create a project or import a folder'); $('#projects').append(p); }
+  const tabs = $('#project-tabs'); const focused = tabs.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.projectKey : undefined; tabs.replaceChildren();
+  [{ key: '', name: '', cwd: null, count: sessions.size, favorite: false }, ...projects].forEach(({ key, cwd, name, count, favorite }, index) => {
+    const tab = document.createElement('button'); const chosen = key === selectedProject;
+    tab.id = `project-tab-${index}`; tab.className = `project-tab${chosen ? ' active' : ''}`; tab.dataset.projectCwd = cwd ?? ''; tab.dataset.projectKey = key; tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(chosen)); tab.setAttribute('aria-controls', 'grid-area'); tab.tabIndex = chosen ? 0 : -1;
+    if (cwd) tab.title = cwd; else bindAttribute(tab, 'title', key ? '논리적 세션 묶음 · 실행 폴더와 별개' : '모든 프로젝트의 세션', key ? 'Session group independent of working folders' : 'Sessions from all projects');
+    const label = document.createElement('span'); if (key === 'unassigned') bindText(label, '미분류', 'Unassigned'); else if (key) label.textContent = name; else bindText(label, '전체', 'All');
+    const total = document.createElement('small'); total.textContent = String(count); if (favorite) tab.append(document.createTextNode('★ ')); tab.append(label, document.createTextNode(' '), total); tab.onclick = () => { selectProject(key); $('#project-tabs [aria-selected="true"]').focus(); }; tabs.append(tab);
     if (chosen) $('#grid-area').setAttribute('aria-labelledby', tab.id);
   });
-  if (focused !== undefined) [...tabs.querySelectorAll<HTMLElement>('[role="tab"]')].find(tab => projectKey(tab.dataset.projectCwd ?? '') === projectKey(focused))?.focus();
+  if (focused !== undefined) [...tabs.querySelectorAll<HTMLElement>('[role="tab"]')].find(tab => tab.dataset.projectKey === focused)?.focus();
   $('#session-list').replaceChildren();
   visibleOrder().forEach((id, index) => { const session = sessions.get(id)!; const button = document.createElement('button'); button.className = `session-link${active === id ? ' active' : ''}`; button.dataset.sessionLink = id; const dot = document.createElement('span'); dot.className = `status-dot ${session.state}`; const label = document.createElement('span'); label.textContent = session.title; const shortcut = document.createElement('small'); shortcut.textContent = index < 9 ? `⌥${index + 1}` : ''; button.append(dot, label, shortcut); button.onclick = () => focusSession(id); $('#session-list').append(button); });
 }
@@ -537,16 +554,17 @@ function renderAll() {
   renderCounts(); renderSide(); renderGrid();
 }
 
-function openCreate(cwd = selectedProject) { $('#create-error').hidden = true; if (cwd) { $<HTMLInputElement>('#session-cwd').value = projectPath(cwd); $<HTMLInputElement>('#session-thread').value = ''; } for (const field of createFields) validateRequired(field); $<HTMLDialogElement>('#create-dialog').showModal(); $<HTMLInputElement>('#session-title').focus(); }
+let createProjectId: string | null | undefined;
+function openCreate(cwd = selectedProjectCwd()) { createProjectId = selectedProjectId() ?? (selectedProject === 'unassigned' ? null : undefined); $('#create-error').hidden = true; $<HTMLInputElement>('#session-cwd').value = cwd ? projectPath(cwd) : ''; $<HTMLInputElement>('#session-thread').value = ''; for (const field of createFields) validateRequired(field); $<HTMLDialogElement>('#create-dialog').showModal(); $<HTMLInputElement>('#session-title').focus(); }
 const createFields = [$<HTMLInputElement>('#session-title'), $<HTMLInputElement>('#session-cwd')];
 function validateRequired(field: HTMLInputElement) { field.setCustomValidity(field.value.trim() ? '' : t('이 항목을 입력하세요.', 'Please fill out this field.')); }
 for (const field of createFields) { field.addEventListener('invalid', () => validateRequired(field)); field.addEventListener('input', () => validateRequired(field)); }
 const sessionBrowser = createSessionBrowser({
   call,
-  projectsChanged(projects) { importedProjects = projects; renderSide(); },
-  projectImported(project) { selectProject(project.cwd); },
+  projectsChanged(projects) { importedProjects = projects; if (selectedProject.startsWith('id:') && !selectedProjectId()) selectProject(''); else renderAll(); },
+  projectImported(project) { selectProject(`id:${project.id}`); },
   async openSession(session) {
-    const opening = start({ title: resumeTitle(session.title), cwd: session.cwd, threadId: session.id });
+    const opening = start({ title: resumeTitle(session.title), cwd: session.cwd, threadId: session.id, ...(selectedProjectId() ? { projectId: selectedProjectId(), projectAssigned: true } : selectedProject === 'unassigned' ? { projectId: null, projectAssigned: true } : {}) });
     const selectionVersion = projectSelectionVersion; const info = await opening;
     // The dialog restores focus when closing; refocus only the original tab intent.
     return () => { if (selectionVersion === projectSelectionVersion && isVisible(info.id)) focusSession(info.id); };
@@ -554,8 +572,24 @@ const sessionBrowser = createSessionBrowser({
   newSession: openCreate,
   notify,
 });
+const projectManager = createProjectManager({
+  call, projects: () => importedProjects,
+  async changed(project, deletedId) {
+    if (deletedId) {
+      const belongs = (session: SavedSession) => session.projectId === deletedId || (!session.projectAssigned && sessionProjectKey(session, importedProjects) === `id:${deletedId}`);
+      const unassign = <T extends SavedSession>(session: T): T => ({ ...session, projectId: null, projectAssigned: true, projectRevision: (session.projectRevision ?? 0) + 1 });
+      saved = saved.map(session => belongs(session) ? unassign(session) : session);
+      for (const session of sessions.values()) if (belongs(session)) receiveSession(unassign(session));
+    }
+    await sessionBrowser.refreshProjects();
+    if (project) selectProject(`id:${project.id}`);
+    scheduleSave();
+  },
+  moved(info) { receiveSession(info); selectProject(sessionProjectKey(info, importedProjects)); focusSession(info.id); },
+});
+$('#project-create').onclick = () => projectManager.open();
 for (const id of ['new-session', 'side-add', 'empty-add']) $(`#${id}`).onclick = () => openCreate();
-$('#catalog-open').onclick = () => void sessionBrowser.open(selectedProject || undefined);
+$('#catalog-open').onclick = () => void sessionBrowser.open(selectedProjectCwd());
 $('#project-import').onclick = () => void sessionBrowser.importProject();
 $('#project-tabs').addEventListener('keydown', event => {
   if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
@@ -563,12 +597,19 @@ $('#project-tabs').addEventListener('keydown', event => {
   const index = tabs.indexOf(event.target as HTMLElement); if (index < 0) return;
   event.preventDefault();
   const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length;
-  selectProject(tabs[next].dataset.projectCwd ?? ''); $('#project-tabs [aria-selected="true"]').focus();
+  selectProject(tabs[next].dataset.projectKey ?? ''); $('#project-tabs [aria-selected="true"]').focus();
 });
 const extensionsManager = createExtensionsManager({ call, notify });
+const mobileControl = createMobileControl({ call, notify });
+const weeklyUsage = createWeeklyUsage({ call });
+$('.sidebar-bottom').before(weeklyUsage.element);
 bindText($('#extensions-open-label'), '플러그인·스킬', 'Plugins & skills');
-$('#extensions-open').onclick = () => extensionsManager.open(selectedProject || undefined);
-const executableSettings = createExecutableSettings(call);
+$('#extensions-open').onclick = () => extensionsManager.open(selectedProjectCwd());
+const executableSettings = createExecutableSettings(async <T>(command: string, args?: Record<string, unknown>) => {
+  const result = await call<T>(command, args);
+  if (result && ['choose_codex_executable', 'set_codex_executable'].includes(command)) weeklyUsage.refresh();
+  return result;
+});
 $('#codex-settings-open').onclick = () => void executableSettings.open();
 for (const button of document.querySelectorAll<HTMLElement>('[data-close]')) button.onclick = () => button.closest('dialog')?.close();
 $('#column-options').onclick = event => { const button = (event.target as HTMLElement).closest<HTMLElement>('[data-columns]'); if (button) { columns = Number(button.dataset.columns); maximized = ''; renderGrid(); scheduleSave(); } };
@@ -593,7 +634,8 @@ $('#broadcast-form').onsubmit = async event => {
 
 async function start(request: SavedSession) {
   // Select at the user's intent, never when a delayed native start completes.
-  if (selectedProject && projectKey(selectedProject) !== projectKey(request.cwd)) selectProject(request.cwd);
+  const requestedProject = sessionProjectKey(request, importedProjects);
+  if (selectedProject && selectedProject !== requestedProject) selectProject(requestedProject);
   const selectionVersion = projectSelectionVersion;
   if (request.threadId) {
     const pending = pendingThreads.get(request.threadId);
@@ -619,7 +661,7 @@ async function start(request: SavedSession) {
       if (sessions.size + pendingStarts >= MAX_WORKSPACE_SESSIONS) throw new UiError(`작업 공간에는 시작 중인 세션을 포함해 최대 ${MAX_WORKSPACE_SESSIONS}개를 표시할 수 있습니다. 완료된 세션을 닫은 뒤 다시 시작하세요.`, `A workspace can display at most ${MAX_WORKSPACE_SESSIONS} sessions, including sessions that are starting. Close a finished session and try again.`);
       pendingStarts++; reserved = true;
       try {
-        const info = await call<SessionInfo>('start_session', { request: { ...request, cols: 100, rows: 30 } });
+        const info = await call<SessionInfo>('start_session', { request: { title: request.title, cwd: request.cwd, ...(request.threadId ? { threadId: request.threadId } : {}), ...(request.projectAssigned || request.projectId !== undefined ? { projectId: request.projectId ?? null, projectAssigned: true } : {}), cols: 100, rows: 30 } });
         if (!info.active || (sessions.get(info.id)?.generation ?? -1) < info.generation) receiveSession(info);
         if (selectionVersion === projectSelectionVersion) focusSession(info.id);
         queueResize(info.id);
@@ -641,7 +683,7 @@ async function start(request: SavedSession) {
 $('#create-form').onsubmit = async event => {
   event.preventDefault(); const button = $<HTMLButtonElement>('#create-submit'); button.disabled = true;
   const threadId = $<HTMLInputElement>('#session-thread').value.trim();
-  try { await start({ title: $<HTMLInputElement>('#session-title').value.trim(), cwd: $<HTMLInputElement>('#session-cwd').value.trim(), ...(threadId ? { threadId } : {}) }); $<HTMLDialogElement>('#create-dialog').close(); $<HTMLFormElement>('#create-form').reset(); }
+  try { await start({ title: $<HTMLInputElement>('#session-title').value.trim(), cwd: $<HTMLInputElement>('#session-cwd').value.trim(), ...(threadId ? { threadId } : {}), ...(createProjectId !== undefined ? { projectId: createProjectId, projectAssigned: true } : {}) }); $<HTMLDialogElement>('#create-dialog').close(); $<HTMLFormElement>('#create-form').reset(); }
   catch (error) { $('#create-error').hidden = false; showError($('#create-error'), error); } finally { button.disabled = false; }
 };
 $('#restore-open').onclick = () => {
@@ -672,12 +714,12 @@ $('#confirm-exit').onclick = async () => {
   button.disabled = true; extensionsButton.disabled = true; for (const control of dismissButtons) control.disabled = true; if (native) languageSelect.disabled = true;
   try {
     bindText(button, '확장 작업 완료를 기다리는 중…', 'Waiting for extension work to finish…');
-    await extensionsManager.beginExit();
+    await Promise.all([extensionsManager.beginExit(), mobileControl.beginExit(), weeklyUsage.beginExit()]);
     bindText(button, '종료 중…', 'Exiting…');
     clearTimeout(saveTimer); scheduleSave(); await new Promise(resolve => setTimeout(resolve, 450)); await saveQueue;
     if (native) await nativeLanguageQueue;
     await call('complete_exit', { confirmed: true }); completed = true;
-  } catch (error) { extensionsManager.cancelExit(); notifyError('앱 종료 실패', 'Could not exit app', error); }
+  } catch (error) { extensionsManager.cancelExit(); mobileControl.cancelExit(); weeklyUsage.cancelExit(); notifyError('앱 종료 실패', 'Could not exit app', error); }
   finally {
     button.disabled = false; dismissButtons.forEach((control, index) => { control.disabled = dismissStates[index]; }); bindText(button, '세션 종료 후 앱 닫기', 'Stop sessions and exit');
     if (!completed) { extensionsButton.disabled = extensionsWasDisabled; if (native) languageSelect.disabled = languageWasDisabled; }
@@ -710,6 +752,7 @@ async function initialize() {
     unlisteners.push(await listen<Output>('terminal-output', event => receiveOutput(event.payload)));
     unlisteners.push(await listen<SessionInfo>('session-changed', event => receiveSession(event.payload)));
     unlisteners.push(await listen<string>('application-error', event => notify(event.payload, true)));
+    unlisteners.push(await listen<boolean>('application-visibility', event => weeklyUsage.setVisible(event.payload)));
     unlisteners.push(await listen('exit-requested', () => { const dialog = $<HTMLDialogElement>('#exit-dialog'); if (!dialog.open) dialog.showModal(); }));
     const [layoutValue, existing] = await Promise.all([call<unknown>('load_layout'), call<SessionInfo[]>('list_sessions')]);
     const wrapper = layoutValue as { layout?: unknown; sessions?: SessionInfo[] } | null;

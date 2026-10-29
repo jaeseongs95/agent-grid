@@ -121,6 +121,41 @@ async fn import_project(engine: State<'_, Engine>, cwd: String) -> Result<projec
     tauri::async_runtime::spawn_blocking(move || engine.import_project(&cwd)).await.map_err(|e| format!("Import project worker: {e}"))?
 }
 #[tauri::command]
+async fn create_project(engine: State<'_, Engine>, name: String, cwd: Option<String>) -> Result<project::ProjectInfo, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.create_project(&name, cwd.as_deref())).await.map_err(|e| format!("Create project worker: {e}"))?
+}
+#[tauri::command]
+async fn rename_project(engine: State<'_, Engine>, id: String, name: String) -> Result<project::ProjectInfo, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.rename_project(&id, &name)).await.map_err(|e| format!("Rename project worker: {e}"))?
+}
+#[tauri::command]
+async fn set_project_favorite(engine: State<'_, Engine>, id: String, favorite: bool) -> Result<project::ProjectInfo, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.set_project_favorite(&id, favorite)).await.map_err(|e| format!("Favorite project worker: {e}"))?
+}
+#[tauri::command]
+async fn delete_project(engine: State<'_, Engine>, id: String) -> Result<(), String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.delete_project(&id)).await.map_err(|e| format!("Delete project worker: {e}"))?
+}
+#[tauri::command]
+async fn move_session_to_project(engine: State<'_, Engine>, id: String, generation: u64, project_id: Option<String>) -> Result<SessionInfo, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.move_session_to_project(&id, generation, project_id.as_deref())).await.map_err(|e| format!("Move session worker: {e}"))?
+}
+#[tauri::command]
+async fn choose_project_folder(app: tauri::AppHandle, picker: State<'_, project::FolderPicker>, ui: State<'_, UiSettings>) -> Result<Option<String>, String> {
+    let picker = picker.inner().clone();
+    let language = if ui.english.load(Ordering::Acquire) { ui_language::UiLanguage::En } else { ui_language::UiLanguage::Ko };
+    #[cfg(windows)]
+    let owner = app.get_webview_window("main").ok_or("Main window is unavailable")?.hwnd().map_err(|e| format!("Get project chooser parent window: {e}"))?.0 as isize;
+    #[cfg(not(windows))]
+    let owner = { let _ = app; 0 };
+    tauri::async_runtime::spawn_blocking(move || picker.choose(owner, language)).await.map_err(|e| format!("Project folder chooser worker: {e}"))?
+}
+#[tauri::command]
 async fn choose_project(app: tauri::AppHandle, engine: State<'_, Engine>, picker: State<'_, project::FolderPicker>, ui: State<'_, UiSettings>) -> Result<Option<project::ProjectInfo>, String> {
     let engine = engine.inner().clone();
     let picker = picker.inner().clone();
@@ -154,6 +189,16 @@ async fn extensions_mutate(engine: State<'_, Engine>, cwd: Option<String>, reque
     tauri::async_runtime::spawn_blocking(move || engine.extensions_mutate(cwd, request)).await.map_err(|e| format!("Extension mutation worker: {e}"))?
 }
 #[tauri::command]
+async fn mobile_control(engine: State<'_, Engine>, id: String, generation: u64, action: codex::MobileAction) -> Result<codex::MobileReply, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.mobile_control(&id, generation, action)).await.map_err(|e| format!("Mobile control worker: {e}"))?
+}
+#[tauri::command]
+async fn weekly_usage(engine: State<'_, Engine>) -> Result<codex::WeeklyUsageSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.weekly_usage()).await.map_err(|e| format!("Weekly usage worker: {e}"))?
+}
+#[tauri::command]
 async fn choose_skill_folder(app: tauri::AppHandle, picker: State<'_, project::FolderPicker>, ui: State<'_, UiSettings>) -> Result<Option<String>, String> {
     let picker = picker.inner().clone();
     let language = if ui.english.load(Ordering::Acquire) { ui_language::UiLanguage::En } else { ui_language::UiLanguage::Ko };
@@ -177,6 +222,8 @@ fn show_main(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         if let Err(error) = window.show().and_then(|_| window.unminimize()).and_then(|_| window.set_focus()) {
             let _ = app.emit("application-error", format!("cannot show main window: {error}"));
+        } else {
+            let _ = app.emit("application-visibility", true);
         }
     }
 }
@@ -220,12 +267,13 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, extensions_list, extensions_mutate, choose_skill_folder, complete_exit])
+        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, create_project, rename_project, set_project_favorite, delete_project, move_session_to_project, choose_project_folder, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, extensions_list, extensions_mutate, choose_skill_folder, mobile_control, weekly_usage, complete_exit])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<ExitState>().0.load(Ordering::Acquire) {
                     api.prevent_close();
                     if let Err(error) = window.hide() { let _ = window.emit("application-error", format!("cannot hide main window: {error}")); }
+                    else { let _ = window.emit("application-visibility", false); }
                 }
             }
         })

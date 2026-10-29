@@ -1,0 +1,8 @@
+.mobile-controls{width:min(600px,calc(100vw - 32px));max-height:85vh;overflow:auto}
+.mobile-controls .dialog-heading{display:flex;justify-content:space-between;align-items:center}
+.mobile-controls p,.mobile-controls small{line-height:1.7;overflow-wrap:anywhere}
+.mobile-controls label{display:block;margin:20px 0 8px}
+.mobile-controls select{width:100%;padding:10px;background:#141923;color:#dbe1ed;border:1px solid #3a4359;border-radius:5px}
+.mobile-control-actions{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}
+#mobile-control-pairing{margin:16px 0;padding:16px;background:#141923;border-radius:6px}
+#mobile-control-code{display:block;font-size:25px;letter-spacing:3px;user-select:all;overflow-wrap:anywhere}
