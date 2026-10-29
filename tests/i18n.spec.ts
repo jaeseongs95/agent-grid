@@ -237,6 +237,8 @@ test('failed native language save remains visible and the next explicit change c
 
 test('confirmed exit waits for the latest serialized language save and keeps selection disabled until native exit settles', async ({ page }) => {
   await nativeFixture(page);
+  // Startup now persists restart metadata before a later exit snapshot.
+  await expect.poll(async () => (await commands(page, ['save_layout'])).length).toBe(1);
   await page.evaluate(() => { const fixture = (window as any).i18nFixture; fixture.holdLanguageSaves = true; fixture.holdCompleteExit = true; });
   await switchLanguage(page, 'en');
   await expect.poll(async () => (await commands(page, ['set_ui_language'])).length).toBe(2);
@@ -244,7 +246,7 @@ test('confirmed exit waits for the latest serialized language save and keeps sel
   await page.locator('#settings-close').click();
   await page.locator('#exit').click();
   await page.locator('#confirm-exit').click();
-  await expect.poll(async () => (await commands(page, ['save_layout'])).length).toBe(1);
+  await expect.poll(async () => (await commands(page, ['save_layout'])).length).toBe(2);
   expect(await commands(page, ['complete_exit'])).toEqual([]);
   await page.evaluate(() => (window as any).i18nFixture.finishLanguageSave());
   await expect.poll(async () => (await commands(page, ['set_ui_language'])).length).toBe(3);

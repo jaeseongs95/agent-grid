@@ -83,6 +83,23 @@ Use **New session** to enter a directory directly. Use the official TUI to choos
 a model, sign in or answer permission prompts. Enter text directly in the terminal
 you want to control. Use **Shift+Enter** to insert a line break in the CLI prompt.
 
+## Restarting and restoring sessions
+
+After a complete exit, the app restores the workspace that was open at shutdown.
+Previously running sessions reconnect using their saved conversation IDs, keeping
+their titles, projects, grid order and sizes. It never resends previous input or
+loads an entire saved terminal transcript. Individually removed sessions stay closed.
+
+Sessions without conversation IDs, stopped sessions and entries saved by older
+versions without a restart intention never silently create new conversations.
+Unconnected entries remain available in the saved-session list for manual retry;
+a partial connection failure does not erase the remaining saved entries.
+Hiding the window to the tray and reopening it keeps the existing terminals running.
+
+Saved entries that are not running do not consume a concurrent-terminal slot.
+The existing resource limit of 32 terminals remains; automatic restoration leaves
+additional entries in the saved list when those terminal slots are full.
+
 ## Plugins and skills
 
 Open **⚙ Settings** in the upper-right corner, then **Plugins & skills**.

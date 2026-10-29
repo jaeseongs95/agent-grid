@@ -1,8 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { acceptOutput, chooseSavedSessions, parseLayout, projectGroups, sessionProjectKey, updateSession, type SessionInfo, type ProjectInfo } from './model.ts';
+import { acceptOutput, chooseSavedSessions, parseLayout, projectGroups, sessionProjectKey, savedSessionMetadata, updateSession, type SessionInfo, type ProjectInfo } from './model.ts';
 
 const base: SessionInfo = { id: 'owned', generation: 2, title: 'test', cwd: 'C:\\work', state: 'running', active: true };
+
+test('restart metadata preserves explicit intent and identity while excluding terminal output and coercions', () => {
+  const session = { ...base, sessionId: base.id, threadId: 'saved-thread', resumeOnStartup: true, output: 'private conversation', seq: 123 };
+  const metadata = savedSessionMetadata(session);
+  assert.deepEqual(metadata, { title: 'test', cwd: 'C:\\work', sessionId: 'owned', threadId: 'saved-thread', resumeOnStartup: true });
+  assert.deepEqual(parseLayout({ version: 1, sessions: [metadata] })?.sessions, [metadata]);
+  assert.deepEqual(parseLayout({ version: 1, sessions: [{ ...metadata, resumeOnStartup: 'true', sessionId: 42 }] })?.sessions, [{ title: 'test', cwd: 'C:\\work', threadId: 'saved-thread' }]);
+});
 
 test('logical project ownership overrides cwd while legacy sessions match only the exact Windows folder', () => {
   const projects: ProjectInfo[] = [{ id: 'folder', name: '폴더', cwd: 'D:\\Work\\Alpha', createdAt: 1, favorite: false }, { id: 'logical', name: '논리 묶음', cwd: null, createdAt: 2, favorite: true }, { id: 'empty', name: '빈 프로젝트', cwd: null, createdAt: 3, favorite: false }];
@@ -70,7 +78,7 @@ test('an explicitly empty saved workspace stays empty; only a missing layout fal
   assert.deepEqual(chooseSavedSessions(saved, history), [{ title: 'kept', cwd: 'C:\\kept' }]);
 });
 
-test('all 32 native session identities and row sizes round-trip; oversized layouts are bounded at 32', () => {
+test('terminal rows stay bounded at 32 while saved metadata uses a separate 512-entry budget', () => {
   const sessions = Array.from({ length: 32 }, (_, index) => ({ title: `session-${index}`, cwd: `C:\\project-${index}`, threadId: `thread-${index}` }));
   const rowSizes = Array.from({ length: 32 }, (_, index) => 1 + index / 32);
   const value = { version: 1, columns: 1, columnSizes: [1], rowSizes, sessions };
@@ -78,6 +86,8 @@ test('all 32 native session identities and row sizes round-trip; oversized layou
   assert.deepEqual(restored?.sessions, sessions);
   assert.deepEqual(restored?.rowSizes, rowSizes);
   const oversized = parseLayout({ ...value, rowSizes: [...rowSizes, 2, 3], sessions: [...sessions, { title: 'overflow', cwd: 'C:\\overflow', threadId: 'overflow' }] });
-  assert.deepEqual(oversized?.sessions, sessions);
+  assert.equal(oversized?.sessions.length, 33);
+  assert.equal(parseLayout({ ...value, sessions: Array.from({ length: 512 }, () => sessions[0]) })?.sessions.length, 512);
+  assert.throws(() => parseLayout({ ...value, sessions: Array.from({ length: 513 }, () => sessions[0]) }), RangeError);
   assert.deepEqual(oversized?.rowSizes, rowSizes);
 });

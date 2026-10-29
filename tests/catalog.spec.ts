@@ -231,14 +231,10 @@ for (const state of ['error', 'stopping'] as const) {
   });
 }
 
-test('saved workspace and catalog share the owned-thread guard across repeated restore clicks', async ({ page }) => {
+test('saved workspace reconciles an already owned thread and catalog keeps the same guard', async ({ page }) => {
   await mockNative(page, { owned: true, ownedState: 'error', saved: true });
-  for (let attempt = 0; attempt < 2; attempt++) {
-    await page.locator('#restore-open').click();
-    await page.locator('#restore-list').getByRole('button', { name: '이 대화 재개 →' }).click();
-    expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session'))).toEqual([]);
-    await page.locator('#restore-dialog').getByRole('button', { name: '닫기', exact: true }).click();
-  }
+  await expect(page.locator('#restore-banner')).toBeHidden();
+  expect(await page.evaluate(() => (window as any).fixture.calls.filter((call: any) => call.command === 'start_session'))).toEqual([]);
   await page.locator('#catalog-open').click();
   await expect(page.locator('#catalog-messages')).toContainText('ALPHA ONLY');
   await page.locator('#catalog-resume').click();

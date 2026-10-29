@@ -276,7 +276,7 @@ test('global capacity includes 31 hidden sessions and a pending start when an em
   await expect(page.locator('.terminal-card')).toHaveCount(31);
   await page.evaluate(() => { (window as any).tabsFixture.holdStart = true; });
   await page.locator('#restore-open').click();
-  await page.locator('#restore-list button').click();
+  await page.locator('#restore-list').getByRole('button', { name: '이 대화 재개 →' }).click();
   await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => call.command === 'start_session').length)).toBe(1);
   await page.locator('#restore-dialog [data-close]').click();
   await tab(page, 'Beta').click();

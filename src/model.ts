@@ -1,4 +1,5 @@
 export const MAX_WORKSPACE_SESSIONS = 32;
+export const MAX_SAVED_WORKSPACE_SESSIONS = 512;
 
 export interface SessionInfo {
   id: string;
@@ -46,8 +47,8 @@ export function projectGroups(projects: ProjectInfo[], sessions: SessionInfo[]):
   }
   return [...groups.values()].sort((a, b) => Number(!!b.favorite) - Number(!!a.favorite));
 }
-export function savedSessionMetadata({ title, cwd, threadId, projectId, projectAssigned, projectRevision }: SavedSession): SavedSession {
-  return { title, cwd, ...(threadId ? { threadId } : {}), ...(typeof projectId === 'string' || projectId === null ? { projectId } : {}), ...(typeof projectAssigned === 'boolean' ? { projectAssigned } : {}), ...(typeof projectRevision === 'number' && Number.isSafeInteger(projectRevision) && projectRevision >= 0 ? { projectRevision } : {}) };
+export function savedSessionMetadata({ title, cwd, threadId, projectId, projectAssigned, projectRevision, sessionId, resumeOnStartup }: SavedSession): SavedSession {
+  return { title, cwd, ...(typeof sessionId === 'string' && sessionId ? { sessionId } : {}), ...(typeof resumeOnStartup === 'boolean' ? { resumeOnStartup } : {}), ...(threadId ? { threadId } : {}), ...(typeof projectId === 'string' || projectId === null ? { projectId } : {}), ...(typeof projectAssigned === 'boolean' ? { projectAssigned } : {}), ...(typeof projectRevision === 'number' && Number.isSafeInteger(projectRevision) && projectRevision >= 0 ? { projectRevision } : {}) };
 }
 
 // A stale generation must never overwrite a newer process or feed its terminal.
@@ -63,7 +64,7 @@ export function acceptOutput(session: Session | undefined, output: Output): bool
   return !!session && session.id === output.id && session.generation === output.generation && output.seq > session.seq;
 }
 
-export interface SavedSession { title: string; cwd: string; threadId?: string; projectId?: string | null; projectAssigned?: boolean; projectRevision?: number }
+export interface SavedSession { sessionId?: string; resumeOnStartup?: boolean; title: string; cwd: string; threadId?: string; projectId?: string | null; projectAssigned?: boolean; projectRevision?: number }
 export interface Layout {
   version: 1;
   columns: number;
@@ -80,11 +81,12 @@ export function parseLayout(value: unknown): Layout | undefined {
   if (!value || typeof value !== 'object') return;
   const v = value as Partial<Layout>;
   if (v.version !== 1 || !Array.isArray(v.sessions)) return;
+  if (v.sessions.length > MAX_SAVED_WORKSPACE_SESSIONS) throw new RangeError('Saved workspace exceeds 512 metadata entries');
   const sizes = (value: unknown) => Array.isArray(value) ? value.slice(0, MAX_WORKSPACE_SESSIONS).map(n => typeof n === 'number' && Number.isFinite(n) ? Math.max(0.2, Math.min(10, n)) : 1) : [];
   return {
     version: 1,
     columns: typeof v.columns === 'number' && Number.isFinite(v.columns) ? Math.max(1, Math.min(4, Math.round(v.columns))) : 2,
     columnSizes: sizes(v.columnSizes), rowSizes: sizes(v.rowSizes),
-    sessions: v.sessions.filter(s => s && typeof s.title === 'string' && typeof s.cwd === 'string').slice(0, MAX_WORKSPACE_SESSIONS).map(s => savedSessionMetadata({ title: s.title, cwd: s.cwd, ...(typeof s.threadId === 'string' ? { threadId: s.threadId } : {}), ...(typeof s.projectId === 'string' || s.projectId === null ? { projectId: s.projectId } : {}), ...(typeof s.projectAssigned === 'boolean' ? { projectAssigned: s.projectAssigned } : {}), ...(typeof s.projectRevision === 'number' ? { projectRevision: s.projectRevision } : {}) })),
+    sessions: v.sessions.filter(s => s && typeof s.title === 'string' && typeof s.cwd === 'string').slice(0, MAX_SAVED_WORKSPACE_SESSIONS).map(s => savedSessionMetadata({ title: s.title, cwd: s.cwd, ...(typeof s.sessionId === 'string' ? { sessionId: s.sessionId } : {}), ...(typeof s.resumeOnStartup === 'boolean' ? { resumeOnStartup: s.resumeOnStartup } : {}), ...(typeof s.threadId === 'string' ? { threadId: s.threadId } : {}), ...(typeof s.projectId === 'string' || s.projectId === null ? { projectId: s.projectId } : {}), ...(typeof s.projectAssigned === 'boolean' ? { projectAssigned: s.projectAssigned } : {}), ...(typeof s.projectRevision === 'number' ? { projectRevision: s.projectRevision } : {}) })),
   };
 }
