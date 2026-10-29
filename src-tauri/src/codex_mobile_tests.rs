@@ -5,6 +5,81 @@ fn fixture_connection(endpoint: String) -> MobileConnection {
     MobileConnection(Arc::new(Management {endpoint,token:"fixture-private-capability".into(),job:Weak::new(),stopped:Arc::new(AtomicBool::new(false)),admission:Mutex::new(()),socket:Mutex::new(None),namespaced_remote:true}))
 }
 
+#[cfg(windows)]
+#[test]
+fn owned_mobile_server_fixture_child() {
+    let Some(ready) = env::var_os("OPENDIY_MOBILE_FIXTURE_READY") else { return; };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(ready, listener.local_addr().unwrap().to_string()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut ws = tungstenite::accept_hdr(stream, |request: &tungstenite::handshake::server::Request, response| {
+        assert_eq!(request.headers()["Authorization"], "Bearer fixture-private-capability");
+        Ok(response)
+    }).unwrap();
+    initialize_fixture(&mut ws);
+    let status = read(&mut ws);
+    assert_eq!(status["method"], "remoteControl/status/read");
+    reply(&mut ws, &status, status_value());
+    assert!(ws.read().is_err());
+    // Stay alive until the parent's last Job handle is closed.
+    loop { thread::sleep(Duration::from_millis(100)); }
+}
+
+#[cfg(windows)]
+#[test]
+fn real_owned_mobile_connection_pins_peer_and_does_not_keep_the_server_job_alive() {
+    let root = env::temp_dir().join(format!("opendiy-mobile-owned-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let ready = root.join("ready");
+    let (mut command, gate) = LaunchGate::wrap_std(env::current_exe().unwrap().as_os_str()).unwrap();
+    command.args(["--exact", "codex::mobile::tests::owned_mobile_server_fixture_child", "--nocapture"])
+        .env("OPENDIY_MOBILE_FIXTURE_READY", &ready).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    hidden(&mut command);
+    let child = command.spawn().unwrap();
+    struct OwnedFixture { child: Child, job: Option<Arc<ProcessJob>>, _gate: LaunchGate }
+    impl Drop for OwnedFixture {
+        fn drop(&mut self) {
+            self.job.take();
+            let _ = self.child.kill(); let _ = self.child.wait();
+        }
+    }
+    let mut owned = OwnedFixture { job:Some(Arc::new(ProcessJob::assign_std(&child).unwrap())), child, _gate:gate };
+    owned._gate.release().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let address = loop {
+        if let Ok(value) = std::fs::read_to_string(&ready) {
+            if value.parse::<std::net::SocketAddr>().is_ok() { break value; }
+        }
+        assert!(owned.child.try_wait().unwrap().is_none(), "owned mobile fixture exited before listening");
+        assert!(Instant::now() < deadline, "owned mobile fixture did not start");
+        thread::sleep(Duration::from_millis(20));
+    };
+    let endpoint = format!("ws://{address}");
+    let connection = MobileConnection::new(endpoint.clone(), "fixture-private-capability".into(), owned.job.as_ref().unwrap(), Arc::new(AtomicBool::new(false)), true);
+    let result = connection.request(MobileAction::Status).unwrap();
+    assert_eq!(result.status.unwrap().status, "connected");
+    assert_eq!(Arc::strong_count(owned.job.as_ref().unwrap()), 1, "management must not own the server Job");
+    let clone = connection.clone();
+    owned.job.take(); // KILL_ON_JOB_CLOSE must work while management clones still exist.
+    owned.child.wait().unwrap();
+    assert!(clone.0.job.upgrade().is_none());
+    assert!(clone.request(MobileAction::Status).is_err());
+
+    // A replacement listener must receive no bearer bytes from a stale handle.
+    let replacement = TcpListener::bind(address).unwrap();
+    let worker = thread::spawn(move || {
+        let (mut stream, _) = replacement.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut bytes = [0u8; 1];
+        assert_eq!(stream.read(&mut bytes).unwrap(), 0);
+    });
+    assert!(clone.request(MobileAction::Status).err().unwrap().contains("종료"));
+    worker.join().unwrap();
+    drop(owned);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn legacy_cli_mobile_mutations_are_rejected_before_connecting() {
     let mut connection = fixture_connection("ws://127.0.0.1:1".into());

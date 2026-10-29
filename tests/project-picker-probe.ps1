@@ -22,8 +22,8 @@ $currentSession = (Get-Process -Id $PID).SessionId
 if ($appProcess.StartTime.ToUniversalTime() -lt [DateTime]::UtcNow.AddMinutes(-20)) { throw 'Refusing a process older than twenty minutes' }
 if ($appProcess.SessionId -ne $currentSession) { throw 'Target is in another Windows session' }
 if (-not [string]::Equals([IO.Path]::GetFullPath($appProcess.Path), $expectedExecutablePath, [StringComparison]::OrdinalIgnoreCase)) { throw 'Target executable path does not match' }
-$mainWindow = $appProcess.MainWindowHandle
-if ($mainWindow -eq [IntPtr]::Zero -or $appProcess.MainWindowTitle -ne 'OpenDIY Desktop') { throw 'Target does not have the expected OpenDIY Desktop main window' }
+# The active native modal can be returned as Process.MainWindowHandle.
+# Resolve the unique owned top-level app window by its exact title instead.
 
 Add-Type -TypeDefinition @'
 using System;
@@ -65,6 +65,16 @@ public static class AgentGridPickerProbe {
         if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || !OwnedBy(hwnd,pid) || WindowClass(hwnd)!="#32770" || GetWindow(hwnd,4)!=owner) return false;
         var text=new StringBuilder(256); GetWindowTextW(hwnd,text,text.Capacity); return text.ToString()==title && HasModernFolderView(hwnd,pid);
     }
+    public static IntPtr[] FindMainWindows(uint pid) {
+        var matches=new List<IntPtr>();
+        EnumWindows(delegate(IntPtr hwnd,IntPtr unused) {
+            if(!OwnedBy(hwnd,pid) || !IsWindowVisible(hwnd) || GetWindow(hwnd,4)!=IntPtr.Zero || WindowClass(hwnd)=="#32770") return true;
+            var text=new StringBuilder(256); GetWindowTextW(hwnd,text,text.Capacity);
+            if(text.ToString()=="OpenDIY Desktop") matches.Add(hwnd);
+            return true;
+        },IntPtr.Zero);
+        return matches.ToArray();
+    }
     public static IntPtr[] FindDialogs(uint pid, IntPtr owner, string title) {
         var matches=new List<IntPtr>();
         EnumWindows(delegate(IntPtr hwnd,IntPtr unused) { if(OwnedBy(hwnd,pid) && IsExpectedDialog(hwnd,pid,owner,title)) matches.Add(hwnd); return true; },IntPtr.Zero);
@@ -75,9 +85,18 @@ public static class AgentGridPickerProbe {
         EnumChildWindows(dialog,delegate(IntPtr child,IntPtr unused) {
             if(++visited>512) return false;
             if(!OwnedBy(child,pid) || !IsWindowVisible(child) || !IsWindowEnabled(child) || WindowClass(child)!="Edit") return true;
-            // The modern file dialog's folder input is inside cmb13=1148.
-            // Do not use an address-bar Edit or accept the classic edt1 control.
-            bool filename=false;
+            // The observed Windows folder picker uses edt1=1152 directly under
+            // the owned modern dialog, paired with stc3=1090 "Folder:".
+            // DirectUI plus the exact folder label distinguishes it from a classic dialog.
+            var label=GetDlgItem(dialog,1090); var labelText=new StringBuilder(128);
+            if(label!=IntPtr.Zero) GetWindowTextW(label,labelText,labelText.Capacity);
+            bool filename=GetDlgCtrlID(child)==1152 && GetParent(child)==dialog
+                && HasModernFolderView(dialog,pid) && label!=IntPtr.Zero && OwnedBy(label,pid)
+                && IsWindowVisible(label) && WindowClass(label)=="Static"
+                && (labelText.ToString()=="\uD3F4\uB354:" || labelText.ToString()=="Folder:");
+            // Retain the separately identified modern cmb13=1148 filename layout.
+            // Address-band Edit controls never have this ancestry.
+
             IntPtr parent=GetParent(child);
             for(int depth=0; !filename && depth<8 && parent!=IntPtr.Zero && parent!=dialog; depth++) {
                 if(!OwnedBy(parent,pid)) break;
@@ -105,6 +124,10 @@ public static class AgentGridPickerProbe {
     }
 }
 '@
+
+$mainWindows = [AgentGridPickerProbe]::FindMainWindows($AppProcessId)
+if ($mainWindows.Length -ne 1) { throw 'Expected one owned OpenDIY Desktop main window; refusing ambiguous action' }
+$mainWindow = $mainWindows[0]
 
 function Assert-ProcessIdentity {
     $observed = Get-Process -Id $AppProcessId -ErrorAction Stop

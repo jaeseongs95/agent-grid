@@ -445,3 +445,36 @@ test('an older catalog registry read cannot remove a project created while that 
   await expect(created).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('#projects [data-project-id="project-3"]')).toBeVisible();
 });
+
+for (const scenario of ['return', 'hidden-output', 'move', 'same-project'] as const) test(`project selection shows the latest terminal conversation after ${scenario}`, async ({ page }) => {
+  await workspace(page);
+  await tab(page, 'Alpha').click();
+  const rows = card(page, 'a1').locator('.xterm-rows');
+  await page.evaluate(() => {
+    const fixture = (window as any).tabsFixture;
+    fixture.latestNode = document.querySelector('.terminal-card[data-id="a1"] .xterm');
+    fixture.emit('terminal-output', { id: 'a1', generation: 7, seq: 1, data: Array.from({ length: 120 }, (_, index) => `HISTORY_${String(index).padStart(3, '0')}\r\n`).join('') + 'LATEST_BEFORE' });
+  });
+  await expect(rows).toContainText('LATEST_BEFORE');
+  await card(page, 'a1').locator('.xterm-helper-textarea').press('Shift+PageUp');
+  await expect(rows).toContainText('HISTORY_');
+  await expect(rows).not.toContainText('LATEST_BEFORE');
+  let latest = 'LATEST_BEFORE';
+  if (scenario === 'return' || scenario === 'hidden-output') {
+    await tab(page, 'Beta').click();
+    if (scenario === 'hidden-output') {
+      latest = 'LATEST_WHILE_HIDDEN';
+      await page.evaluate(() => (window as any).tabsFixture.emit('terminal-output', { id: 'a1', generation: 7, seq: 2, data: '\r\n' + 'HIDDEN_HISTORY\r\n'.repeat(80) + 'LATEST_WHILE_HIDDEN' }));
+      await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.calls.some((call: any) => call.command === 'session_output_ack' && call.args.id === 'a1' && call.args.seq === 2))).toBe(true);
+    }
+    await tab(page, 'Alpha').click();
+  } else {
+    await card(page, 'a1').getByLabel('프로젝트로 이동', { exact: true }).click();
+    await page.locator('#project-move-target').selectOption(scenario === 'move' ? 'beta' : 'alpha');
+    await page.locator('#project-move-confirm').click();
+    await expect(page.locator('#project-move-dialog')).toBeHidden();
+  }
+  await expect(rows).toContainText(latest);
+  expect(await page.evaluate(() => (window as any).tabsFixture.latestNode === document.querySelector('.terminal-card[data-id="a1"] .xterm'))).toBe(true);
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => ['start_session', 'session_stop', 'session_write', 'catalog_preview'].includes(call.command)))).toEqual([]);
+});

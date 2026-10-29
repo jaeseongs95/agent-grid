@@ -65,7 +65,8 @@ its group without restarting its terminal or changing its actual working directo
 
 Use the project tabs above the grid, or click a project in the sidebar, to
 view that project's sessions. **All** shows every session. Switching tabs keeps
-all terminals running and retains their output; group input and keyboard
+all terminals running and retains their output. Switching projects or moving a session
+shows its latest terminal output; group input and keyboard
 session shortcuts apply only to the visible project. When the selected project has
 a default folder, new sessions and the session browser start with that directory.
 

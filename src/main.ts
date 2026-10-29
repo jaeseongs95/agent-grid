@@ -280,6 +280,15 @@ function selectProject(key: string) {
   for (const [id, view] of terminals) { view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); refreshInputState(id); if (!isVisible(id)) view.terminal.blur(); }
   bindText($('#search-result'), '', ''); $('#broadcast-results').hidden = true;
   renderAll();
+  const selectionVersion = projectSelectionVersion;
+  for (const id of visibleOrder()) {
+    const view = terminals.get(id)!; const generation = sessions.get(id)!.generation;
+    // 선행 출력 파싱 뒤, 현재 선택과 터미널에만 최신 화면 위치를 적용한다.
+    view.terminal.write('', () => {
+      if (projectSelectionVersion !== selectionVersion || terminals.get(id) !== view || sessions.get(id)?.generation !== generation || view.card.hidden) return;
+      view.fit.fit(); view.terminal.scrollToBottom();
+    });
+  }
 }
 function focusSession(id: string) {
   const session = sessions.get(id); if (!session) return;

@@ -4,6 +4,8 @@ use super::*;
 use std::{fs, path::PathBuf, sync::atomic::AtomicBool};
 
 const MAX_ROWS: usize = 4096;
+// 실제 카탈로그는 9천 개를 넘는다. CLI 원문 8 MiB 제한도 별도로 유지한다.
+const MAX_PLUGIN_ROWS: usize = 16384;
 const MAX_IMPORT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_IMPORT_FILES: usize = 1024;
 // ponytail: one admission lock keeps extension mutations/readbacks coherent;
@@ -164,7 +166,12 @@ fn optional_text(value: &Value, key: &str, maximum: usize) -> Result<Option<Stri
     if value[key].is_null() { Ok(None) } else { text(value, key, maximum).map(Some) }
 }
 fn rows<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, String> {
-    value[key].as_array().filter(|rows| rows.len() <= MAX_ROWS).ok_or_else(|| format!("Extension response has no bounded {key} array"))
+    bounded_rows(value, key, MAX_ROWS)
+}
+fn bounded_rows<'a>(value: &'a Value, key: &str, maximum: usize) -> Result<&'a Vec<Value>, String> {
+    let rows = value[key].as_array().ok_or_else(|| format!("Extension response has no {key} array"))?;
+    if rows.len() > maximum { return Err(format!("Extension {key} array exceeded {maximum} entries")); }
+    Ok(rows)
 }
 fn source(value: &Value) -> Result<String, String> {
     if !value.is_object() { return Err("Extension source is not an object".into()); }
@@ -183,10 +190,12 @@ fn parse_plugin(value: &Value) -> Result<ExtensionPlugin, String> {
     })
 }
 fn parse_plugins(value: &Value) -> Result<ExtensionPlugins, String> {
-    if rows(value, "installed")?.len() + rows(value, "available")?.len() > MAX_ROWS { return Err("Plugin list exceeded 4096 entries".into()); }
+    let installed = bounded_rows(value, "installed", MAX_PLUGIN_ROWS)?;
+    let available = bounded_rows(value, "available", MAX_PLUGIN_ROWS)?;
+    if installed.len() + available.len() > MAX_PLUGIN_ROWS { return Err(format!("Plugin list exceeded {MAX_PLUGIN_ROWS} entries")); }
     Ok(ExtensionPlugins {
-        installed: rows(value, "installed")?.iter().map(parse_plugin).collect::<Result<_, _>>()?,
-        available: rows(value, "available")?.iter().map(parse_plugin).collect::<Result<_, _>>()?,
+        installed: installed.iter().map(parse_plugin).collect::<Result<_, _>>()?,
+        available: available.iter().map(parse_plugin).collect::<Result<_, _>>()?,
     })
 }
 fn parse_marketplaces(value: &Value) -> Result<Vec<ExtensionMarketplace>, String> {
@@ -524,6 +533,35 @@ mod tests {
         let plugins = parse_plugins(&json!({"installed":[plugin],"available":[]})).unwrap();
         assert_eq!(plugins.installed[0].plugin_id, "name@one");
         assert!(parse_skills(&json!({"data":[{"skills":[],"errors":[{"path":"broken","message":"bad YAML"}]}]})).unwrap().1.len() == 1);
+    }
+    #[test]
+    fn plugin_catalog_accepts_observed_size_but_preserves_shape_and_combined_bounds() {
+        let plugin = json!({"pluginId":"name@one","name":"name","marketplaceName":"one","version":null,"enabled":true,"source":{"source":"remote","id":"fixture"}});
+        let catalog = json!({"installed":vec![plugin.clone();20],"available":vec![plugin.clone();9161]});
+        let parsed = parse_plugins(&catalog).unwrap();
+        assert_eq!(parsed.installed.len(), 20);
+        assert_eq!(parsed.available.len(), 9161);
+        assert!(parse_plugins(&json!({"installed":[],"available":vec![plugin.clone();16384]})).is_ok());
+        let error = parse_plugins(&json!({"installed":[plugin.clone()],"available":vec![plugin.clone();16384]})).err().unwrap();
+        assert!(error.contains("16384"), "{error}");
+        let error = parse_plugins(&json!({"installed":[],"available":vec![plugin.clone();16385]})).err().unwrap();
+        assert!(error.contains("16384"), "{error}");
+        for invalid in [json!({}), json!({"installed":[]}), json!({"available":[]}), json!({"installed":[],"available":null}), json!({"installed":[],"available":{}}), json!({"installed":[],"available":[{}]})] {
+            assert!(parse_plugins(&invalid).is_err());
+        }
+        assert!(rows(&json!({"data":vec![Value::Null;4097]}), "data").is_err());
+        assert!(parse_marketplaces(&json!({"marketplaces":vec![Value::Null;4097]})).is_err());
+    }
+    #[test]
+    #[ignore = "선택한 실제 CLI의 조회 명령만 명시적으로 실행한다"]
+    fn selected_cli_plugin_catalog_is_parsed_without_configuration_changes() {
+        let exe = env::var_os("AGENT_GRID_EXTENSION_READ_ONLY_EXE").expect("조회할 CLI 실행 파일 환경 변수가 필요하다");
+        let cwd = PathBuf::from(env::var_os("AGENT_GRID_EXTENSION_READ_ONLY_CWD").expect("조회할 실행 폴더 환경 변수가 필요하다"));
+        let Ok(value) = cli_args(&exe, &cwd, &["plugin", "list", "--available", "--json"]) else { panic!("실제 플러그인 조회 실패: 원문 오류는 비밀 보존을 위해 출력하지 않는다"); };
+        let parsed = parse_plugins(&value);
+        assert!(parsed.is_ok(), "실제 플러그인 응답 해석 실패: 원문 값은 출력하지 않는다");
+        let parsed = parsed.unwrap();
+        println!("실제 조회 응답 해석 통과: 설치됨={}, 설치 가능={}", parsed.installed.len(), parsed.available.len());
     }
     #[test]
     fn output_capture_is_bounded() {
