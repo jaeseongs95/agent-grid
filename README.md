@@ -99,6 +99,11 @@ session again to return to recent messages. Closing the popup releases its rows,
 preview and selection; conversation bodies are not copied into the app database.
 The extensions popup initially renders 50 rows, keeps at most 250 row elements,
 and releases fetched data on close.
+Terminal input also has bounded admission: at most 128 accepted requests and 256 KiB
+including the current write, with the native 64 KiB per-request ceiling. Input pauses
+under pressure and resumes after draining; oversized or unaccepted input is reported.
+Resize keeps one current request and the latest unsent size. Disposing a terminal
+releases queued input and geometry. Restored sessions initially load metadata only.
 These bounds and lifecycle tests are not a claim of a completed long-duration leak test.
 
 Existing saved settings and projects from Agent Grid are preserved. The longer-term

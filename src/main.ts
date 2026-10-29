@@ -9,6 +9,7 @@ import { MAX_WORKSPACE_SESSIONS, acceptOutput, broadcast, broadcastTargets, choo
 import { createSessionBrowser, type ProjectInfo } from './session-browser';
 import { createExecutableSettings } from './executable-settings';
 import { createExtensionsManager } from './extensions';
+import { InputQueueError, TerminalInputQueue, TerminalResizeQueue } from './terminal-flow';
 import { bindAttribute, bindText, getLanguage, languageStorageError, onLanguageChange, setLanguage, t } from './i18n';
 
 const native = isTauri();
@@ -18,7 +19,9 @@ const states: Record<string, [string, string]> = { restored: ['저장됨 · 미�
 function stateLabels(state: string): [string, string] { return states[state] ?? states.unknown; }
 const sessions = new Map<string, Session>();
 const selected = new Set<string>();
-const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; input: Promise<void>; resize: Promise<void>; resizeTimer?: ReturnType<typeof setTimeout> }>();
+interface QueuedInput { data: string; generation: number; selectionVersion: number; broadcast?: boolean }
+interface QueuedResize { generation: number; selectionVersion: number; cols: number; rows: number }
+const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; input: TerminalInputQueue<QueuedInput>; resize: TerminalResizeQueue<QueuedResize>; inputWarning: boolean; resizeTimer?: ReturnType<typeof setTimeout> }>();
 const pending = new Map<string, Output[]>();
 const resolving = new Set<string>();
 const unlisteners: UnlistenFn[] = [];
@@ -266,7 +269,7 @@ function selectProject(cwd: string) {
   projectSelectionVersion++; selectedProject = cwd; maximized = ''; dragging = '';
   for (const id of selected) if (!isVisible(id)) selected.delete(id);
   if (!isVisible(active)) active = visibleOrder()[0] ?? '';
-  for (const [id, view] of terminals) { view.terminal.options.disableStdin = !native || !isVisible(id); if (!isVisible(id)) view.terminal.blur(); }
+  for (const [id, view] of terminals) { view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); refreshInputState(id); if (!isVisible(id)) view.terminal.blur(); }
   bindText($('#search-result'), '', ''); $('#broadcast-results').hidden = true;
   renderAll();
 }
@@ -311,27 +314,40 @@ function setActive(id: string, focus = true) {
   if (focus) terminals.get(id)?.terminal.focus();
 }
 
+function canType(id: string) {
+  const session = sessions.get(id);
+  return native && !!session?.active && isVisible(id) && !['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(session.state);
+}
+function refreshInputState(id: string) {
+  const view = terminals.get(id); if (!view) return;
+  view.terminal.options.disableStdin = !canType(id) || view.input.paused || view.input.disposed;
+  view.card.dataset.inputPending = String(view.input.size); view.card.dataset.inputBytes = String(view.input.byteLength);
+  const paused = String(view.input.paused);
+  if (view.card.dataset.inputPaused !== paused) {
+    view.card.dataset.inputPaused = paused;
+    bindText(view.card.querySelector('.terminal-hint')!, view.input.paused ? '입력 전송 대기 중 · 완료되면 입력이 재개됩니다' : '직접 입력 · IME · 붙여넣기', view.input.paused ? 'Input paused until pending writes finish' : 'Direct input · IME · paste');
+  }
+  if (!view.input.size) view.inputWarning = false;
+}
+function inputError(error: unknown) {
+  return error instanceof InputQueueError ? new UiError(error.reason === 'message' ? '한 번에 64KiB 이하로 입력하세요. 이 입력은 전송하지 않았습니다.' : error.reason === 'full' ? '입력 전송 대기열이 가득 찼습니다. 이 입력은 전송하지 않았습니다. 완료 후 다시 시도하세요.' : '대기 중 프로젝트 또는 세션 상태가 변경되어 전송하지 않았습니다.', error.reason === 'message' ? 'Input must be at most 64KiB per operation. This input was not sent.' : error.reason === 'full' ? 'The input queue is full. This input was not sent. Retry after pending writes finish.' : 'Not sent because the project or session state changed while queued.') : error;
+}
 function sendInput(id: string, data: string) {
   const session = sessions.get(id); const view = terminals.get(id);
-  if (!session || !session.active || !view || !isVisible(id) || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(session.state)) return;
-  const generation = session.generation; const selectionVersion = projectSelectionVersion;
-  view.input = view.input.then(() => {
-    const current = sessions.get(id);
-    if (selectionVersion !== projectSelectionVersion || !current?.active || !isVisible(id) || current.generation !== generation || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(current.state)) return;
-    return call<void>('session_write', { id, generation, data });
-  }).catch(error => notifyError(`${session.title} 입력 실패`, `${session.title} input failed`, error));
+  if (!session || !view || !canType(id)) return;
+  void view.input.enqueue({ data, generation: session.generation, selectionVersion: projectSelectionVersion }).catch(error => {
+    if (error instanceof InputQueueError && error.reason === 'cancelled') return;
+    if (error instanceof InputQueueError && view.inputWarning) return;
+    if (error instanceof InputQueueError) view.inputWarning = true;
+    notifyError(`${session.title} 입력 실패`, `${session.title} input failed`, inputError(error));
+  });
 }
 
 function queueResize(id: string) {
-  const view = terminals.get(id); if (!native || !view) return;
+  const view = terminals.get(id); const session = sessions.get(id); if (!native || !view || !session) return;
   clearTimeout(view.resizeTimer);
-  view.resizeTimer = setTimeout(() => {
-    view.resize = view.resize.then(async () => {
-      const current = sessions.get(id);
-      if (!current || !current.active || !isVisible(id) || ['restored', 'starting', 'stopping', 'stopped', 'exited'].includes(current.state)) return;
-      await call('session_resize', { id, generation: current.generation, cols: view.terminal.cols, rows: view.terminal.rows });
-    }).catch(error => notifyError('터미널 크기 변경 실패', 'Could not resize terminal', error));
-  }, 60);
+  const generation = session.generation; const selectionVersion = projectSelectionVersion;
+  view.resizeTimer = setTimeout(() => view.resize.enqueue({ generation, selectionVersion, cols: view.terminal.cols, rows: view.terminal.rows }), 60);
 }
 
 function createTerminal(session: Session) {
@@ -344,7 +360,18 @@ function createTerminal(session: Session) {
   let frame = 0;
   const observer = new ResizeObserver(() => { cancelAnimationFrame(frame); frame = requestAnimationFrame(() => { if (card.offsetWidth && card.offsetHeight) fit.fit(); }); });
   observer.observe(card.querySelector('.terminal-host')!);
-  terminals.set(session.id, { terminal, fit, search, card, observer, input: Promise.resolve(), resize: Promise.resolve() });
+  const input = new TerminalInputQueue<QueuedInput>(async value => {
+    const current = sessions.get(session.id);
+    if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || !canType(session.id) || (value.broadcast && !writable(current))) throw new InputQueueError('cancelled');
+    await call<void>('session_write', { id: session.id, generation: value.generation, data: value.data });
+  }, () => refreshInputState(session.id));
+  const resize = new TerminalResizeQueue<QueuedResize>(async value => {
+    const current = sessions.get(session.id);
+    if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || !canType(session.id)) return;
+    await call('session_resize', { id: session.id, generation: value.generation, cols: value.cols, rows: value.rows });
+  }, error => notifyError('터미널 크기 변경 실패', 'Could not resize terminal', error));
+  terminals.set(session.id, { terminal, fit, search, card, observer, input, resize, inputWarning: false });
+  refreshInputState(session.id);
   terminal.onData(data => sendInput(session.id, data));
   terminal.onResize(() => queueResize(session.id));
   terminal.attachCustomKeyEventHandler(event => !(event.type === 'keydown' && ((event.altKey && /^[1-9]$/.test(event.key)) || (event.ctrlKey && event.key === 'Tab') || (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'f'))));
@@ -372,7 +399,7 @@ function createTerminal(session: Session) {
 }
 
 function move(id: string, offset: number) { const visible = visibleOrder(); const index = visible.indexOf(id); const next = index + offset; if (index < 0 || next < 0 || next >= visible.length) return; const from = order.indexOf(id); const to = order.indexOf(visible[next]); [order[from], order[to]] = [order[to], order[from]]; renderGrid(); renderSide(); scheduleSave(); }
-function removeSession(id: string) { const view = terminals.get(id); clearTimeout(view?.resizeTimer); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); selected.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
+function removeSession(id: string) { const view = terminals.get(id); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); selected.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
 
 function receiveSession(info: SessionInfo, persist = true) {
   const previous = sessions.get(info.id); const session = updateSession(previous, info);
@@ -380,7 +407,7 @@ function receiveSession(info: SessionInfo, persist = true) {
   sessions.set(session.id, session);
   if (!order.includes(session.id)) order.push(session.id);
   const terminal = terminals.get(session.id)?.terminal ?? createTerminal(session);
-  if (previous && previous.generation !== session.generation) terminal.reset();
+  if (previous && previous.generation !== session.generation) { const view = terminals.get(session.id)!; view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); terminal.reset(); }
   if (previous && previous.state !== session.state) notify(`${session.title} · ${stateLabels(session.state)[0]}`, false, `${session.title} · ${stateLabels(session.state)[1]}`);
   renderAll();
   if (!previous || previous.state === 'starting') queueResize(session.id);
@@ -460,7 +487,7 @@ function renderGrid() {
   while (rowSizes.length < rows) rowSizes.push(1);
   grid.style.gridTemplateColumns = maximized ? 'minmax(0,1fr)' : columnSizes.slice(0, count).map(size => `minmax(0,${size}fr)`).join(' ');
   grid.style.gridTemplateRows = maximized ? 'minmax(0,1fr)' : rowSizes.slice(0, rows).map(size => `minmax(0,${size}fr)`).join(' ');
-  order.forEach((id, index) => { const view = terminals.get(id)!; view.card.hidden = !isVisible(id) || (!!maximized && id !== maximized); view.terminal.options.disableStdin = !native || !isVisible(id); if (grid.children[index] !== view.card) grid.insertBefore(view.card, grid.children[index] ?? null); });
+  order.forEach((id, index) => { const view = terminals.get(id)!; view.card.hidden = !isVisible(id) || (!!maximized && id !== maximized); refreshInputState(id); if (grid.children[index] !== view.card) grid.insertBefore(view.card, grid.children[index] ?? null); });
   $('#empty').hidden = visible.length > 0;
   bindText($('#empty h2'), selectedProject ? '이 프로젝트에 열린 세션이 없습니다' : '다음 작업을 펼쳐 보세요', selectedProject ? 'No open sessions in this project' : 'Open your next task');
   bindText($('#empty p'), selectedProject ? '새 세션을 만들거나 세션 불러오기에서 기존 대화를 이어가세요. 다른 프로젝트의 세션은 계속 실행됩니다.' : '프로젝트 경로를 선택해 첫 세션을 시작하세요. 각 세션은 독립된 터미널에서 실행됩니다.', selectedProject ? 'Create a session or load an existing conversation. Sessions in other projects keep running.' : 'Choose a project path to start your first session. Each session runs in its own terminal.');
@@ -556,12 +583,8 @@ $('#broadcast-form').onsubmit = async event => {
   const failures = new Map<string, unknown>();
   const outcomes = await broadcast(targets, id => sessions.get(id), target => {
     const view = terminals.get(target.id);
-    const operation = (view?.input ?? Promise.resolve()).then(async () => {
-      const current = sessions.get(target.id);
-      if (selectionVersion !== projectSelectionVersion || !current || !isVisible(target.id) || current.generation !== target.generation || !writable(current)) throw new UiError('대기 중 프로젝트 또는 세션 상태가 변경되어 전송하지 않았습니다.', 'Not sent because the project or session state changed while queued.');
-      await call('session_write', { id: target.id, generation: target.generation, data });
-    }).catch(error => { failures.set(target.id, error); throw error; });
-    if (view) view.input = operation.catch(() => {}); // Outcome is shown per target below; keep the input queue usable.
+    const operation = (view ? view.input.enqueue({ data, generation: target.generation, selectionVersion, broadcast: true }) : Promise.reject(new InputQueueError('cancelled')))
+      .catch(error => { const detail = inputError(error); failures.set(target.id, detail); throw detail; });
     return operation;
   });
   results.replaceChildren(...outcomes.map(outcome => { const item = document.createElement('span'); bindText(item, `${outcome.title}: ${outcome.status === 'sent' ? '전송됨' : outcome.status === 'skipped' ? '상태 변경으로 건너뜀' : `실패 — ${failures.has(outcome.id) ? message(failures.get(outcome.id), 'ko') : outcome.error}`}`, `${outcome.title}: ${outcome.status === 'sent' ? 'Sent' : outcome.status === 'skipped' ? 'Skipped after state change' : `Failed — ${failures.has(outcome.id) ? message(failures.get(outcome.id), 'en') : outcome.error}`}`); return item; }));
@@ -711,5 +734,5 @@ function seedDemo() {
   setActive('demo-0', false);
 }
 
-window.addEventListener('beforeunload', () => { for (const unlisten of unlisteners) unlisten(); for (const view of terminals.values()) { clearTimeout(view.resizeTimer); view.observer.disconnect(); view.terminal.dispose(); } });
+window.addEventListener('beforeunload', () => { for (const unlisten of unlisteners) unlisten(); for (const view of terminals.values()) { clearTimeout(view.resizeTimer); view.input.dispose(); view.resize.dispose(); view.observer.disconnect(); view.terminal.dispose(); } });
 void initialize();
