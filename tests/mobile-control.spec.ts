@@ -5,7 +5,7 @@ async function workspace(page: Page) {
     const state = window as any;
     state.isTauri = true;
     let callback = 0;
-    state.mobileFixture = { calls: [], status: 'disabled', hold: false, failure: false, release: () => {} };
+    state.mobileFixture = { calls: [], status: 'disabled', isolated: true, hold: false, failure: false, release: () => {} };
     state.__TAURI_INTERNALS__ = {
       transformCallback: () => ++callback, unregisterCallback() {},
       async invoke(command: string, args: any = {}) {
@@ -24,7 +24,7 @@ async function workspace(page: Page) {
           if (fixture.failure) throw new Error('이 실행 파일은 원격 제어를 지원하지 않습니다');
           if (args.action === 'enable') fixture.status = 'connected';
           if (args.action === 'disable') fixture.status = 'disabled';
-          return { status: { status: fixture.status, serverName: '시험 서버', environmentId: 'test-environment' },
+          return { isolated: fixture.isolated, status: { status: fixture.status, serverName: '시험 서버', environmentId: 'test-environment' },
             pairing: args.action === 'pair' ? { manualCode: 'TEST-CODE-ONLY', expiresAt: Math.floor(Date.now() / 1000) + 120, environmentId: 'test-environment' } : null };
         }
         return null;
@@ -33,6 +33,7 @@ async function workspace(page: Page) {
   });
   await page.goto('/');
   await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  if (await page.locator('#settings-open').count()) await page.locator('#settings-open').click();
   await page.locator('#mobile-control-open').click();
   await expect(page.locator('#mobile-control-session option')).toHaveCount(1);
 }
@@ -53,7 +54,9 @@ test('mobile controls use the selected live generation and clear pairing codes o
   await page.locator('#mobile-control-open').click();
   await expect(page.locator('#mobile-control-code')).toBeEmpty();
   expect(await page.evaluate(() => (window as any).mobileFixture.calls.filter((item: any) => item.command === 'mobile_control').map((item: any) => item.args))).toEqual([
+    { id: 'live', generation: 4, action: 'status' },
     { id: 'live', generation: 4, action: 'enable' }, { id: 'live', generation: 4, action: 'pair' }, { id: 'live', generation: 4, action: 'disable' },
+    { id: 'live', generation: 4, action: 'status' },
   ]);
 });
 
@@ -67,6 +70,21 @@ test('unsupported mobile controls report the error without changing a running se
   expect(await page.evaluate(() => (window as any).mobileFixture.calls.filter((item: any) => ['start_session', 'session_stop', 'session_write'].includes(item.command)))).toEqual([]);
 });
 
+test('legacy CLI status explains isolation and prevents mobile mutations before a failed request', async ({ page }) => {
+  await workspace(page);
+  await page.evaluate(() => { (window as any).mobileFixture.isolated = false; });
+  await page.locator('#mobile-control-refresh').click();
+  await expect(page.locator('#mobile-control-compatibility')).toContainText('--remote-control-client-name');
+  await expect(page.locator('#mobile-control-enable')).toBeDisabled();
+  await expect(page.locator('#mobile-control-disable')).toBeDisabled();
+  await expect(page.locator('#mobile-control-pair')).toBeDisabled();
+  const actions = await page.evaluate(() => (window as any).mobileFixture.calls.filter((item: any) => item.command === 'mobile_control').map((item: any) => item.args.action));
+  expect(actions.every((action: string) => action === 'status')).toBe(true);
+  await page.locator('#mobile-control-cli-settings').click();
+  await expect(page.locator('#mobile-control-dialog')).not.toBeVisible();
+  await expect(page.locator('#codex-settings-dialog')).toBeVisible();
+});
+
 test('late pairing after close stays cleared and app exit waits for the pending mobile request', async ({ page }) => {
   await workspace(page);
   await page.locator('#mobile-control-enable').click();
@@ -75,6 +93,7 @@ test('late pairing after close stays cleared and app exit waits for the pending 
   await page.locator('#mobile-control-pair').click();
   await expect(page.locator('#mobile-control-open')).toBeDisabled();
   await page.locator('#mobile-control-close').click();
+  await page.locator('#settings-close').click();
   await page.locator('#exit').click();
   await page.locator('#confirm-exit').click();
   await expect(page.locator('#confirm-exit')).toBeDisabled();

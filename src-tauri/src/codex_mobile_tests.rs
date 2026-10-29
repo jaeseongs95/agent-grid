@@ -94,6 +94,22 @@ fn legacy_cli_mobile_mutations_are_rejected_before_connecting() {
     }
     assert!(!connection.request(MobileAction::Status).err().unwrap().contains("--remote-control-client-name"));
 }
+
+#[test]
+fn legacy_cli_status_reports_isolation_without_mutating_the_server() {
+    let (mut connection, stream, worker) = fixture(|mut ws| {
+        initialize_fixture(&mut ws);
+        let request = read(&mut ws);
+        assert_eq!(request["method"], "remoteControl/status/read");
+        reply(&mut ws, &request, status_value());
+        assert!(ws.read().is_err());
+    });
+    Arc::get_mut(&mut connection.0).unwrap().namespaced_remote = false;
+    let result = connection.run_stream(MobileAction::Status, stream, Duration::from_secs(2)).unwrap();
+    assert!(!result.isolated);
+    assert_eq!(serde_json::to_value(&result).unwrap()["isolated"], false);
+    worker.join().unwrap();
+}
 fn fixture(operation: impl FnOnce(WebSocket<TcpStream>) + Send + 'static) -> (MobileConnection, TcpStream, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -145,6 +161,7 @@ fn four_actions_are_closed_and_mutations_are_ephemeral() {
             assert!(ws.read().is_err()); // Every success closes its one management connection.
         });
         let result = connection.run_stream(action,stream,Duration::from_secs(2)).unwrap();
+        assert!(result.isolated);
         assert_eq!(result.status.is_none(),matches!(action,MobileAction::Pair));
         let encoded = serde_json::to_string(&result).unwrap();
         assert!(!encoded.contains("machine-code"));

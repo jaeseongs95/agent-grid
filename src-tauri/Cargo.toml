@@ -1,6 +1,6 @@
 [package]
 name = "opendiy-desktop"
-version = "0.5.0"
+version = "0.5.1"
 description = "Independent terminal workspace for local coding agents"
 authors = ["OpenDIY Desktop contributors"]
 license = "MIT"

@@ -12,6 +12,7 @@ pub enum MobileAction { Status, Enable, Disable, Pair }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MobileReply {
+    pub isolated: bool,
     pub status: Option<MobileStatus>,
     pub pairing: Option<MobilePairing>,
 }
@@ -100,7 +101,7 @@ impl MobileConnection {
         rpc.send(json!({"method":"initialized","params":{}})).map_err(|_| "모바일 관리 초기화 전송에 실패했습니다.")?;
         let state = self.call(&mut rpc, "remoteControl/status/read", json!({}), deadline)?;
         let current = parse_status(&state, &self.0.token)?;
-        let mut reply = MobileReply { status:None, pairing:None };
+        let mut reply = MobileReply { isolated:self.0.namespaced_remote, status:None, pairing:None };
         match action {
             MobileAction::Status => reply.status = Some(current),
             MobileAction::Enable | MobileAction::Disable => {

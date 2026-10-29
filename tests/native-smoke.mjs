@@ -61,6 +61,16 @@ async function nativeCall(command, args = {}) {
   return page.evaluate(({ command, args }) => window.__TAURI_INTERNALS__.invoke(command, args), { command, args });
 }
 
+async function openSettings() {
+  if (!await page.locator('#settings-dialog').isVisible()) await page.locator('#settings-open').click();
+}
+
+async function closePopups() {
+  // 설정과 그 위의 하위 창을 모두 실제 닫기 키로 해제한다.
+  for (let depth = 0; depth < 4 && await page.locator('dialog[open]').count(); depth++) await page.keyboard.press('Escape');
+  assert.equal(await page.locator('dialog[open]').count(), 0, '열린 창을 닫지 못해 본 화면 조작을 중단합니다');
+}
+
 async function projectPicker(mode, cwd) {
   const processId = process.env.AGENT_GRID_NATIVE_PID;
   const executable = process.env.AGENT_GRID_NATIVE_EXE;
@@ -128,15 +138,14 @@ async function createSession(title, cwd) {
 }
 
 async function stopOurs() {
-  if (await page.locator('dialog[open]').count()) await page.keyboard.press('Escape');
+  await closePopups();
   const allProjects = page.locator('#project-tabs [role="tab"][data-project-cwd=""]');
   if (await allProjects.count()) await allProjects.click();
   for (const title of ownedTitles) {
     try {
       const card = tile(title);
       if (!await card.count()) continue;
-      const openDialog = page.locator('dialog[open]');
-      if (await openDialog.count()) await page.keyboard.press('Escape');
+      await closePopups();
       expectedStopTitle = title;
       await card.locator('.stop').click();
       await until(async () => {
@@ -283,6 +292,7 @@ try {
       retained.push({ title, path: await card.locator('.terminal-path').textContent(), screen: await card.locator('.xterm-screen').elementHandle(), output: await card.locator('.xterm-rows').innerText() });
     }
     try {
+      await openSettings();
       await page.locator('#language-select').selectOption('en');
       await until(() => page.locator('html').getAttribute('lang'), value => value === 'en', 'English language applied');
       assert.match((await page.locator('#new-session').textContent()) ?? '', /new session/i);
@@ -299,6 +309,7 @@ try {
       assert.match((await page.locator('#codex-executable-choose').textContent()) ?? '', /select|choose/i);
       assert(!/[가-힣]/.test((await page.locator('#codex-executable-source').textContent()) ?? ''), 'English settings source contains Korean UI text');
       await page.locator('#codex-settings-close').click();
+      await page.locator('#settings-close').click();
       await page.locator('#catalog-open').click();
       await until(() => page.locator('#catalog-list').getAttribute('aria-busy'), value => value === 'false', 'English catalog query completes', 45_000);
       assert.match((await page.locator('#catalog-title').textContent()) ?? '', /session/i);
@@ -327,10 +338,12 @@ try {
       }
       return { nativeMenuReadback: menu, invalidLanguageRejected: true, sameSessionIdsGenerationsAndThreadUuids: true, sessions, physicalTrayInteractionVerified: false, globalConfigurationWritten: false };
     } finally {
-      if (await page.locator('dialog[open]').count()) await page.keyboard.press('Escape');
+      await closePopups();
+      await openSettings();
       await page.locator('#language-select').selectOption('ko');
       await until(() => page.locator('#connection').textContent(), value => value === '로컬 연결됨', 'Korean restored for existing smoke checks');
       assert.deepEqual(await nativeCall('set_ui_language', { language: 'ko' }), { show: 'OpenDIY Desktop 열기', exit: '종료…' });
+      await page.locator('#settings-close').click();
       for (const previous of retained) await previous.screen?.dispose();
     }
   });
@@ -404,7 +417,7 @@ try {
         }
         return { picker, registryCount: 2, selectedImportedProject: true, emptyProjectVisibleTerminals: 0, originalProjectVisibleTerminals: 2, allProjectsVisibleTerminals: 2, sessions: await assertLive(), terminals: retained, hiddenOutputArrivalTimingVerified: false, additionalCliStarted: false };
       } finally {
-        if (await page.locator('dialog[open]').count()) await page.keyboard.press('Escape');
+        await closePopups();
         await (await tab('')).click();
         for (const previous of screens) await previous.screen?.dispose();
       }
@@ -452,6 +465,7 @@ try {
         const before = await nativeCall('get_codex_settings');
         assert.equal(before.savedPath, null, 'Fresh isolated settings already have a saved executable');
         assert.equal(persistedExecutable(), null);
+        await openSettings();
         await page.locator('#codex-settings-open').click();
         await settingsDialog.waitFor({ state: 'visible' });
         const picker = await executablePicker('Cancel');
@@ -508,6 +522,7 @@ try {
         return { savedPath: null, source: reset.source, resolvedPathSha256: hash(reset.resolvedPath), sqliteSavedRowRemoved: true, fallbackExplicit: true, sessions: await assertLiveSessions() };
       });
       await page.locator('#codex-settings-close').click();
+      await page.locator('#settings-close').click();
     } finally {
       for (const previous of screens) await previous.screen?.dispose();
     }

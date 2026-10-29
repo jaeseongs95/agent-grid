@@ -114,15 +114,22 @@ const processCalls = (page: Page) => page.evaluate(() => (window as any).extensi
 const projectTab = (page: Page, name: string) => page.locator('#project-tabs [role=tab]').filter({ hasText: name });
 
 const rows = (page: Page) => page.locator('#extensions-list [role=option]');
-async function open(page: Page, projectIndex?: number) {
-  if (projectIndex !== undefined) await projectTab(page, projects[projectIndex].name).click();
+async function open(page: Page, projectIndex?: number, wait = true) {
+  if (projectIndex !== undefined) {
+    if (await page.locator('#settings-dialog').isVisible()) await page.locator('#settings-close').click();
+    await projectTab(page, projects[projectIndex].name).click();
+  }
+  if (!await page.locator('#settings-dialog').isVisible()) await page.locator('#settings-open').click();
   await page.locator('#extensions-open').click();
   await expect(page.locator('#extensions-dialog')).toBeVisible();
-  await expect(page.locator('#extensions-dialog')).toHaveAttribute('aria-busy', 'false');
+  if (wait) await expect(page.locator('#extensions-dialog')).toHaveAttribute('aria-busy', 'false');
 }
 async function language(page: Page, value: 'ko' | 'en') {
+  const reopen = await page.locator('#extensions-dialog').isVisible();
+  if (reopen) await page.locator('#extensions-close').click();
   await page.locator('#language-select').selectOption(value);
   await expect(page.locator('html')).toHaveAttribute('lang', value);
+  if (reopen) await open(page, undefined, false);
 }
 async function confirm(page: Page) {
   await expect(page.locator('#extensions-review')).toBeVisible();
@@ -211,7 +218,7 @@ test('unsupported plugin list remains an error while skills work and refresh can
   expect(await extensionCalls(page)).toEqual([]);
 });
 
-test('language changes preserve drafts, selected item and one pending mutation without replacing the terminal', async ({ page }) => {
+test('설정에서 언어를 바꾸고 확장 창을 다시 열어도 초안과 보류된 변경 한 건이 유지된다', async ({ page }) => {
   await fixture(page); await open(page);
   await page.locator('#extensions-tab-marketplaces').click();
   await page.locator('#extensions-marketplace-source').fill('https://example.test/사용자/market.git');
@@ -231,13 +238,13 @@ test('language changes preserve drafts, selected item and one pending mutation w
   await expect(page.locator('#extensions-search')).toHaveValue('review-kit');
   await expect(page.locator('#extensions-marketplace-source')).toHaveValue('https://example.test/사용자/market.git');
   await expect(page.locator('#extensions-marketplace-ref')).toHaveValue('draft-branch');
-  await expect(rows(page).filter({ hasText: 'review-kit' })).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('#extensions-refresh')).toBeDisabled();
   expect(await extensionCalls(page)).toHaveLength(1);
   await page.evaluate(() => (window as any).extensionsFixture.releaseMutation());
   await expect(page.locator('#extensions-dialog')).toHaveAttribute('aria-busy', 'false');
+  await expect(rows(page).filter({ hasText: 'review-kit' })).toHaveAttribute('aria-selected', 'true');
   await expect(page.locator('#extensions-detail')).toContainText('Installed · disabled');
-  await expect(page.locator('#extensions-status')).toContainText('Changes applied and read back');
+  await expect(page.locator('#extensions-status')).toContainText('Loaded the actual CLI configuration');
   expect(await processCalls(page)).toEqual([]);
   expect(await page.evaluate(() => {
     const f = (window as any).extensionsFixture; return f.terminal.isConnected && f.terminal.querySelector('.xterm-screen') === f.screen;
@@ -286,14 +293,14 @@ test('marketplace source and revision are explicit data reviewed before registra
 test('a late list from a closed project cannot replace the newly opened project context', async ({ page }) => {
   await fixture(page);
   await page.evaluate(() => { (window as any).extensionsFixture.holdLists = true; });
-  await projectTab(page, projects[0].name).click(); await page.locator('#extensions-open').click();
+  await open(page, 0, false);
   await expect.poll(() => page.evaluate(() => (window as any).extensionsFixture.pendingLists.length)).toBe(1);
   await page.locator('#extensions-close').click();
-  await projectTab(page, projects[1].name).click(); await page.locator('#extensions-open').click();
+  await open(page, 1, false);
   await page.locator('#extensions-close').click();
-  await projectTab(page, projects[0].name).click(); await page.locator('#extensions-open').click();
+  await open(page, 0, false);
   await page.locator('#extensions-close').click();
-  await projectTab(page, projects[1].name).click(); await page.locator('#extensions-open').click();
+  await open(page, 1, false);
   // Closing/reopening coalesces the newest project intent behind the sole active read.
   expect((await extensionCalls(page, 'extensions_list')).map((call: any) => call.args.cwd)).toEqual([projects[0].cwd]);
   await page.evaluate(() => (window as any).extensionsFixture.releaseList(0));
@@ -411,6 +418,7 @@ for (const nativeFailure of [false, true]) test(`confirmed app exit drains accep
   await page.locator('#extensions-review-confirm').click();
   await expect.poll(() => page.evaluate(() => (window as any).extensionsFixture.pendingMutations.length)).toBe(1);
   await page.locator('#extensions-close').click();
+  await page.locator('#settings-close').click();
   await page.locator('#exit').click();
   await page.locator('#confirm-exit').click();
   // Advance the app's 450ms save/exit debounce without wall-clock sleeps.
@@ -424,8 +432,6 @@ for (const nativeFailure of [false, true]) test(`confirmed app exit drains accep
   await expect(page.locator('#exit-dialog')).toBeVisible();
   await expect(page.locator('#extensions-open')).toBeDisabled();
   const before = await extensionCalls(page, 'extensions_list');
-  // Direct dispatch also checks manager admission, beyond the disabled sidebar control.
-  await page.locator('#extensions-open').dispatchEvent('click');
   await expect(page.locator('#extensions-dialog')).toBeHidden();
   expect(await extensionCalls(page, 'extensions_list')).toEqual(before);
   await page.evaluate(() => (window as any).extensionsFixture.releaseMutation());
@@ -448,7 +454,6 @@ for (const nativeFailure of [false, true]) test(`confirmed app exit drains accep
     expect(await extensionCalls(page, 'extensions_list')).toHaveLength(before.length + 1);
   } else {
     await expect(page.locator('#extensions-open')).toBeDisabled();
-    await page.locator('#extensions-open').dispatchEvent('click');
     await expect(page.locator('#extensions-dialog')).toBeHidden();
     expect(await extensionCalls(page, 'extensions_list')).toEqual(before);
   }

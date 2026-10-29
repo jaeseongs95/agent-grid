@@ -81,7 +81,8 @@ struct LaunchGuard { session: Arc<Session>, armed: bool }
 impl Drop for LaunchGuard {
     fn drop(&mut self) {
         if !self.armed { return; }
-        self.session.stop_requested.store(true, Ordering::Release);
+        // 실패 정리는 사용자 취소 요청과 구분한다. 관측은 정리 중 억제한다.
+        let _ = self.session.phase.fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| if phase < 3 { Some(2) } else { None });
         self.session.flow.cancel();
         let process = self.session.process.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(process) = process {
@@ -115,7 +116,7 @@ struct Session {
     // phase 0: preparing, 1: live, 2: stopping, 3: reaped/restored.
     // Codex status observations cannot turn a reaped process back into a live one.
     phase: AtomicU8,
-    stop_requested: AtomicBool,
+    stop_requested: Arc<AtomicBool>,
     process: Mutex<Option<Arc<ProcessControl>>>,
     flow: OutputFlow,
     done: (Mutex<bool>, Condvar),
@@ -175,7 +176,7 @@ impl Session {
             // Publish process ownership and completion together under info's lock.
             self.phase.store(3, Ordering::Release);
             info.active = false;
-            info.state = state.into();
+            info.state = if self.stop_requested.load(Ordering::Acquire) { "stopped" } else { state }.into();
         }, false);
         let mut done = self.done.0.lock().map_err(|_| "session completion lock poisoned")?;
         *done = true;
@@ -183,11 +184,23 @@ impl Session {
         result
     }
 
-    fn stop(&self) -> Result<(), String> {
-        if self.phase.fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| if phase < 3 { Some(2) } else { None }).is_err() { return Ok(()); }
-        self.stop_requested.store(true, Ordering::Release);
+    fn request_stop(&self) -> Result<(), String> {
+        if self.phase.load(Ordering::Acquire) == 3 { return Ok(()); }
+        let result = self.update(|info| {
+            // 완료와 취소의 승자를 메타데이터 락 하나로 정한다.
+            if self.phase.load(Ordering::Acquire) < 3 {
+                self.stop_requested.store(true, Ordering::Release);
+                self.phase.store(2, Ordering::Release);
+                info.state = "stopping".into();
+            }
+        }, false);
         self.flow.cancel();
-        let status_result = self.update(|info| { if self.phase.load(Ordering::Acquire) == 2 { info.state = "stopping".into(); } }, false);
+        result
+    }
+
+    fn stop(&self) -> Result<(), String> {
+        if self.phase.load(Ordering::Acquire) == 3 { return Ok(()); }
+        let status_result = self.request_stop();
         let process = self.process.lock().map_err(|_| "session process lock poisoned")?.clone();
         if let Some(process) = process { process.terminate()?; }
         let done = self.done.0.lock().map_err(|_| "session completion lock poisoned")?;
@@ -213,7 +226,7 @@ impl Engine {
         let saved = store.lock().map_err(|_| "metadata store lock poisoned")?.sessions()?;
         let mut sessions = HashMap::new();
         for info in saved {
-            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone() }));
+            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone() }));
         }
         Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: AtomicBool::new(false) }) })
     }
@@ -226,6 +239,13 @@ impl Engine {
         if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting".into()); }
         let mut sessions = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?;
         if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting".into()); }
+        if let Some(thread_id) = request.thread_id.as_deref() {
+            for session in sessions.values() {
+                if session.phase.load(Ordering::Acquire) < 3 && session.info()?.thread_id.as_deref() == Some(thread_id) {
+                    return Err("Saved thread already has an active session; wait for its cleanup before resuming".into());
+                }
+            }
+        }
         if sessions.values().filter(|session| session.phase.load(Ordering::Acquire) < 3).count() >= MAX_ACTIVE_SESSIONS { return Err("32 concurrent sessions limit reached".into()); }
         // Bound metadata in memory as well as output. Remove oldest terminal
         // entries only from the live registry; persisted restore metadata survives.
@@ -241,7 +261,7 @@ impl Engine {
             live_ids.push(info.id.clone());
             store.prune_sessions(&live_ids)?;
         }
-        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone() });
+        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: Arc::new(AtomicBool::new(false)), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone() });
         if let Some(id) = retired_id { sessions.remove(&id); }
         sessions.insert(info.id.clone(), session.clone());
         drop(sessions);
@@ -257,7 +277,7 @@ impl Engine {
         let weak = Arc::downgrade(&session);
         let on_event = Arc::new(move |event| { if let Some(session) = weak.upgrade() { session.observe(event); } });
         let info = session.info()?;
-        let adapter = match self.codex_executable().and_then(|exe| codex::prepare_with_executable(&exe, Path::new(&info.cwd), info.thread_id.as_deref(), on_event)) {
+        let adapter = match self.codex_executable().and_then(|exe| codex::prepare_with_cancellation(&exe, Path::new(&info.cwd), info.thread_id.as_deref(), on_event, session.stop_requested.clone())) {
             Ok(adapter) => adapter,
             Err(error) => { session.finish("error")?; return Err(error); }
         };
@@ -562,9 +582,7 @@ impl Engine {
         let mut failures = Vec::new();
         for session in &sessions {
             if session.phase.load(Ordering::Acquire) < 3 {
-                session.stop_requested.store(true, Ordering::Release);
-                let _ = session.phase.fetch_update(Ordering::AcqRel, Ordering::Acquire, |phase| if phase < 3 { Some(2) } else { None });
-                session.flow.cancel();
+                if let Err(error) = session.request_stop() { failures.push(error); }
                 let process = match session.process.lock() { Ok(lock) => lock.clone(), Err(_) => { failures.push("session process lock poisoned".into()); continue; } };
                 if let Some(process) = process { if let Err(error) = process.terminate() { failures.push(error); } }
             }
@@ -595,6 +613,130 @@ mod lifecycle_tests {
 
     fn request() -> StartRequest {
         StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 80, rows: 24 }
+    }
+
+    #[test]
+    fn resume_admission_has_one_owner_through_error_and_stopping() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let mut request = request();
+        request.thread_id = Some(Uuid::new_v4().to_string());
+        let request = Arc::new(request);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2).map(|_| {
+            let engine = engine.clone(); let request = request.clone(); let barrier = barrier.clone();
+            thread::spawn(move || { barrier.wait(); engine.allocate(&request) })
+        }).collect();
+        barrier.wait();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1, "one saved thread must have one native owner");
+        let owner = results.into_iter().find_map(Result::ok).unwrap();
+        owner.phase.store(1, Ordering::Release);
+        owner.observe(CodexEvent::Status("error".into()));
+        assert!(engine.allocate(&request).is_err(), "observation error does not release ownership");
+        owner.phase.store(2, Ordering::Release);
+        assert!(engine.allocate(&request).is_err(), "cleanup must finish before another resume");
+        let info = owner.info().unwrap();
+        assert!(engine.stop(&info.id, info.generation + 1).unwrap_err().contains("stale"));
+        assert!(!owner.stop_requested.load(Ordering::Acquire));
+        owner.finish("stopped").unwrap();
+        let next = engine.allocate(&request).unwrap();
+        assert_ne!(next.info().unwrap().id, info.id);
+        next.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn resume_cancel_during_prepare_preserves_stopped_after_start_failure() {
+        let (entered, entry) = std::sync::mpsc::sync_channel(0);
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let sink_release = release.clone();
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(move |event| {
+            if let BackendEvent::Changed(info) = event {
+                if info.state == "starting" { entered.send(info).unwrap(); sink_release.wait(); }
+            }
+            Ok(())
+        })).unwrap();
+        let missing = std::env::temp_dir().join(format!("missing-opendiy-resume-{}.exe", Uuid::new_v4()));
+        engine.inner.store.lock().unwrap().set_codex_executable(Some(missing.to_str().unwrap())).unwrap();
+        let starting = engine.clone();
+        let worker = thread::spawn(move || starting.start(request()));
+        let info = entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        let session = engine.lookup(&info.id, info.generation).unwrap();
+        let stopping = engine.clone();
+        let stop = thread::spawn(move || stopping.stop(&info.id, info.generation));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !session.stop_requested.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline);
+            thread::yield_now();
+        }
+        release.wait();
+        assert!(worker.join().unwrap().is_err());
+        stop.join().unwrap().unwrap();
+        assert_eq!(session.info().unwrap().state, "stopped");
+        assert!(!session.info().unwrap().active);
+        assert!(session.process.lock().unwrap().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resume_observation_error_keeps_real_pty_stoppable_until_reaped() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let shell = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let mut command = CommandBuilder::new(shell);
+        command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"]);
+        let started = engine.start_fixture(request(), command).unwrap();
+        let session = engine.lookup(&started.id, started.generation).unwrap();
+        session.observe(CodexEvent::Status("error".into()));
+        assert!(session.info().unwrap().active);
+        assert!(session.process.lock().unwrap().is_some());
+        let start = std::time::Instant::now();
+        engine.stop(&started.id, started.generation).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5), "stop must wake the real PTY reader and reap its process");
+        let finished = session.info().unwrap();
+        assert_eq!(finished.state, "stopped");
+        assert!(!finished.active);
+        assert!(session.process.lock().unwrap().is_none());
+        assert!(*session.done.0.lock().unwrap());
+        engine.stop(&started.id, started.generation).unwrap();
+    }
+
+    #[test]
+    fn resume_launch_guard_failure_reports_error_without_user_cancel() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let allocated = engine.allocate(&request()).unwrap();
+        drop(LaunchGuard { session: allocated, armed: true });
+        let failed = engine.list().unwrap().pop().unwrap();
+        assert_eq!(failed.state, "error");
+        assert!(!failed.active);
+        let session = engine.lookup(&failed.id, failed.generation).unwrap();
+        assert!(!session.stop_requested.load(Ordering::Acquire));
+        assert!(session.process.lock().unwrap().is_none());
+        assert!(*session.done.0.lock().unwrap());
+    }
+
+    #[test]
+    fn resume_cancel_and_finish_share_the_same_metadata_lock() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let session = engine.allocate(&request()).unwrap();
+        let metadata = session.info.lock().unwrap();
+        let (entered, entry) = std::sync::mpsc::sync_channel(0);
+        let stopping = session.clone();
+        let worker = thread::spawn(move || { entered.send(()).unwrap(); stopping.request_stop() });
+        entry.recv_timeout(Duration::from_secs(5)).unwrap();
+        // 완료가 이 락을 소유한 동안 취소가 phase/flag를 먼저 발행하면 안 된다.
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while !session.stop_requested.load(Ordering::Acquire) && std::time::Instant::now() < deadline { thread::yield_now(); }
+        assert_eq!(session.phase.load(Ordering::Acquire), 0);
+        assert!(!session.stop_requested.load(Ordering::Acquire));
+        drop(metadata);
+        worker.join().unwrap().unwrap();
+        assert_eq!(session.phase.load(Ordering::Acquire), 2);
+        session.finish("error").unwrap();
+        assert_eq!(session.info().unwrap().state, "stopped");
+        let finished = engine.allocate(&request()).unwrap();
+        finished.finish("exited").unwrap();
+        finished.request_stop().unwrap();
+        assert_eq!(finished.info().unwrap().state, "exited");
+        assert!(!finished.stop_requested.load(Ordering::Acquire));
     }
 
     #[test]

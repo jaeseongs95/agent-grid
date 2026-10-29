@@ -67,6 +67,7 @@ class StartupFixture {
   }
   File.WriteAllText(Path.Combine(root, "server.args"), String.Join("\n", args));
   File.WriteAllText(Path.Combine(root, "server.pid"), Process.GetCurrentProcess().Id.ToString());
+  if (mode == "cancelled-start") Thread.Sleep(30000);
   return 0;
  }
 }
@@ -112,5 +113,29 @@ class StartupFixture {
         assert!(started.elapsed() < HELP_TIMEOUT + Duration::from_secs(5), "probe pipe readers must settle after {mode}");
         exited("probe.pid");
     }
+    // 실제 소유 서버가 연결을 기다리는 동안 취소하고 원래 프로세스 핸들로 회수를 확인한다.
+    fs::remove_file(root.join("server.pid")).unwrap();
+    fs::write(root.join("mode"), "cancelled-start").unwrap();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    let worker_root = root.clone();
+    let worker_exe = exe.clone();
+    let worker = thread::spawn(move || launch_server_with_cancellation(&worker_exe, &worker_root, None, Some(worker_cancelled)).err().expect("cancelled server must not become a session"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !root.join("server.pid").is_file() {
+        assert!(Instant::now() < deadline, "owned cancellation server must start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pid: u32 = fs::read_to_string(root.join("server.pid")).unwrap().parse().unwrap();
+    let process = unsafe { OpenProcess(0x00100000, 0, pid) };
+    assert!(!process.is_null(), "retain the original owned server handle");
+    let started = Instant::now();
+    cancelled.store(true, Ordering::Release);
+    let error = worker.join().unwrap();
+    assert!(error.contains("cancelled"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(2), "cancelled connect must not wait for the 12-second deadline");
+    let status = unsafe { WaitForSingleObject(process, 1000) };
+    unsafe { CloseHandle(process); }
+    assert_eq!(status, 0, "the original owned server must be reaped before cancellation returns");
     fs::remove_dir_all(root).unwrap();
 }

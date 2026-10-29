@@ -20,7 +20,8 @@ modification or redistribution. See the [reference license](https://github.com/p
 
 ## Language
 
-Select **한국어** or **English** from **언어 / Language** in the sidebar.
+Open **⚙ Settings** in the upper-right corner and select **한국어** or **English**
+under **Language**.
 Changes apply immediately to the app interface and native tray/chooser labels,
 and the desktop app saves the selection in its own SQLite settings for the next launch.
 The default is Korean. Session titles, paths, conversations and terminal output
@@ -37,8 +38,9 @@ Extract the whole portable ZIP and run `opendiy-desktop.exe`. Keep
 terminal side while the main application uses a normal desktop window.
 
 Install and sign in to OpenDIY Codex or a compatible official Codex CLI first. Desktop
-packages do not bundle a CLI binary, and the app does not download one. Open **Executable settings**
-and select its native `codex.exe`; the app saves that path for future starts
+packages do not bundle a CLI binary, and the app does not download one. Open **⚙ Settings**
+in the upper-right corner, choose **Executable settings** and select its native `codex.exe`;
+the app saves that path for future starts
 and history queries. The screen shows the saved path, resolved executable and
 where it came from. Cancelling the chooser keeps the previous setting.
 Changing it leaves running terminals alone.
@@ -78,11 +80,12 @@ in bounded pages and are not stored in OpenDIY Desktop's database.
 
 Use **New session** to enter a directory directly. Use the official TUI to choose
 a model, sign in or answer permission prompts. Enter text directly in the terminal
-you want to control.
+you want to control. Use **Shift+Enter** to insert a line break in the CLI prompt.
 
 ## Plugins and skills
 
-Open **Plugins & skills** in the sidebar. The popup uses the executable selected
+Open **⚙ Settings** in the upper-right corner, then **Plugins & skills**.
+The popup uses the executable selected
 in **Executable settings**, and shows that executable and the selected project.
 Search installed/available plugins and skills, install/remove or enable/disable
 plugins, manage marketplace sources, and enable/disable skills. Import an existing
@@ -99,7 +102,8 @@ Start a new session to use changed extensions; running terminals are not restart
 
 ## Mobile remote control
 
-Open **Mobile remote control**, select a running session and read its status. Enable
+Open **⚙ Settings** in the upper-right corner, then **Mobile remote control**,
+select a running session and read its status. Enable
 remote control, refresh until the remote service is connected, then create a pairing
 code to enter in mobile Codex. A connected remote service means the session server
 has connected to the relay; it does not confirm that a phone is paired.
@@ -109,7 +113,9 @@ The selected CLI must support the remote-control app-server APIs and
 API key authentication is unsupported. Without that startup option, existing
 session operation remains available, but mobile enable, disable and pairing requests
 are blocked to protect other remote registrations. After choosing a supported CLI,
-start a new session to use mobile control.
+start a new session to use mobile control. These three actions stay disabled until a status
+response confirms isolated registration support. For an unsupported CLI, the popup
+explains the limitation and provides **Open executable settings**.
 
 Management requests use the selected session's existing app-owned server. Hiding
 the desktop window keeps it running; stopping the session or exiting the app ends

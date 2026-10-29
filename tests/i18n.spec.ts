@@ -20,7 +20,7 @@ async function nativeFixture(page: Page, options: { stored?: string; nativeLangu
     let callback = 0;
     const callbacks = new Map<number, (value: any) => void>();
     const listeners = new Map<string, (value: any) => void>();
-    state.i18nFixture = { calls: [], releaseSettings: () => {}, releaseChooser: () => {}, releaseList: () => {}, releasePreview: () => {}, releaseLanguageRead: () => {}, holdLanguageSaves: false, pendingLanguageSaves: [], completedLanguageSaves: [], activeLanguageSaves: 0, maxLanguageSaves: 0, holdCompleteExit: false, releaseCompleteExit: () => {},
+    state.i18nFixture = { calls: [], holdSettings: options.holdSettings, holdList: options.holdList, holdPreview: options.holdPreview, releaseSettings: () => {}, releaseChooser: () => {}, releaseList: () => {}, releasePreview: () => {}, releaseLanguageRead: () => {}, holdLanguageSaves: false, pendingLanguageSaves: [], completedLanguageSaves: [], activeLanguageSaves: 0, maxLanguageSaves: 0, holdCompleteExit: false, releaseCompleteExit: () => {},
       finishLanguageSave(fail = false) { const pending = this.pendingLanguageSaves.shift(); if (!pending) throw new Error('No pending language save'); if (fail) pending.reject(new Error('Fixture language database write failed')); else pending.resolve(); },
       emit(event: string, payload: any) { listeners.get(event)!({ event, id: 1, payload }); },
     };
@@ -51,10 +51,10 @@ async function nativeFixture(page: Page, options: { stored?: string; nativeLangu
           } finally { fixture.activeLanguageSaves--; }
         }
         if (command === 'complete_exit' && fixture.holdCompleteExit) await new Promise<void>(resolve => { fixture.releaseCompleteExit = resolve; });
-        if (command === 'get_codex_settings') { if (options.holdSettings) await new Promise<void>(resolve => { fixture.releaseSettings = resolve; }); return settings; }
+        if (command === 'get_codex_settings') { if (fixture.holdSettings) await new Promise<void>(resolve => { fixture.releaseSettings = resolve; }); return settings; }
         if (command === 'choose_codex_executable') { if (options.holdChooser) await new Promise<void>(resolve => { fixture.releaseChooser = resolve; }); return settings; }
-        if (command === 'catalog_list') { if (options.holdList) await new Promise<void>(resolve => { fixture.releaseList = resolve; }); return { sessions: catalogRows, nextCursor: null }; }
-        if (command === 'catalog_preview') { if (options.holdPreview) await new Promise<void>(resolve => { fixture.releasePreview = resolve; }); return { messages: [{ id: args.threadId + '-message', role: 'user', text: '사용자가 작성한 대화 원문' }], nextCursor: null }; }
+        if (command === 'catalog_list') { if (fixture.holdList) await new Promise<void>(resolve => { fixture.releaseList = resolve; }); return { sessions: catalogRows, nextCursor: null }; }
+        if (command === 'catalog_preview') { if (fixture.holdPreview) await new Promise<void>(resolve => { fixture.releasePreview = resolve; }); return { messages: [{ id: args.threadId + '-message', role: 'user', text: '사용자가 작성한 대화 원문' }], nextCursor: null }; }
         return null;
       },
     };
@@ -71,6 +71,7 @@ async function nativeFixture(page: Page, options: { stored?: string; nativeLangu
 
 const commands = (page: Page, names: string[]) => page.evaluate(names => (window as any).i18nFixture.calls.filter((call: any) => names.includes(call.command)), names);
 async function switchLanguage(page: Page, language: 'ko' | 'en') {
+  if (!await page.locator('#settings-dialog').isVisible()) await page.locator('#settings-open').click();
   await page.locator('#language-select').selectOption(language);
   await expect(page.locator('html')).toHaveAttribute('lang', language);
   await expect(page.locator('#language-select')).toHaveValue(language);
@@ -136,26 +137,28 @@ test('live terminals, user content, project selection and search drafts survive 
   expect((await commands(page, ['set_ui_language'])).at(-1)).toEqual({ command: 'set_ui_language', args: { language: 'en' } });
 });
 
-test('empty state and open new-session labels change while all user form values remain intact', async ({ page }) => {
+test('설정에서 선택한 언어로 빈 화면과 새 세션 양식을 표시하고 입력 원문을 보존한다', async ({ page }) => {
   await nativeFixture(page, { empty: true });
   await switchLanguage(page, 'en');
   await expect(page.locator('#empty h2')).not.toHaveText(/[가-힣]/);
   await expect(page.locator('#empty-add')).toContainText(/session/i);
-  await page.locator('#new-session').click();
-  await page.locator('#session-title').fill('이름 초안');
-  await page.locator('#session-cwd').fill(project.cwd);
-  await page.locator('#session-thread').fill('사용자-스레드-초안');
-  await switchLanguage(page, 'ko');
-  await expect(page.locator('label[for=session-title]')).toHaveText('세션 이름');
-  await switchLanguage(page, 'en');
-  await expect(page.locator('label[for=session-title]')).toHaveText(/session name/i);
-  await expect(page.locator('label[for=session-cwd]')).toHaveText(/project path/i);
-  await expect(page.locator('#session-title')).toHaveAttribute('placeholder', /API/i);
-  await expect(page.locator('#session-thread')).toHaveAttribute('placeholder', /new|empty|blank/i);
-  await expect(page.locator('#create-submit')).toContainText(/start session/i);
-  await expect(page.locator('#session-title')).toHaveValue('이름 초안');
-  await expect(page.locator('#session-cwd')).toHaveValue(project.cwd);
-  await expect(page.locator('#session-thread')).toHaveValue('사용자-스레드-초안');
+  for (const language of ['ko', 'en'] as const) {
+    await switchLanguage(page, language);
+    await page.locator('#settings-close').click();
+    await page.locator('#new-session').click();
+    await expect(page.locator('label[for=session-title]')).toHaveText(language === 'ko' ? '세션 이름' : /session name/i);
+    await expect(page.locator('label[for=session-cwd]')).toHaveText(language === 'ko' ? '프로젝트 경로' : /project path/i);
+    await expect(page.locator('#session-title')).toHaveAttribute('placeholder', /API/i);
+    await expect(page.locator('#session-thread')).toHaveAttribute('placeholder', language === 'ko' ? /비워 두면/ : /new|empty|blank/i);
+    await expect(page.locator('#create-submit')).toContainText(language === 'ko' ? '세션 시작' : /start session/i);
+    await page.locator('#session-title').fill('이름 초안');
+    await page.locator('#session-cwd').fill(project.cwd);
+    await page.locator('#session-thread').fill('사용자-스레드-초안');
+    await expect(page.locator('#session-title')).toHaveValue('이름 초안');
+    await expect(page.locator('#session-cwd')).toHaveValue(project.cwd);
+    await expect(page.locator('#session-thread')).toHaveValue('사용자-스레드-초안');
+    await page.locator('#create-dialog [data-close]').first().click();
+  }
   expect(await commands(page, processActions)).toEqual([]);
 });
 
@@ -184,6 +187,7 @@ test('pending native startup language read cannot overwrite the durable preferen
 
 test('failed native startup language read is visible and does not automatically write; a deliberate selection recovers', async ({ page }) => {
   await nativeFixture(page, { stored: 'ko', nativeLanguage: 'en', failLanguageRead: true });
+  await page.locator('#settings-open').click();
   await expect(page.locator('#language-error')).toBeVisible();
   await expect(page.locator('#language-error')).toContainText('Fixture language database read failed');
   await expect(page.locator('#language-select')).toBeEnabled();
@@ -237,6 +241,7 @@ test('confirmed exit waits for the latest serialized language save and keeps sel
   await switchLanguage(page, 'en');
   await expect.poll(async () => (await commands(page, ['set_ui_language'])).length).toBe(2);
   await switchLanguage(page, 'ko');
+  await page.locator('#settings-close').click();
   await page.locator('#exit').click();
   await page.locator('#confirm-exit').click();
   await expect.poll(async () => (await commands(page, ['save_layout'])).length).toBe(1);
@@ -253,68 +258,76 @@ test('confirmed exit waits for the latest serialized language save and keeps sel
   await expect(page.locator('#confirm-exit')).toBeEnabled();
 });
 
-test('pending settings response and pending native picker finish in the current language without another request', async ({ page }) => {
+test('보류된 실행 파일 조회와 선택은 창을 다시 연 현재 언어로 표시하고 선택 요청을 중복하지 않는다', async ({ page }) => {
   await nativeFixture(page, { holdSettings: true, holdChooser: true });
+  await page.locator('#settings-open').click();
   await page.locator('#codex-settings-open').click();
   await expect(page.locator('#codex-settings-status')).toContainText('확인');
+  await page.locator('#codex-settings-close').click();
   await switchLanguage(page, 'en');
+  await page.evaluate(() => { const fixture = (window as any).i18nFixture; fixture.holdSettings = false; fixture.releaseSettings(); });
+  await expect(page.locator('#codex-settings-dialog')).toBeHidden();
+  await page.locator('#codex-settings-open').click();
   await expect(page.locator('#codex-settings-status')).not.toHaveText(/[가-힣]/);
-  await page.evaluate(() => (window as any).i18nFixture.releaseSettings());
   await expect(page.locator('#codex-executable-path')).toHaveValue(savedPath);
   await expect(page.locator('#codex-executable-source')).toHaveText(/saved|specified|custom|selected file/i);
   await expect(page.locator('#codex-settings-close')).toHaveAttribute('aria-label', /close/i);
-  expect(await commands(page, ['get_codex_settings'])).toHaveLength(1);
+  expect(await commands(page, ['get_codex_settings'])).toHaveLength(2);
   await page.locator('#codex-executable-choose').click();
   await expect(page.locator('#codex-executable-choose')).toBeDisabled();
+  await page.locator('#codex-settings-close').click();
   await switchLanguage(page, 'ko');
-  await expect(page.locator('#codex-settings-status')).toContainText('기다리는 중');
+  await page.locator('#codex-settings-open').click();
+  await expect(page.locator('#codex-executable-choose')).toBeDisabled();
+  await expect(page.locator('#codex-settings-status')).toContainText('확인');
   await page.evaluate(() => (window as any).i18nFixture.releaseChooser());
-  await expect(page.locator('#codex-settings-status')).toHaveText('설정이 저장되었습니다.');
-  await switchLanguage(page, 'en');
-  await expect(page.locator('#codex-settings-status')).toHaveText(/saved/i);
+  await expect(page.locator('#codex-executable-choose')).toBeEnabled();
+  await expect(page.locator('#codex-executable-source')).toHaveText('직접 지정');
+  await expect(page.locator('#codex-settings-close')).toHaveAttribute('aria-label', '설정 닫기');
   await expect(page.locator('#codex-executable-path')).toHaveValue(savedPath);
   await expect(page.locator('#codex-executable-resolved')).toHaveText(savedPath);
-  expect(await commands(page, ['get_codex_settings', 'choose_codex_executable'])).toHaveLength(2);
+  expect(await commands(page, ['get_codex_settings'])).toHaveLength(3);
+  expect(await commands(page, ['choose_codex_executable'])).toHaveLength(1);
   expect(await commands(page, processActions)).toEqual([]);
 });
 
-test('pending catalog list and preview use current language, preserving query, selection and original messages', async ({ page }) => {
+test('닫은 세션 조회 창의 늦은 응답을 무시하고 다시 열면 선택한 언어와 대화 원문을 표시한다', async ({ page }) => {
   await nativeFixture(page, { holdList: true, holdPreview: true });
   await page.locator('#catalog-open').click();
   await expect.poll(async () => (await commands(page, ['catalog_list'])).length).toBe(1);
+  await page.locator('#catalog-close').click();
   await switchLanguage(page, 'en');
-  await expect(page.locator('#catalog-list-status')).toHaveText(/search|finding|loading/i);
-  await page.evaluate(() => (window as any).i18nFixture.releaseList());
+  await page.locator('#settings-close').click();
+  await page.evaluate(() => { const fixture = (window as any).i18nFixture; fixture.holdList = false; fixture.releaseList(); });
+  await expect(page.locator('#catalog-list [role=option]')).toHaveCount(0);
+  await page.locator('#catalog-open').click();
   await expect(page.locator('#catalog-list [role=option]')).toHaveCount(2);
   await expect.poll(async () => (await commands(page, ['catalog_preview'])).length).toBe(1);
   await expect(page.locator('#catalog-list-status')).toContainText(/2.*session/i);
+  await expect(page.locator('#catalog-search')).toHaveAttribute('placeholder', /session title/i);
+  await expect(page.locator('#catalog-project option').first()).toHaveText(/all projects/i);
+  await page.locator('#catalog-close').click();
   await switchLanguage(page, 'ko');
-  await expect(page.locator('#catalog-preview-status')).toContainText('불러오는 중');
-  await page.evaluate(() => (window as any).i18nFixture.releasePreview());
+  await page.locator('#settings-close').click();
+  await page.evaluate(() => { const fixture = (window as any).i18nFixture; fixture.holdPreview = false; fixture.releasePreview(); });
+  await expect(page.locator('#catalog-messages article')).toHaveCount(0);
+  await page.locator('#catalog-open').click();
   await expect(page.locator('#catalog-preview-status')).toContainText('읽기 전용');
   await page.locator('#catalog-search').fill('사용자 검색 초안');
-  await expect.poll(async () => (await commands(page, ['catalog_list'])).length).toBe(2);
-  await page.evaluate(() => (window as any).i18nFixture.releaseList());
-  await expect.poll(async () => (await commands(page, ['catalog_preview'])).length).toBe(2);
-  await page.evaluate(() => (window as any).i18nFixture.releasePreview());
+  await expect.poll(async () => (await commands(page, ['catalog_list'])).length).toBe(4);
+  await expect.poll(async () => (await commands(page, ['catalog_preview'])).length).toBe(3);
   await expect(page.locator('#catalog-preview-status')).toContainText('읽기 전용');
   await page.locator('#catalog-list [role=option]').nth(1).click();
-  await expect.poll(async () => (await commands(page, ['catalog_preview'])).length).toBe(3);
-  await page.evaluate(() => (window as any).i18nFixture.releasePreview());
+  await expect.poll(async () => (await commands(page, ['catalog_preview'])).length).toBe(4);
   await expect(page.locator('#catalog-messages')).toContainText('사용자가 작성한 대화 원문');
-  const before = await commands(page, ['catalog_list', 'catalog_preview', 'list_projects']);
-  await switchLanguage(page, 'en');
-  await expect(page.locator('#catalog-search')).toHaveAttribute('placeholder', /session title/i);
-  await expect(page.locator('#catalog-close')).toHaveAttribute('aria-label', /close/i);
-  await expect(page.locator('#catalog-project option').first()).toHaveText(/all projects/i);
+  await expect(page.locator('#catalog-search')).toHaveAttribute('placeholder', /세션 제목/);
+  await expect(page.locator('#catalog-close')).toHaveAttribute('aria-label', '세션 불러오기 닫기');
   await expect(page.locator('#catalog-list [aria-selected=true]')).toHaveAttribute('data-thread-id', catalogRows[1].id);
   await expect(page.locator('#catalog-session-title')).toHaveText(catalogRows[1].title);
-  await expect(page.locator('#catalog-messages article strong')).toHaveText(/user/i);
+  await expect(page.locator('#catalog-messages article strong')).toHaveText('사용자');
   await expect(page.locator('#catalog-messages article p')).toHaveText('사용자가 작성한 대화 원문');
-  await expect(page.locator('#catalog-preview-status')).toContainText(/read.only/i);
-  expect((await page.locator('#catalog-metadata dt').allTextContents()).some(text => /[가-힣]/.test(text))).toBe(false);
+  await expect(page.locator('#catalog-preview-status')).toContainText('읽기 전용');
   await expect(page.locator('#catalog-project')).toHaveValue('');
   await expect(page.locator('#catalog-search')).toHaveValue('사용자 검색 초안');
-  expect(await commands(page, ['catalog_list', 'catalog_preview', 'list_projects'])).toEqual(before);
   expect(await commands(page, processActions)).toEqual([]);
 });

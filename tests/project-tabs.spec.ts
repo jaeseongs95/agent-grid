@@ -342,7 +342,9 @@ test('project names are text, favorites sort first and repeated management keeps
   for (let attempt = 0; attempt < 3; attempt++) { await manage.click(); await page.locator('#project-dialog-close').click(); }
   await expect(page.locator('#project-dialog')).toHaveCount(1);
   await expect(page.locator('#project-delete-dialog')).toHaveCount(1);
+  await page.locator('#settings-open').click();
   await page.locator('#language-select').selectOption('en');
+  await page.locator('#settings-close').click();
   await manage.click();
   await expect(page.locator('#project-dialog-title')).toHaveText('Manage project');
   await expect(page.getByLabel('Project name', { exact: true })).toHaveValue('이름 변경');

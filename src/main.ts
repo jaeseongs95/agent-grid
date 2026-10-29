@@ -49,23 +49,25 @@ let projectSelectionVersion = 0;
 if (native) $('#app').hidden = true;
 $('#app').innerHTML = `
   <aside class="sidebar">
-    <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">0.5.0</span></a>
+    <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">0.5.1</span></a>
     <div class="workspace-label">WORKSPACE <span class="local-pill">LOCAL</span></div>
     <button class="workspace-choice"><span class="folder-icon">▤</span><span>나의 작업 공간<small>독립된 터미널, 하나의 화면</small></span></button>
-    <div class="side-heading">프로젝트 <span id="project-count">0</span></div>
-    <button id="project-create" class="project-import quiet-button">+ 새 프로젝트</button>
-    <button id="project-import" class="project-import quiet-button">+ 프로젝트 가져오기</button>
-    <div id="projects" class="projects"></div>
-    <div class="side-heading sessions-heading">세션 <span id="side-count">0</span><button id="side-add" class="icon-button" aria-label="새 세션 만들기">+</button></div>
-    <nav id="session-list" aria-label="세션 목록"></nav>
+    <div class="sidebar-lists">
+      <section class="sidebar-projects" aria-labelledby="projects-heading">
+        <div id="projects-heading" class="side-heading">프로젝트 <span id="project-count">0</span></div>
+        <div class="project-actions"><button id="project-create" class="project-import quiet-button">+ 새 프로젝트</button><button id="project-import" class="project-import quiet-button">+ 프로젝트 가져오기</button></div>
+        <div id="projects" class="projects"></div>
+      </section>
+      <section class="sidebar-sessions" aria-labelledby="sessions-heading">
+        <div id="sessions-heading" class="side-heading sessions-heading">세션 <span id="side-count">0</span><button id="side-add" class="icon-button" aria-label="새 세션 만들기">+</button></div>
+        <nav id="session-list" aria-label="세션 목록"></nav>
+      </section>
+    </div>
     <button id="external-toggle" class="side-link"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button>
-    <button id="codex-settings-open" class="side-link"><span>⚙</span> 실행 파일 설정</button>
-    <button id="extensions-open" class="side-link"><span>◇</span> <span id="extensions-open-label">플러그인·스킬</span></button>
-    <div class="language-setting"><label for="language-select">언어 / Language</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div>
     <div class="sidebar-bottom"><span class="connection-dot"></span><span id="connection">연결 확인 중</span><small>Windows · 로컬 실행</small></div>
   </aside>
   <main>
-    <header class="topbar"><div class="workspace-actions"><h1 class="workspace-title">OpenDIY Desktop</h1><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="알림 보기">♧<span id="notification-count" hidden></span></button><button id="exit" class="quiet-button">앱 종료</button></div></header>
+    <header class="topbar"><div class="workspace-actions"><h1 class="workspace-title">OpenDIY Desktop</h1><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="알림 보기">♧<span id="notification-count" hidden></span></button><button id="settings-open" class="icon-button" aria-label="설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" title="설정">⚙</button><button id="exit" class="quiet-button">앱 종료</button></div></header>
     <div id="project-tabs" class="project-tabs" role="tablist" aria-label="프로젝트별 세션"></div>
     <section class="toolbar" aria-label="그리드 도구"><div class="session-summary"><span class="connection-dot"></span><strong id="running-count">0</strong> 실행 중 <span class="divider"></span><span id="total-count">0개 세션</span></div><div class="layout-tools"><button id="search-toggle" class="quiet-button" title="활성 터미널 검색 (Ctrl+Shift+F)">⌕ <span>검색</span></button><span class="divider"></span><span class="layout-label">열</span><div id="column-options" class="segmented" role="group" aria-label="그리드 열 수"><button data-columns="1" aria-label="1열">▯</button><button data-columns="2" class="active" aria-label="2열">▥</button><button data-columns="3" aria-label="3열">▥▯</button><button data-columns="4" aria-label="4열">▥▥</button></div></div></section>
     <div id="runtime-banner" class="runtime-banner" hidden></div>
@@ -75,6 +77,7 @@ $('#app').innerHTML = `
     <footer><span><span class="connection-dot"></span> <span id="footer-state">로컬 세션만 제어합니다</span></span><span>드래그로 순서 변경 <i>·</i> 경계선으로 크기 조절 <i>·</i> Alt + 1–9</span><span id="save-status">레이아웃 자동 저장</span></footer>
   </main>
   <div id="toast-area" class="toast-area" role="status" aria-live="polite"></div>
+  <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">설정</h2><button id="settings-close" class="icon-button" data-close aria-label="설정 닫기" autofocus>×</button></div><div class="settings-options"><button id="codex-settings-open" class="side-link" aria-haspopup="dialog" aria-controls="codex-settings-dialog"><span>⚙</span> 실행 파일 설정</button><button id="extensions-open" class="side-link" aria-haspopup="dialog" aria-controls="extensions-dialog"><span>◇</span> <span id="extensions-open-label">플러그인·스킬</span></button></div><div class="language-setting"><label for="language-select">언어</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div></dialog>
   <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><span class="eyebrow">NEW SESSION</span><button type="button" class="icon-button" data-close aria-label="닫기">×</button></div><h2>새 세션 만들기</h2><p>선택한 프로젝트에서 로컬 에이전트를 시작합니다.</p><label for="session-title">세션 이름</label><input id="session-title" name="title" placeholder="예: API 개선" required maxlength="120"/><label for="session-cwd">프로젝트 경로</label><input id="session-cwd" name="cwd" placeholder="C:\\work\\my-project" required/><small>실제로 존재하는 로컬 디렉터리의 절대 경로를 입력하세요.</small><label for="session-thread">이어갈 스레드 ID <span class="optional">선택</span></label><input id="session-thread" name="thread" placeholder="비워 두면 새 대화로 시작합니다"/><div id="create-error" class="inline-error" role="alert" hidden></div><div class="dialog-actions"><button type="button" class="quiet-button" data-close>취소</button><button id="create-submit" class="primary-button" type="submit">세션 시작 →</button></div></form></dialog>
   <dialog id="restore-dialog"><div class="dialog-heading"><span class="eyebrow">SAVED WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>저장된 세션</h2><p>버튼을 누른 세션만 시작합니다. 스레드 ID가 있으면 해당 대화를 재개합니다.</p><div id="restore-list" class="restore-list"></div></dialog>
   <dialog id="external-dialog"><div class="dialog-heading"><span class="eyebrow">READ ONLY</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>외부 세션</h2><p>다른 앱에서 발견한 기록입니다. 관측 정보이며 현재 실행 상태는 미확인입니다. 입력하거나 종료할 수 없습니다.</p><button id="external-refresh" class="quiet-button">새로 고침</button><div id="external-list" class="external-list"></div></dialog>
@@ -98,6 +101,9 @@ const markupLabels: Record<string, [string, string]> = {
   "외부 세션": ["외부 세션", "External sessions"],
   "읽기 전용": ["읽기 전용", "Read only"],
   "실행 파일 설정": ["실행 파일 설정", "Executable settings"],
+  "설정": ["설정", "Settings"],
+  "설정 열기": ["설정 열기", "Open settings"],
+  "설정 닫기": ["설정 닫기", "Close settings"],
   "언어": ["언어", "Language"],
   "연결 확인 중": ["연결 확인 중", "Checking connection"],
   "Windows · 로컬 실행": ["Windows · 로컬 실행", "Windows · local execution"],
@@ -376,12 +382,22 @@ function createTerminal(session: Session) {
   refreshInputState(session.id);
   terminal.onData(data => sendInput(session.id, data));
   terminal.onResize(() => queueResize(session.id));
-  terminal.attachCustomKeyEventHandler(event => !(event.type === 'keydown' && ((event.altKey && /^[1-9]$/.test(event.key)) || (event.ctrlKey && event.key === 'Tab') || (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'f'))));
+  terminal.attachCustomKeyEventHandler(event => {
+    if (event.key === 'Enter' && event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
+      // xterm does not distinguish Shift+Enter. The CLI decodes this CSI-u key
+      // on Windows too; keep it in the same bounded, generation-pinned queue.
+      if (event.isComposing || event.keyCode === 229) return false;
+      event.preventDefault();
+      if (event.type === 'keydown') sendInput(session.id, '\u001b[13;2u');
+      return false;
+    }
+    return !(event.type === 'keydown' && ((event.altKey && /^[1-9]$/.test(event.key)) || (event.ctrlKey && event.key === 'Tab') || (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'f')));
+  });
   card.addEventListener('pointerdown', () => setActive(session.id, false));
   card.querySelector('.maximize')!.addEventListener('click', () => { maximized = maximized === session.id ? '' : session.id; renderGrid(); setActive(session.id); });
   card.querySelector('.stop')!.addEventListener('click', () => {
     const current = sessions.get(session.id)!;
-    if (['restored', 'stopped', 'exited'].includes(current.state)) { removeSession(session.id); return; }
+    if (!current.active) { removeSession(session.id); return; }
     if (confirm(t(`“${current.title}” 세션을 종료할까요? 실행 중인 작업이 중단됩니다.`, `Stop session “${current.title}”? Running work will be interrupted.`))) {
       void call('session_stop', { id: current.id, generation: current.generation }).then(() => {
         // A reaped error may not emit another state event. A live observation error
@@ -587,7 +603,7 @@ $('#project-tabs').addEventListener('keydown', event => {
   selectProject(tabs[next].dataset.projectKey ?? ''); $('#project-tabs [aria-selected="true"]').focus();
 });
 const extensionsManager = createExtensionsManager({ call, notify });
-const mobileControl = createMobileControl({ call, notify });
+const mobileControl = createMobileControl({ call, notify, openExecutableSettings: () => void executableSettings.open() });
 const weeklyUsage = createWeeklyUsage({ call });
 $('.sidebar-bottom').before(weeklyUsage.element);
 bindText($('#extensions-open-label'), '플러그인·스킬', 'Plugins & skills');
@@ -598,6 +614,7 @@ const executableSettings = createExecutableSettings(async <T>(command: string, a
   return result;
 });
 $('#codex-settings-open').onclick = () => void executableSettings.open();
+$('#settings-open').onclick = () => $<HTMLDialogElement>('#settings-dialog').showModal();
 for (const button of document.querySelectorAll<HTMLElement>('[data-close]')) button.onclick = () => button.closest('dialog')?.close();
 $('#column-options').onclick = event => { const button = (event.target as HTMLElement).closest<HTMLElement>('[data-columns]'); if (button) { columns = Number(button.dataset.columns); maximized = ''; renderGrid(); scheduleSave(); } };
 

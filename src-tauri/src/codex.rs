@@ -174,6 +174,7 @@ fn timed_out(error: &tungstenite::Error) -> bool {
 struct Rpc<S: Read + Write> {
     ws: WebSocket<S>,
     next_id: u64,
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 fn adopt_root(threads: &[Value], cwd: &Path) -> Result<Option<Value>, String> {
@@ -209,6 +210,7 @@ fn read_state(rpc: &mut Rpc<TcpStream>, selected: Option<&str>, cwd: &Path) -> R
 }
 impl<S: Read + Write> Rpc<S> {
     fn send(&mut self, value: Value) -> Result<(), String> {
+        check_cancelled(self.cancelled.as_ref())?;
         self.ws.send(Message::Text(value.to_string().into())).map_err(|e| format!("Codex transport write failed: {e}"))
     }
     fn read(&mut self) -> Result<Option<Value>, String> {
@@ -224,11 +226,13 @@ impl<S: Read + Write> Rpc<S> {
         }
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        check_cancelled(self.cancelled.as_ref())?;
         self.next_id += 1;
         let id = self.next_id;
         self.send(json!({"id":id,"method":method,"params":params}))?;
         let deadline = Instant::now() + RPC_TIMEOUT;
         while Instant::now() < deadline {
+            check_cancelled(self.cancelled.as_ref())?;
             if let Some(message) = self.read()? {
                 if let Some(result) = response(&message, id) { return result; }
             }
@@ -238,10 +242,15 @@ impl<S: Read + Write> Rpc<S> {
     }
 }
 
-fn connect(endpoint: &str, token: &str, server: &mut Child, job: &ProcessJob) -> Result<Rpc<TcpStream>, String> {
+fn check_cancelled(cancelled: Option<&Arc<AtomicBool>>) -> Result<(), String> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) { Err("Session startup was cancelled".into()) } else { Ok(()) }
+}
+
+fn connect(endpoint: &str, token: &str, server: &mut Child, job: &ProcessJob, cancelled: Option<Arc<AtomicBool>>) -> Result<Rpc<TcpStream>, String> {
     let address = endpoint.trim_start_matches("ws://").parse().map_err(|e| format!("Invalid loopback endpoint: {e}"))?;
     let deadline = Instant::now() + Duration::from_secs(12);
     loop {
+        check_cancelled(cancelled.as_ref())?;
         if let Some(status) = server.try_wait().map_err(|e| format!("Cannot inspect Codex server: {e}"))? {
             return Err(format!("Codex app-server exited before connecting ({status}); verify the CLI supports authenticated WebSockets"));
         }
@@ -250,7 +259,9 @@ fn connect(endpoint: &str, token: &str, server: &mut Child, job: &ProcessJob) ->
             // A released ephemeral port may have been claimed by an unrelated listener.
             job.verify_tcp_peer(&stream)
                 .map_err(|error| format!("Codex app-server TCP peer ownership verification failed: {error}"))?;
-            return authenticated_socket(endpoint, token, stream);
+            let mut rpc = authenticated_socket(endpoint, token, stream)?;
+            rpc.cancelled = cancelled;
+            return Ok(rpc);
         }
         if Instant::now() >= deadline { return Err("Codex app-server did not become ready within 12 seconds".into()); }
         thread::sleep(Duration::from_millis(80));
@@ -269,13 +280,13 @@ fn authenticated_socket(endpoint: &str, token: &str, stream: TcpStream) -> Resul
     // Handshake errors can contain the authorization header; never return them.
     let (ws, _) = tungstenite::client::client_with_config(request, stream, Some(config))
         .map_err(|_| "Codex authenticated WebSocket handshake failed".to_string())?;
-    Ok(Rpc {ws, next_id:0})
+    Ok(Rpc {ws, next_id:0, cancelled:None})
 }
 
 #[cfg(windows)]
 pub(crate) fn verify_connect_peer_fixture(endpoint: &str, server: &mut Child, job: &ProcessJob) -> Result<(), String> {
     // Exercise the real connection path: the unrelated fixture listener must receive zero HTTP bytes.
-    connect(endpoint, "agent-grid-port-preemption-fixture", server, job).map(|_| ())
+    connect(endpoint, "agent-grid-port-preemption-fixture", server, job, None).map(|_| ())
 }
 
 fn verified_thread(thread: &Value, requested: &str, cwd: &Path) -> Result<(), String> {
@@ -325,7 +336,13 @@ fn publish_status(previous: &mut Option<String>, state: String, on_event: &dyn F
 /// Both terminal sessions and short-lived catalog requests use the same owned,
 /// authenticated server. Browsing never creates/resumes a conversation.
 fn launch_server(exe: &OsString, cwd: &Path, thread_id: Option<&str>) -> Result<(CodexSession, Rpc<TcpStream>), String> {
+    launch_server_with_cancellation(exe, cwd, thread_id, None)
+}
+
+fn launch_server_with_cancellation(exe: &OsString, cwd: &Path, thread_id: Option<&str>, cancelled: Option<Arc<AtomicBool>>) -> Result<(CodexSession, Rpc<TcpStream>), String> {
+    check_cancelled(cancelled.as_ref())?;
     let (no_remote_control, namespaced_remote) = server_capabilities(exe, cwd)?;
+    check_cancelled(cancelled.as_ref())?;
     // Opt-in namespace isolates this owned process from all existing servers'
     // enrollment records. Older CLIs remain usable with mobile mutations gated.
     let remote_client_name = namespaced_remote.then(|| format!("opendiy-desktop-{}", Uuid::new_v4().simple()));
@@ -348,7 +365,7 @@ fn launch_server(exe: &OsString, cwd: &Path, thread_id: Option<&str>) -> Result<
     session.mobile = Some(MobileConnection::new(endpoint.clone(), token.clone(), session.job.as_ref().unwrap(), session.stopped.clone(), namespaced_remote));
     session._launch_gate.release()?;
     let job = session.job.as_ref().ok_or("Codex server has no owned process job")?;
-    let mut rpc = connect(&endpoint, &token, &mut session.server, job)?;
+    let mut rpc = connect(&endpoint, &token, &mut session.server, job, cancelled)?;
     rpc.call("initialize", initialize())?;
     rpc.send(json!({"method":"initialized","params":{}}))?;
     Ok((session, rpc))
@@ -359,10 +376,14 @@ pub fn prepare(cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEv
 }
 
 pub fn prepare_with_executable(exe: &OsString, cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEvent) + Send + Sync>) -> Result<CodexSession, String> {
+    prepare_with_cancellation(exe, cwd, thread_id, on_event, Arc::new(AtomicBool::new(false)))
+}
+
+pub(crate) fn prepare_with_cancellation(exe: &OsString, cwd: &Path, thread_id: Option<&str>, on_event: Arc<dyn Fn(CodexEvent) + Send + Sync>, cancelled: Arc<AtomicBool>) -> Result<CodexSession, String> {
     let cwd = cwd.canonicalize().map_err(|e| format!("Cannot open working directory: {e}"))?;
     if !cwd.is_dir() { return Err("Working directory must be a directory".into()); }
     if let Some(id) = thread_id { Uuid::parse_str(id).map_err(|_| "Saved Codex thread ID is not a UUID; refusing ambiguous name-based resume")?; }
-    let (mut session, mut rpc) = launch_server(exe, &cwd, thread_id)?;
+    let (mut session, mut rpc) = launch_server_with_cancellation(exe, &cwd, thread_id, Some(cancelled))?;
     if let Some(id) = thread_id {
         let existing = rpc.call("thread/read", json!({"threadId":id,"includeTurns":false}))?;
         verified_thread(&existing["thread"], id, &cwd)?;
@@ -504,7 +525,7 @@ impl Proxy {
         match handshake {
             Ok((mut ws, _)) => {
                 ws.get_mut().timeout = Duration::from_millis(500);
-                proxy.rpc = Some(Rpc {ws,next_id:0});
+                proxy.rpc = Some(Rpc {ws,next_id:0,cancelled:None});
                 Ok(proxy)
             }
             Err(error) => {
@@ -560,6 +581,34 @@ mod startup_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resume_rpc_cancellation_interrupts_a_pending_reply_and_blocks_late_send() {
+        use std::sync::atomic::AtomicUsize;
+        struct PendingReply { cancelled: Arc<AtomicBool>, reads: Arc<AtomicUsize>, writes: Arc<AtomicUsize> }
+        impl Read for PendingReply {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                self.cancelled.store(true, Ordering::Release);
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        impl Write for PendingReply {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> { self.writes.fetch_add(1, Ordering::Relaxed); Ok(bytes.len()) }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let stream = PendingReply { cancelled: cancelled.clone(), reads: reads.clone(), writes: writes.clone() };
+        let mut rpc = Rpc { ws: WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Client, None), next_id:0, cancelled:Some(cancelled) };
+        let started = Instant::now();
+        assert!(rpc.call("thread/read", json!({"threadId":"fixture"})).unwrap_err().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1), "cancel must not wait for the 20-second RPC deadline");
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        let sent = writes.load(Ordering::Relaxed);
+        assert!(rpc.call("initialize", json!({})).unwrap_err().contains("cancelled"));
+        assert_eq!(writes.load(Ordering::Relaxed), sent, "a cancelled startup must not send the next RPC");
+    }
     #[test]
     fn rpc_replies_require_exact_numeric_id_and_preserve_errors() {
         assert!(response(&json!({"id":2,"result":{}}), 1).is_none());

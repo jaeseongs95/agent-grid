@@ -53,6 +53,19 @@ async function workspace(page: Page) {
   await input(page).focus();
 }
 
+test('Shift+Enter sends the CLI newline key once while plain Enter and IME keep their own input', async ({ page }) => {
+  await workspace(page);
+  await input(page).press('Shift+Enter');
+  await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b[13;2u']);
+  await input(page).press('Enter');
+  await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b[13;2u', '\r']);
+  await input(page).evaluate(element => {
+    element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229, shiftKey: true, isComposing: true, bubbles: true }));
+  });
+  await input(page).press('a');
+  await expect.poll(() => page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['\u001b[13;2u', '\r', 'a']);
+});
+
 test('held native input retains at most128 operations, preserves order and resumes stdin after drain', async ({ page }) => {
   await workspace(page);
   await page.evaluate(() => { (window as any).flow.holdWrites = true; });
@@ -119,6 +132,17 @@ test('disposing a terminal clears pending input while its one inflight request c
   await page.evaluate(() => (window as any).flow.releaseWrites());
   await expect.poll(() => page.evaluate(() => (window as any).flow.activeWrites)).toBe(0);
   expect(await page.evaluate(() => (window as any).flow.sent.map((item: any) => item.data))).toEqual(['x']);
+});
+
+test('an already reaped error session closes without a process-stop prompt or native stop', async ({ page }) => {
+  await workspace(page);
+  await page.evaluate(() => (window as any).flow.emit({ id: 'flow-a', state: 'error', active: false }));
+  let prompts = 0;
+  page.on('dialog', async dialog => { prompts++; await dialog.dismiss(); });
+  await card(page).getByLabel('이 세션 종료').click();
+  await expect(card(page)).toHaveCount(0);
+  expect(prompts).toBe(0);
+  expect(await page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_stop'))).toEqual([]);
 });
 
 test('held native resize keeps one request and the latest pending geometry, not an IPC chain', async ({ page }) => {
