@@ -103,7 +103,7 @@ test('switch applies immediately and the selected language survives a real reloa
   expect(await page.evaluate(() => localStorage.getItem('agent-grid-language'))).toBe('ko');
 });
 
-test('live terminals, user content, selection and drafts survive repeated language changes without process actions', async ({ page }) => {
+test('live terminals, user content, project selection and search drafts survive repeated language changes without process actions', async ({ page }) => {
   await nativeFixture(page);
   const card = page.locator(`.terminal-card[data-id="${session.id}"]`);
   await page.evaluate(({ session }) => {
@@ -114,8 +114,6 @@ test('live terminals, user content, selection and drafts survive repeated langua
   await expect(card.locator('.xterm-rows')).toContainText('USER_OUTPUT');
   const output = await card.locator('.xterm-rows').innerText();
   await page.locator('#project-tabs [role=tab]').filter({ hasText: project.name }).click();
-  await card.locator('input[type=checkbox]').check();
-  await page.locator('#broadcast-input').fill('전송하지 않은 초안');
   await page.locator('#search-toggle').click();
   await page.locator('#terminal-search').fill('USER_OUTPUT');
   await expect(page.locator('#search-result')).toHaveText('결과 찾음');
@@ -124,18 +122,13 @@ test('live terminals, user content, selection and drafts survive repeated langua
   await expect(card.locator('.session-state')).toHaveText(/ready|idle|input/i);
   await expect(card.locator('.maximize')).toHaveAttribute('aria-label', /maximize/i);
   await expect(card.locator('.stop')).toHaveAttribute('aria-label', /stop|close|end/i);
-  await expect(card.locator('input')).toHaveAttribute('aria-label', /select|broadcast|send to this session/i);
-  await expect(page.locator('#broadcast-input')).toHaveAttribute('placeholder', /session/i);
   await expect(page.locator('#terminal-search')).toHaveAttribute('placeholder', /search/i);
   await expect(page.locator('#search-result')).toHaveText(/found/i);
   await expect(page.locator('#project-tabs [role=tab]').first()).toContainText(/all/i);
   await expect(page.locator('#project-tabs [role=tab][aria-selected=true]')).toContainText(project.name);
-  await expect(page.locator('#selected-count')).toContainText(/selected/i);
   await expect(card.locator('.terminal-title')).toHaveText(session.title);
   await expect(card.locator('.terminal-path')).toContainText(session.cwd);
   await expect(card.locator('.terminal-identity')).toHaveAttribute('title', session.threadId);
-  await expect(card.locator('input')).toBeChecked();
-  await expect(page.locator('#broadcast-input')).toHaveValue('전송하지 않은 초안');
   await expect(page.locator('#terminal-search')).toHaveValue('USER_OUTPUT');
   expect(await card.locator('.xterm-rows').innerText()).toBe(output);
   expect(await page.evaluate(() => { const f = (window as any).i18nFixture; return f.card.isConnected && f.xterm.isConnected && f.card.querySelector('.xterm-screen') === f.xterm; })).toBe(true);

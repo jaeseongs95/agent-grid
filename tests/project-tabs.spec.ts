@@ -163,18 +163,19 @@ test('session shortcuts, maximize and reorder stay within the selected project',
   await expect.poll(() => visibleIds(page)).toEqual(['a2', 'b1', 'a1', 'parent', 'child', 'sibling']);
 });
 
-test('broadcast cannot send to a selection hidden by a project switch', async ({ page }) => {
+test('terminals have no shared send controls and direct input reaches only its focused session', async ({ page }) => {
   await workspace(page);
-  await card(page, 'a1').getByLabel('선택 전송 대상', { exact: true }).check();
-  await card(page, 'b1').getByLabel('선택 전송 대상', { exact: true }).check();
+  await expect(page.locator('.broadcast-panel, [id^=broadcast-], #clear-selection, #selected-count, .select-session, .terminal-header input[type=checkbox]')).toHaveCount(0);
   await tab(page, 'Alpha').click();
-  await page.locator('#broadcast-input').fill('alpha-only');
-  await page.locator('#broadcast-send').click();
-  await expect(page.locator('#broadcast-results')).toContainText('Alpha first: 전송됨');
-  const writes = await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => call.command === 'session_write').map((call: any) => call.args));
-  expect(writes).toEqual([{ id: 'a1', generation: 7, data: 'alpha-only\r' }]);
+  await card(page, 'a1').locator('.xterm-helper-textarea').press('x');
+  await page.keyboard.insertText('한글😀');
   await tab(page, 'Beta').click();
-  await expect(page.locator('#broadcast-send')).toBeDisabled();
+  await card(page, 'b1').locator('.xterm-helper-textarea').press('b');
+  await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => call.command === 'session_write').map((call: any) => call.args))).toEqual([
+    { id: 'a1', generation: 7, data: 'x' },
+    { id: 'a1', generation: 7, data: '한글😀' },
+    { id: 'b1', generation: 7, data: 'b' },
+  ]);
 });
 
 test('selected project supplies new-session and catalog scope, import creates a selected persistent tab', async ({ page }) => {
@@ -237,20 +238,17 @@ test('a delayed start cannot steal the project selected after its create popup c
   await expect(card(page, 'b1')).toHaveClass(/focused/);
 });
 
-for (const back of [false, true]) test(`queued direct and broadcast input stays cancelled after switching ${back ? 'away and back' : 'away'}`, async ({ page }) => {
+for (const back of [false, true]) test(`queued direct input stays cancelled after switching ${back ? 'away and back' : 'away'}`, async ({ page }) => {
   await workspace(page);
   await tab(page, 'Alpha').click();
   await page.evaluate(() => { (window as any).tabsFixture.holdNextWrite = true; });
   await card(page, 'a1').locator('.xterm-helper-textarea').press('x');
   await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => call.command === 'session_write').length)).toBe(1);
   await card(page, 'a1').locator('.xterm-helper-textarea').press('y');
-  await card(page, 'a1').getByLabel('선택 전송 대상', { exact: true }).check();
-  await page.locator('#broadcast-input').fill('must-not-send');
-  await page.locator('#broadcast-send').click();
   await tab(page, 'Beta').click();
   if (back) await tab(page, 'Alpha').click();
   await page.evaluate(() => (window as any).tabsFixture.releaseWrite());
-  await expect(page.locator('#broadcast-results')).toContainText('실패');
+  await expect(card(page, 'a1')).toHaveAttribute('data-input-pending', '0');
   const writes = await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => call.command === 'session_write').map((call: any) => call.args.data));
   expect(writes).toEqual(['x']);
 });

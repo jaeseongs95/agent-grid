@@ -7,8 +7,7 @@ A Windows desktop grid for running coding-agent CLI sessions side by side.
 The Codex adapter supports [OpenDIY Codex](https://github.com/jaeseongs95/opendiy-codex),
 the selected runtime for this project, and compatible official Codex CLI versions. Arrange terminals in a
 resizable grid, group them by working directory, search terminal output and
-send input to selected sessions. Waiting and unknown sessions are excluded
-from group input. Each target reports its own delivery result.
+enter text directly in each terminal.
 
 ![OpenDIY Desktop design preview](docs/design-demo.png)
 
@@ -66,8 +65,8 @@ its group without restarting its terminal or changing its actual working directo
 Use the project tabs above the grid, or click a project in the sidebar, to
 view that project's sessions. **All** shows every session. Switching tabs keeps
 all terminals running and retains their output. Switching projects or moving a session
-shows its latest terminal output; group input and keyboard
-session shortcuts apply only to the visible project. When the selected project has
+shows its latest terminal output; keyboard session shortcuts apply only to the
+visible project. When the selected project has
 a default folder, new sessions and the session browser start with that directory.
 
 **Load sessions** opens a two-pane popup. Search session titles and filter by
@@ -78,9 +77,8 @@ so it does not require an existing desktop daemon. Recent messages are fetched
 in bounded pages and are not stored in OpenDIY Desktop's database.
 
 Use **New session** to enter a directory directly. Use the official TUI to choose
-a model, sign in or answer permission prompts. Select
-terminal cards before using group input. A reported delivery means bytes
-reached that terminal; it does not mean a model accepted or completed a turn.
+a model, sign in or answer permission prompts. Enter text directly in the terminal
+you want to control.
 
 ## Plugins and skills
 

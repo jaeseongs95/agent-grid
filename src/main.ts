@@ -5,7 +5,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { SearchAddon } from '@xterm/addon-search';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
-import { MAX_WORKSPACE_SESSIONS, acceptOutput, broadcast, broadcastTargets, chooseSavedSessions, parseLayout, projectGroups, sessionProjectKey, savedSessionMetadata, updateSession, writable, type Layout, type Output, type SavedSession, type Session, type SessionInfo, type ProjectInfo } from './model';
+import { MAX_WORKSPACE_SESSIONS, acceptOutput, chooseSavedSessions, parseLayout, projectGroups, sessionProjectKey, savedSessionMetadata, updateSession, type Layout, type Output, type SavedSession, type Session, type SessionInfo, type ProjectInfo } from './model';
 import { createSessionBrowser } from './session-browser';
 import { createProjectManager } from './project-manager';
 import { createExecutableSettings } from './executable-settings';
@@ -22,8 +22,7 @@ const $ = <T extends HTMLElement = HTMLElement>(selector: string) => document.qu
 const states: Record<string, [string, string]> = { restored: ['저장됨 · 미실행', 'Saved · not started'], notLoaded: ['상태 미확인', 'Unknown state'], starting: ['시작 중', 'Starting'], running: ['실행 중', 'Running'], idle: ['입력 가능', 'Ready'], waiting: ['응답 대기', 'Waiting for response'], stopping: ['종료 중', 'Stopping'], stopped: ['종료됨', 'Stopped'], exited: ['종료됨', 'Exited'], error: ['오류', 'Error'], unknown: ['상태 미확인', 'Unknown state'] };
 function stateLabels(state: string): [string, string] { return states[state] ?? states.unknown; }
 const sessions = new Map<string, Session>();
-const selected = new Set<string>();
-interface QueuedInput { data: string; generation: number; selectionVersion: number; broadcast?: boolean }
+interface QueuedInput { data: string; generation: number; selectionVersion: number }
 interface QueuedResize { generation: number; selectionVersion: number; cols: number; rows: number }
 const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; input: TerminalInputQueue<QueuedInput>; resize: TerminalResizeQueue<QueuedResize>; inputWarning: boolean; resizeTimer?: ReturnType<typeof setTimeout> }>();
 const pending = new Map<string, Output[]>();
@@ -66,15 +65,13 @@ $('#app').innerHTML = `
     <div class="sidebar-bottom"><span class="connection-dot"></span><span id="connection">연결 확인 중</span><small>Windows · 로컬 실행</small></div>
   </aside>
   <main>
-    <header class="topbar"><div class="breadcrumb">작업 공간 <span>/</span> <strong>세션 그리드</strong></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="알림 보기">♧<span id="notification-count" hidden></span></button><button id="exit" class="quiet-button">앱 종료</button></div></header>
-    <section class="workspace-header"><div><div class="eyebrow">YOUR AGENTS, IN VIEW</div><h1>세션 그리드<span class="heading-dot">.</span></h1><p>흐름을 놓치지 않고, 여러 작업을 함께.</p></div><div class="workspace-actions"><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div></section>
+    <header class="topbar"><div class="workspace-actions"><h1 class="workspace-title">OpenDIY Desktop</h1><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="알림 보기">♧<span id="notification-count" hidden></span></button><button id="exit" class="quiet-button">앱 종료</button></div></header>
     <div id="project-tabs" class="project-tabs" role="tablist" aria-label="프로젝트별 세션"></div>
     <section class="toolbar" aria-label="그리드 도구"><div class="session-summary"><span class="connection-dot"></span><strong id="running-count">0</strong> 실행 중 <span class="divider"></span><span id="total-count">0개 세션</span></div><div class="layout-tools"><button id="search-toggle" class="quiet-button" title="활성 터미널 검색 (Ctrl+Shift+F)">⌕ <span>검색</span></button><span class="divider"></span><span class="layout-label">열</span><div id="column-options" class="segmented" role="group" aria-label="그리드 열 수"><button data-columns="1" aria-label="1열">▯</button><button data-columns="2" class="active" aria-label="2열">▥</button><button data-columns="3" aria-label="3열">▥▯</button><button data-columns="4" aria-label="4열">▥▥</button></div></div></section>
     <div id="runtime-banner" class="runtime-banner" hidden></div>
     <div id="restore-banner" class="restore-banner" hidden><span>저장된 작업 공간이 있습니다. 프로세스는 자동으로 시작하지 않습니다.</span><button id="restore-open" class="quiet-button">저장 세션 보기 →</button></div>
     <section id="search-bar" class="search-bar" hidden><label for="terminal-search">활성 터미널 검색</label><input id="terminal-search" placeholder="검색어 입력"/><button id="search-prev" class="quiet-button" aria-label="이전 검색 결과">↑</button><button id="search-next" class="quiet-button" aria-label="다음 검색 결과">↓</button><span id="search-result" role="status"></span><button id="search-close" class="icon-button" aria-label="검색 닫기">×</button></section>
     <section id="grid-area" class="grid-area" role="tabpanel"><div id="grid" class="terminal-grid"></div><div id="grid-handles"></div><div id="empty" class="empty"><div class="empty-grid">▦</div><h2>다음 작업을 펼쳐 보세요</h2><p>프로젝트 경로를 선택해 첫 세션을 시작하세요.<br>각 세션은 독립된 터미널에서 실행됩니다.</p><button id="empty-add" class="primary-button">+ 첫 세션 만들기</button><small>Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션</small></div></section>
-    <section class="broadcast-panel"><div class="broadcast-top"><div><strong>선택 전송</strong><span id="selected-count">선택한 세션이 없습니다</span></div><button id="clear-selection" class="text-button">선택 해제</button></div><form id="broadcast-form"><span class="broadcast-symbol">↗</span><input id="broadcast-input" aria-label="선택한 세션에 보낼 메시지" placeholder="체크한 세션에 같은 메시지를 보냅니다. 대기·미확인 세션은 제외됩니다." autocomplete="off"/><button id="broadcast-send" type="submit" class="send-button" disabled>전송 <span>↵</span></button></form><div id="broadcast-results" class="broadcast-results" role="status" hidden></div></section>
     <footer><span><span class="connection-dot"></span> <span id="footer-state">로컬 세션만 제어합니다</span></span><span>드래그로 순서 변경 <i>·</i> 경계선으로 크기 조절 <i>·</i> Alt + 1–9</span><span id="save-status">레이아웃 자동 저장</span></footer>
   </main>
   <div id="toast-area" class="toast-area" role="status" aria-live="polite"></div>
@@ -104,13 +101,9 @@ const markupLabels: Record<string, [string, string]> = {
   "언어": ["언어", "Language"],
   "연결 확인 중": ["연결 확인 중", "Checking connection"],
   "Windows · 로컬 실행": ["Windows · 로컬 실행", "Windows · local execution"],
-  "작업 공간": ["작업 공간", "Workspace"],
-  "세션 그리드": ["세션 그리드", "Session grid"],
   "LOCAL WORKSPACE": ["로컬 작업 공간", "LOCAL WORKSPACE"],
   "알림 보기": ["알림 보기", "View notifications"],
   "앱 종료": ["앱 종료", "Exit app"],
-  "YOUR AGENTS, IN VIEW": ["에이전트 작업을 한눈에", "YOUR AGENTS, IN VIEW"],
-  "흐름을 놓치지 않고, 여러 작업을 함께.": ["흐름을 놓치지 않고, 여러 작업을 함께.", "Keep track of every task, all in one place."],
   "세션 불러오기": ["세션 불러오기", "Load sessions"],
   "새 세션": ["새 세션", "New session"],
   "프로젝트별 세션": ["프로젝트별 세션", "Sessions by project"],
@@ -137,12 +130,6 @@ const markupLabels: Record<string, [string, string]> = {
   "각 세션은 독립된 터미널에서 실행됩니다.": ["각 세션은 독립된 터미널에서 실행됩니다.", "Each session runs in its own terminal."],
   "+ 첫 세션 만들기": ["+ 첫 세션 만들기", "+ Create first session"],
   "Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션": ["Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션", "Alt + 1–9 switch sessions · Ctrl + Tab next session"],
-  "선택 전송": ["선택 전송", "Send to selected"],
-  "선택한 세션이 없습니다": ["선택한 세션이 없습니다", "No sessions selected"],
-  "선택 해제": ["선택 해제", "Clear selection"],
-  "선택한 세션에 보낼 메시지": ["선택한 세션에 보낼 메시지", "Message for selected sessions"],
-  "체크한 세션에 같은 메시지를 보냅니다. 대기·미확인 세션은 제외됩니다.": ["체크한 세션에 같은 메시지를 보냅니다. 대기·미확인 세션은 제외됩니다.", "Send the same message to checked sessions. Waiting or unknown sessions are excluded."],
-  "전송": ["전송", "Send"],
   "로컬 세션만 제어합니다": ["로컬 세션만 제어합니다", "Controlling local sessions only"],
   "드래그로 순서 변경": ["드래그로 순서 변경", "Drag to reorder"],
   "경계선으로 크기 조절": ["경계선으로 크기 조절", "Drag borders to resize"],
@@ -173,7 +160,6 @@ const markupLabels: Record<string, [string, string]> = {
   "앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.": ["앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.", "All running sessions owned by this app will stop. Sessions in other apps are unaffected. The window close button hides the app to the tray."],
   "계속 작업": ["계속 작업", "Keep working"],
   "세션 종료 후 앱 닫기": ["세션 종료 후 앱 닫기", "Stop sessions and exit"],
-  "선택 전송 대상": ["선택 전송 대상", "Select for broadcast"],
   "앞으로 이동": ["앞으로 이동", "Move earlier"],
   "뒤로 이동": ["뒤로 이동", "Move later"],
   "세션 최대화": ["세션 최대화", "Maximize session"],
@@ -275,10 +261,9 @@ function visibleSessions() { return visibleOrder().map(id => sessions.get(id)!);
 function isVisible(id: string) { const session = sessions.get(id); return !!session && (!selectedProject || sessionProjectKey(session, importedProjects) === selectedProject); }
 function selectProject(key: string) {
   projectSelectionVersion++; selectedProject = key; maximized = ''; dragging = '';
-  for (const id of selected) if (!isVisible(id)) selected.delete(id);
   if (!isVisible(active)) active = visibleOrder()[0] ?? '';
   for (const [id, view] of terminals) { view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); refreshInputState(id); if (!isVisible(id)) view.terminal.blur(); }
-  bindText($('#search-result'), '', ''); $('#broadcast-results').hidden = true;
+  bindText($('#search-result'), '', '');
   renderAll();
   const selectionVersion = projectSelectionVersion;
   for (const id of visibleOrder()) {
@@ -369,7 +354,7 @@ function queueResize(id: string) {
 
 function createTerminal(session: Session) {
   const card = document.createElement('article'); card.className = 'terminal-card'; card.dataset.id = session.id;
-  card.innerHTML = `<header class="terminal-header"><label class="select-session" title="선택 전송 대상"><input type="checkbox" aria-label="선택 전송 대상"/></label><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-state"></span><div class="card-actions"><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">직접 입력 · IME · 붙여넣기</span></div>`;
+  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-state"></span><div class="card-actions"><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">직접 입력 · IME · 붙여넣기</span></div>`;
   localizeMarkup(card);
   const terminal = new Terminal({ fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.45, cursorBlink: true, scrollback: 10000, disableStdin: !native, allowProposedApi: false, theme: { background: '#141820', foreground: '#ced5e3', cursor: '#a5b4fc', selectionBackground: '#3b4567', black: '#212735', red: '#f78b99', green: '#91d6ad', yellow: '#eac184', blue: '#8eaafb', magenta: '#c4a4f3', cyan: '#87cfd9', white: '#e3e8f0' } });
   const fit = new FitAddon(); const search = new SearchAddon(); terminal.loadAddon(fit); terminal.loadAddon(search);
@@ -379,7 +364,7 @@ function createTerminal(session: Session) {
   observer.observe(card.querySelector('.terminal-host')!);
   const input = new TerminalInputQueue<QueuedInput>(async value => {
     const current = sessions.get(session.id);
-    if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || !canType(session.id) || (value.broadcast && !writable(current))) throw new InputQueueError('cancelled');
+    if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || !canType(session.id)) throw new InputQueueError('cancelled');
     await call<void>('session_write', { id: session.id, generation: value.generation, data: value.data });
   }, () => refreshInputState(session.id));
   const resize = new TerminalResizeQueue<QueuedResize>(async value => {
@@ -393,7 +378,6 @@ function createTerminal(session: Session) {
   terminal.onResize(() => queueResize(session.id));
   terminal.attachCustomKeyEventHandler(event => !(event.type === 'keydown' && ((event.altKey && /^[1-9]$/.test(event.key)) || (event.ctrlKey && event.key === 'Tab') || (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'f'))));
   card.addEventListener('pointerdown', () => setActive(session.id, false));
-  card.querySelector('input')!.addEventListener('change', event => { if ((event.target as HTMLInputElement).checked) selected.add(session.id); else selected.delete(session.id); renderCounts(); });
   card.querySelector('.maximize')!.addEventListener('click', () => { maximized = maximized === session.id ? '' : session.id; renderGrid(); setActive(session.id); });
   card.querySelector('.stop')!.addEventListener('click', () => {
     const current = sessions.get(session.id)!;
@@ -417,7 +401,7 @@ function createTerminal(session: Session) {
 }
 
 function move(id: string, offset: number) { const visible = visibleOrder(); const index = visible.indexOf(id); const next = index + offset; if (index < 0 || next < 0 || next >= visible.length) return; const from = order.indexOf(id); const to = order.indexOf(visible[next]); [order[from], order[to]] = [order[to], order[from]]; renderGrid(); renderSide(); scheduleSave(); }
-function removeSession(id: string) { const view = terminals.get(id); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); selected.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
+function removeSession(id: string) { const view = terminals.get(id); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
 
 function receiveSession(info: SessionInfo, persist = true) {
   const previous = sessions.get(info.id); const session = updateSession(previous, info);
@@ -469,9 +453,6 @@ function receiveOutput(output: Output) {
 function renderCounts() {
   const visible = visibleSessions(); const live = visible.filter(session => session.active).length;
   $('#running-count').textContent = String(live); bindText($('#total-count'), `${visible.length}개 세션`, `${visible.length} session${visible.length === 1 ? '' : 's'}`); $('#side-count').textContent = String(visible.length);
-  const targets = broadcastTargets(visible, selected);
-  bindText($('#selected-count'), selected.size ? `${selected.size}개 선택 · 전송 가능 ${targets.length}개` : '선택한 세션이 없습니다', selected.size ? `${selected.size} selected · ${targets.length} ready to send` : 'No sessions selected');
-  $<HTMLButtonElement>('#broadcast-send').disabled = !native || targets.length === 0 || !$<HTMLInputElement>('#broadcast-input').value.trim();
 }
 
 function renderSide() {
@@ -555,9 +536,6 @@ function renderAll() {
     const identity = card.querySelector<HTMLElement>('.terminal-identity')!;
     const index = String(order.indexOf(id) + 1).padStart(2, '0'); bindText(identity, `${index}  ·  ${demo ? 'DEMO · 실제 세션 아님' : session.threadId ? `스레드 ${session.threadId.slice(0, 12)}` : '로컬 세션'}`, `${index}  ·  ${demo ? 'DEMO · example session' : session.threadId ? `Thread ${session.threadId.slice(0, 12)}` : 'Local session'}`);
     identity.title = session.threadId ?? '';
-    const checkbox = card.querySelector<HTMLInputElement>('input')!;
-    checkbox.checked = selected.has(id);
-    checkbox.disabled = !writable(session);
     card.classList.toggle('focused', id === active);
   }
   renderCounts(); renderSide(); renderGrid();
@@ -622,24 +600,6 @@ const executableSettings = createExecutableSettings(async <T>(command: string, a
 $('#codex-settings-open').onclick = () => void executableSettings.open();
 for (const button of document.querySelectorAll<HTMLElement>('[data-close]')) button.onclick = () => button.closest('dialog')?.close();
 $('#column-options').onclick = event => { const button = (event.target as HTMLElement).closest<HTMLElement>('[data-columns]'); if (button) { columns = Number(button.dataset.columns); maximized = ''; renderGrid(); scheduleSave(); } };
-$('#clear-selection').onclick = () => { selected.clear(); renderAll(); };
-$('#broadcast-input').addEventListener('input', renderCounts);
-$('#broadcast-form').onsubmit = async event => {
-  event.preventDefault(); const input = $<HTMLInputElement>('#broadcast-input'); if (!input.value.trim()) return;
-  const targets = broadcastTargets(visibleSessions(), selected); if (!targets.length) return;
-  const selectionVersion = projectSelectionVersion;
-  const data = input.value + '\r'; const send = $<HTMLButtonElement>('#broadcast-send'); send.disabled = true; input.disabled = true;
-  const results = $('#broadcast-results'); results.hidden = false; listStatus(results, '선택한 세션에 전송 중…', 'Sending to selected sessions…');
-  const failures = new Map<string, unknown>();
-  const outcomes = await broadcast(targets, id => sessions.get(id), target => {
-    const view = terminals.get(target.id);
-    const operation = (view ? view.input.enqueue({ data, generation: target.generation, selectionVersion, broadcast: true }) : Promise.reject(new InputQueueError('cancelled')))
-      .catch(error => { const detail = inputError(error); failures.set(target.id, detail); throw detail; });
-    return operation;
-  });
-  results.replaceChildren(...outcomes.map(outcome => { const item = document.createElement('span'); bindText(item, `${outcome.title}: ${outcome.status === 'sent' ? '전송됨' : outcome.status === 'skipped' ? '상태 변경으로 건너뜀' : `실패 — ${failures.has(outcome.id) ? message(failures.get(outcome.id), 'ko') : outcome.error}`}`, `${outcome.title}: ${outcome.status === 'sent' ? 'Sent' : outcome.status === 'skipped' ? 'Skipped after state change' : `Failed — ${failures.has(outcome.id) ? message(failures.get(outcome.id), 'en') : outcome.error}`}`); return item; }));
-  input.disabled = false; renderCounts();
-};
 
 async function start(request: SavedSession) {
   // Select at the user's intent, never when a delayed native start completes.

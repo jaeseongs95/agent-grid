@@ -205,6 +205,7 @@ try {
     await until(() => page.locator('#connection').textContent(), text => text === '로컬 연결됨', 'native IPC connected');
     assert.equal(await page.locator('#runtime-banner').isVisible(), false, 'Demo/browser preview is not native evidence');
     assert.equal(await page.locator('.terminal-card').count(), 0, 'Existing owned tiles present; refusing to touch them');
+    assert.equal(await page.locator('.broadcast-panel, [id^=broadcast-], #clear-selection, #selected-count').count(), 0, '선택 전송 패널이 제거되어야 합니다');
     safeInitialState = true;
     return { title: await page.title(), origin: new URL(page.url()).origin, initialTiles: 0 };
   });
@@ -607,6 +608,7 @@ try {
   });
   await check('synthetic Korean composition reaches actual PTY echo (not physical IME)', async () => {
     const card = tile([...ownedTitles][0]);
+    assert.equal(await page.locator('.select-session, .terminal-header input[type=checkbox]').count(), 0, '선택 전송 체크박스가 제거되어야 합니다');
     const marker = '한글입력검사';
     // Read only VT-rendered rows, excluding xterm's local composition overlay and textarea.
     const rows = card.locator('.xterm-rows');
@@ -630,6 +632,9 @@ try {
     assert(events.every(event => event.trusted === false));
     const dispatchedAt = Date.now();
     const echoed = await until(() => rows.innerText(), text => text.includes(marker), 'actual Korean marker echo after composition end', 15_000);
+    for (const title of [...ownedTitles].slice(1)) {
+      assert(!(await tile(title).locator('.xterm-rows').innerText()).includes(marker), '직접 입력이 다른 터미널에 전달되면 안 됩니다');
+    }
     return { events, marker, markerInitiallyAbsent: true, echoObservedIn: 'VT-rendered xterm rows (composition overlay excluded)', echoWaitMs: Date.now() - dispatchedAt, beforeOutputLength: before.length, afterOutputLength: echoed.length, beforeOutputSha256: hash(before), afterOutputSha256: hash(echoed), enterSent: false, physicalImeVerified: false, koreanPtyRoundTripVerified: true, unsubmittedTextCleared: false, disposition: 'Left unsubmitted until the owned session is stopped; no Ctrl+U sent to a potentially waiting session.' };
   });
   await check('external observations stay read only and report unavailable daemon explicitly', async () => {

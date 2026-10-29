@@ -8,12 +8,7 @@ test('design demo preserves terminals through layout, reorder, keyboard selectio
   const cards = page.locator('.terminal-card');
   await expect(cards).toHaveCount(4);
   await expect(page.locator('.xterm-screen')).toHaveCount(4);
-  await page.getByLabel('선택 전송 대상', { exact: true }).nth(0).check();
-  await page.getByLabel('선택 전송 대상', { exact: true }).nth(1).check();
-  await expect(page.getByLabel('선택 전송 대상', { exact: true }).nth(3)).toBeDisabled();
-  await expect(page.locator('#selected-count')).toHaveText('2개 선택 · 전송 가능 2개');
-  await page.getByLabel('선택한 세션에 보낼 메시지').fill('데모에서는 실행하지 않습니다');
-  await expect(page.locator('#broadcast-send')).toBeDisabled();
+  await expect(page.locator('.broadcast-panel, [id^=broadcast-], #clear-selection, #selected-count, .select-session, .terminal-header input[type=checkbox]')).toHaveCount(0);
   await page.keyboard.press('Alt+2');
   await expect(cards.nth(1)).toHaveClass(/focused/);
   await cards.nth(1).getByLabel('세션 최대화').click();
@@ -33,8 +28,6 @@ test('design demo preserves terminals through layout, reorder, keyboard selectio
   await page.getByRole('button', { name: '3열', exact: true }).click();
   await expect(cards).toHaveCount(4);
   await page.getByRole('button', { name: '2열', exact: true }).click();
-  await page.getByRole('button', { name: '선택 해제', exact: true }).click();
-  await expect(page.locator('#selected-count')).toHaveText('선택한 세션이 없습니다');
   await page.screenshot({ path: testInfo.outputPath('agent-grid-demo.png'), fullPage: true });
   expect(errors).toEqual([]);
 });
@@ -54,3 +47,36 @@ test('browser preview shows a real runtime diagnostic and external sessions stay
   await expect(page.locator('#external-list')).toContainText('데스크톱 앱에서 사용할 수 있는 기능입니다.');
   await expect(page.locator('#external-dialog input')).toHaveCount(0);
 });
+
+for (const width of [1440, 800]) {
+  test(`compact workspace toolbar keeps session actions on the top row at ${width}px`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 1000 });
+    await page.goto('/?demo=1');
+    await expect(page.locator('.terminal-card')).toHaveCount(4);
+    await expect(page.locator('.workspace-header')).toHaveCount(0);
+    await expect(page.getByRole('heading', { name: 'OpenDIY Desktop', exact: true })).toBeVisible();
+    const topbar = (await page.locator('.topbar').boundingBox())!;
+    expect(topbar.y).toBe(0);
+    expect(topbar.height).toBeLessThanOrEqual(60);
+    for (const selector of ['#catalog-open', '#new-session', '#notifications', '#exit']) {
+      const action = page.locator(`.topbar ${selector}`);
+      await expect(action).toBeVisible();
+      const box = (await action.boundingBox())!;
+      expect(box.y).toBeGreaterThanOrEqual(topbar.y);
+      expect(box.y + box.height).toBeLessThanOrEqual(topbar.y + topbar.height);
+      expect(box.x + box.width).toBeLessThanOrEqual(width);
+    }
+    const tabs = (await page.locator('#project-tabs').boundingBox())!;
+    expect(tabs.y).toBeLessThan(80);
+    expect((await page.locator('#grid-area').boundingBox())!.height).toBeGreaterThan(700);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(width);
+    await page.screenshot({ path: testInfo.outputPath(`compact-toolbar-${width}.png`), fullPage: true });
+    await page.locator('#catalog-open').focus();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#catalog-dialog')).toBeVisible();
+    await page.locator('#catalog-close').click();
+    await page.locator('#new-session').focus();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#create-dialog')).toBeVisible();
+  });
+}
