@@ -104,6 +104,12 @@ including the current write, with the native 64 KiB per-request ceiling. Input p
 under pressure and resumes after draining; oversized or unaccepted input is reported.
 Resize keeps one current request and the latest unsent size. Disposing a terminal
 releases queued input and geometry. Restored sessions initially load metadata only.
+OpenDIY Codex R28 also bounds its display history to 30 turns, 400 items and 8 MiB
+of retained logical source per display budget. Older sections are fetched on demand;
+distant display references are released when their independent operations finish.
+These budgets do not limit the entire process, durable history or model context.
+Legacy history still uses the official full-read fallback, so its initial load can
+exceed the display budget. Other selected CLIs retain their own history behavior.
 These bounds and lifecycle tests are not a claim of a completed long-duration leak test.
 
 Existing saved settings and projects from Agent Grid are preserved. The longer-term

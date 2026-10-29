@@ -118,7 +118,7 @@ async function createSession(title, cwd) {
     const state = ((await card.locator('.session-state').getAttribute('class')) ?? '').split(/\s+/).find(value => ['idle', 'running', 'waiting'].includes(value));
     const text = await card.locator('.terminal-host').innerText();
     return { id: await card.getAttribute('data-id'), state, threadId: fullThreadId || /스레드\s+(\S+)/.exec(visible)?.[1], fullThreadId: !!fullThreadId, outputLength: text.trim().length, outputSha256: hash(text) };
-  }, info => !!info.id && !!info.threadId && !!info.state && info.outputLength > 10, 'real CLI thread metadata, observed state and terminal text', sessionTimeout);
+  }, info => !!info.id && info.fullThreadId && uuid.test(info.threadId) && !!info.state && info.outputLength > 10, 'real CLI thread metadata, observed state and terminal text', sessionTimeout);
   assert(info.fullThreadId && uuid.test(info.threadId), 'Expected a full UUID in the UI thread identifier tooltip');
   report.sessions.push(info);
   return info;
