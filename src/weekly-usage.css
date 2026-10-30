@@ -3,9 +3,6 @@
 #weekly-usage-label { margin-right: auto; }
 #weekly-usage-refresh { padding: 3px 7px; border: 1px solid var(--line, #303443); border-radius: 5px; background: transparent; color: var(--text, #e7ebf4); font: inherit; cursor: pointer; }
 #weekly-usage-refresh:disabled { opacity: .5; cursor: default; }
-#weekly-usage-error { margin-top: 5px; }
-#weekly-usage-error summary { cursor: pointer; }
-#weekly-usage-error[hidden] { display: none; }
 #weekly-usage-value { color: var(--text, #e7ebf4); font-variant-numeric: tabular-nums; }
 #weekly-usage small { display: block; margin-top: 5px; line-height: 1.45; overflow-wrap: anywhere; }
 #weekly-usage-meter { display: block; width: 100%; height: 5px; margin: 9px 0; border: 0; border-radius: 4px; overflow: hidden; accent-color: var(--accent, #90a8ff); }

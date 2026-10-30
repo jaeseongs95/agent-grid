@@ -680,7 +680,7 @@ impl Engine {
                 if kind=="question" {item["questions"]=request["params"]["questions"].clone();}
                 item["metadataAvailable"]=request["metadataAvailable"].clone();
                 if kind=="approval" {
-                    let options=codex::ConversationConnection::approval_decisions(&request["params"]).into_iter().map(|decision|serde_json::json!({"id":decision,"label":match decision {"accept"=>"승인","acceptForSession"=>"세션 동안 승인","decline"=>"거절",_=>"취소"}})).collect::<Vec<_>>();
+                    let options=codex::ConversationConnection::approval_decisions(&request["params"]).into_iter().map(|decision|serde_json::json!({"id":decision,"label":match decision {"accept"=>"승인","acceptForSession"=>"이 세션에서 승인","decline"=>"거절",_=>"취소"}})).collect::<Vec<_>>();
                     if options.is_empty() {item["canRespond"]=serde_json::json!(false);}
                     item["approval"]=serde_json::json!({"options":options});
                 }

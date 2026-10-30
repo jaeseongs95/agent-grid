@@ -4,6 +4,8 @@ const snapshot = {
   executable: 'D:\\선택한 도구\\codex.exe', observedAt: Date.parse('2026-10-29T00:00:00Z'), limitName: '기본 계정',
   weekly: { usedPercent: 42.7, resetsAt: Date.parse('2026-10-30T08:00:00Z') / 1000 },
 };
+const readFailure = '사용량을 불러오지 못했습니다. 잠시 후 새로고침해 주세요.';
+const lastKnownFailure = readFailure + ' 마지막 정상값을 표시합니다.';
 
 async function fixture(page: Page, options: { hold?: boolean; hidden?: boolean; weekly?: null; error?: string } = {}) {
   await page.clock.install({ time: new Date('2026-10-29T00:00:00Z') });
@@ -43,7 +45,7 @@ test('실제 주간 비율과 현지 초기화 시각을 표시하고 언어를 
   await expect(page.locator('#weekly-usage-reset')).toContainText('초기화');
   await expect(page.locator('#weekly-usage-reset')).toContainText('30');
   await expect(page.locator('#weekly-usage-meter')).toHaveAttribute('value', '42.7');
-  await expect(page.locator('#weekly-usage')).toHaveAttribute('title', /선택한 도구/);
+  await expect(page.locator('#weekly-usage')).toHaveAttribute('title', '기본 계정');
   await page.evaluate(() => (window as any).usageFixture.setLanguage('en'));
   await expect(page.locator('#weekly-usage-label')).toHaveText('Weekly usage');
   await expect(page.locator('#weekly-usage-reset')).toContainText('Resets');
@@ -57,7 +59,7 @@ test('미제공·인증 오류·초기화 시각 부재를 0퍼센트로 바꾸�
   await expect(page.locator('#weekly-usage-meter')).toBeHidden();
   await page.evaluate(() => { const f = (window as any).usageFixture; f.error = 'chatgpt authentication required'; });
   await page.clock.runFor(60_000);
-  await expect(page.locator('#weekly-usage-status')).toHaveText('사용량 조회 실패');
+  await expect(page.locator('#weekly-usage-status')).toHaveText(readFailure);
   await expect(page.locator('#weekly-usage-value')).toHaveText('—');
   await page.evaluate(() => { const f = (window as any).usageFixture; f.error = ''; f.response.weekly = { usedPercent: 0, resetsAt: null }; });
   await page.clock.runFor(60_000);
@@ -101,7 +103,7 @@ test('숨김에서 돌아와도 이전 응답은 무효이며 새 CLI 선택을 
   expect(await count(page)).toBe(1);
   await page.clock.runFor(1);
   await expect(page.locator('#weekly-usage-value')).toHaveText('91%');
-  await expect(page.locator('#weekly-usage')).toHaveAttribute('title', /다른 도구/);
+  await expect(page.locator('#weekly-usage')).toHaveAttribute('title', '기본 계정');
 });
 
 test('종료는 진행 조회를 정산하고 늦은 응답을 버리며 종료 취소 뒤에만 재개한다', async ({ page }) => {
@@ -137,7 +139,7 @@ test('지난 초기화 시각의 수치는 갱신 대기로 표시하고 잘못�
   expect(await count(page)).toBe(2);
   await page.evaluate(() => { (window as any).usageFixture.response.weekly.usedPercent = 200; });
   await page.clock.runFor(30_000);
-  await expect(page.locator('#weekly-usage-status')).toHaveText('사용량 조회 실패 · 마지막 정상값 유지');
+  await expect(page.locator('#weekly-usage-status')).toHaveText(lastKnownFailure);
   await expect(page.locator('#weekly-usage-value')).toHaveText('88%');
   expect(await count(page)).toBe(3);
   await page.clock.runFor(59_999);
@@ -202,20 +204,23 @@ test('수동 새로고침은 1분을 기다리지 않고 조회하며 5초 제�
   await expect.poll(() => count(page)).toBe(4);
 });
 
-test('조회 실패는 마지막 정상값과 조회시점·오래됨을 보존하고 오류를 펼쳐 확인할 수 있다', async ({ page }) => {
+test('조회 실패는 마지막 정상값과 오래됨을 보존하며 기술 오류와 경로를 화면에 노출하지 않는다', async ({ page }) => {
   await fixture(page);
   await expect(page.locator('#weekly-usage-value')).toHaveText('42.7%');
   await page.evaluate(() => { (window as any).usageFixture.error = '<img src=x onerror=alert(1)> 다른 세션 조회가 진행 중입니다.'; });
   await page.clock.runFor(60_000);
-  await expect(page.locator('#weekly-usage-status')).toHaveText('사용량 조회 실패 · 마지막 정상값 유지');
+  await expect(page.locator('#weekly-usage-status')).toHaveText(lastKnownFailure);
   await expect(page.locator('#weekly-usage-value')).toHaveText('42.7%');
   await expect(page.locator('#weekly-usage-meter')).toHaveAttribute('value', '42.7');
   await expect(page.locator('#weekly-usage-observed')).toContainText('1분 전');
   await expect(page.locator('#weekly-usage')).toHaveClass('usage-stale');
-  await page.locator('#weekly-usage-error summary').click();
-  await expect(page.locator('#weekly-usage-error-message')).toBeVisible();
-  await expect(page.locator('#weekly-usage-error-message')).toContainText('<img src=x onerror=alert(1)>');
-  expect(await page.locator('#weekly-usage-error img').count()).toBe(0);
+  const displayed = await page.locator('#weekly-usage').evaluate(element => ({ text: element.textContent, tooltips: [...element.querySelectorAll('[title]'), element].map(node => node.getAttribute('title')).join('\n') }));
+  expect(displayed.text).not.toContain('onerror');
+  expect(displayed.text).not.toContain('다른 세션 조회');
+  expect(displayed.tooltips).not.toContain('onerror');
+  expect(displayed.tooltips).not.toContain('다른 세션 조회');
+  expect(displayed.tooltips).not.toContain('codex.exe');
+  expect(await page.locator('#weekly-usage details, #weekly-usage img').count()).toBe(0);
   await page.clock.runFor(120_000);
   expect(await count(page)).toBe(4);
   await expect(page.locator('#weekly-usage-observed')).toContainText('3분 전');
@@ -223,6 +228,22 @@ test('조회 실패는 마지막 정상값과 조회시점·오래됨을 보존�
   await page.locator('#weekly-usage-refresh').click();
   await expect(page.locator('#weekly-usage-value')).toHaveText('48%');
   await expect(page.locator('#weekly-usage-observed')).toContainText('방금');
-  await expect(page.locator('#weekly-usage-error')).toBeHidden();
+  await expect(page.locator('#weekly-usage-status')).not.toHaveText(lastKnownFailure);
   await expect(page.locator('#weekly-usage')).not.toHaveClass('usage-stale');
+});
+
+test('늦게 완료된 조회도 완료 후 1분을 기다려 서버 제한보다 이른 자동 조회를 막는다', async ({ page }) => {
+  await fixture(page, { hold: true });
+  await expect.poll(() => count(page)).toBe(1);
+  await page.clock.runFor(10_000);
+  await page.evaluate(() => { const f = (window as any).usageFixture; f.release(); f.hold = false; });
+  await expect(page.locator('#weekly-usage-value')).toHaveText('42.7%');
+  await expect(page.locator('#weekly-usage-refresh')).toBeEnabled();
+  await page.clock.runFor(59_999);
+  expect(await count(page)).toBe(1);
+  await page.clock.runFor(1);
+  await expect.poll(() => count(page)).toBe(2);
+  const calls = await page.evaluate(() => (window as any).usageFixture.calls);
+  expect(calls[1].time - calls[0].time).toBe(70_000);
+  expect(calls[1].manual).toBe(false);
 });

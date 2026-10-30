@@ -157,8 +157,10 @@ The lower-left indicator reads the selected CLI account's representative weekly
 rate-limit window: an explicit 10,080-minute window, its used percentage and reset
 time when provided. It is account usage, not a total calculated from this app's
 sessions. Missing weekly data and read failures are shown separately and never
-treated as 0%. Reads are at least five minutes apart, with one request at a time;
-automatic polling pauses while the window is hidden.
+treated as 0%. Automatic reads run 60 seconds after the previous request settles and pause while
+the window is hidden. Refresh reads immediately, with a five-second manual limit and one request
+at a time. A failed refresh keeps the last confirmed value and its timestamp. Technical errors
+are not shown in the usage panel. External session records are available in Settings.
 
 ## Memory and history
 
