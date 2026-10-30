@@ -465,7 +465,7 @@ function mountConversation(session: Session) {
       const showingConversation = !conversationHost.hidden;
       card.querySelector<HTMLElement>('.terminal-host')!.hidden = showingConversation;
       toggle.setAttribute('aria-pressed', String(showingConversation));
-      notifyError('보기 전환 실패', 'Could not switch view', error);
+      notify('보기를 전환하지 못했습니다. 현재 화면과 작성 중인 내용을 확인한 뒤 다시 시도하세요.', true, 'Could not switch views. Check the current view and your draft before trying again.');
     }
     finally { toggle.disabled = false; }
   };
@@ -549,7 +549,7 @@ function removeSession(id: string, preserveRestore = false) {
     workspaceSlots = workspaceSlots.filter(slot => typeof slot === 'string' || !removed.includes(slot));
     updateRestoreBanner();
   }
-  workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); explicitlyStoppedSessions.delete(id); const view = terminals.get(id); const conversation = conversations.get(id); conversations.delete(id); conversationOwners.delete(id); if (conversation) void conversation.dispose({ sessionEnded: true }).catch(error => notifyError('대화 정리 실패', 'Conversation cleanup failed', error)); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
+  workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); explicitlyStoppedSessions.delete(id); const view = terminals.get(id); const conversation = conversations.get(id); conversations.delete(id); conversationOwners.delete(id); if (conversation) void conversation.dispose({ sessionEnded: true }).catch(error => notify('대화 연결 정리를 확인하지 못했습니다. 세션 상태를 확인하세요.', true, 'Conversation cleanup could not be confirmed. Check the session status.')); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
 
 function receiveSession(info: SessionInfo, persist = true) {
   const previous = sessions.get(info.id); const session = updateSession(previous, info);
@@ -561,7 +561,7 @@ function receiveSession(info: SessionInfo, persist = true) {
   }
   if (!order.includes(session.id)) order.push(session.id);
   const terminal = terminals.get(session.id)?.terminal ?? createTerminal(session);
-  if (previous && previous.generation !== session.generation) { const view = terminals.get(session.id)!; view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); terminal.write('', () => terminal.reset()); const oldConversation = conversations.get(session.id); conversations.delete(session.id); conversationOwners.delete(session.id); if (oldConversation) void oldConversation.dispose({ sessionEnded: true }).catch(error => notifyError('이전 대화 정리 실패', 'Old conversation cleanup failed', error)); mountConversation(session); }
+  if (previous && previous.generation !== session.generation) { const view = terminals.get(session.id)!; view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); terminal.write('', () => terminal.reset()); const oldConversation = conversations.get(session.id); conversations.delete(session.id); conversationOwners.delete(session.id); if (oldConversation) void oldConversation.dispose({ sessionEnded: true }).catch(error => notify('이전 대화 연결 정리를 확인하지 못했습니다. 세션 상태를 확인하세요.', true, 'Previous conversation cleanup could not be confirmed. Check the session status.')); mountConversation(session); }
   if (previous && previous.state !== session.state) notify(`${session.title} · ${stateLabels(session.state)[0]}`, false, `${session.title} · ${stateLabels(session.state)[1]}`);
   renderAll();
   if (!previous || previous.state === 'starting') queueResize(session.id);
@@ -659,7 +659,7 @@ function renderGrid() {
 function updateConversationVisibility() {
   for (const [id, controller] of conversations) {
     const view = terminals.get(id);
-    void controller.setForeground(!!view && !view.card.hidden && !document.hidden && nativeWindowVisible).catch(error => notifyError('대화 화면 갱신 실패', 'Conversation visibility failed', error));
+    void controller.setForeground(!!view && !view.card.hidden && !document.hidden && nativeWindowVisible).catch(error => notify('대화 화면을 갱신하지 못했습니다. 해당 세션을 다시 선택하세요.', true, 'Could not refresh the conversation view. Select the session again.'));
   }
 }
 document.addEventListener('visibilitychange', updateConversationVisibility);

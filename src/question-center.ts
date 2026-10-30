@@ -1,4 +1,4 @@
-import { onLanguageChange, t } from './i18n';
+import { locale, onLanguageChange, t } from './i18n';
 import './question-center.css';
 
 export interface PendingQuestion {
@@ -13,7 +13,7 @@ interface QuestionCenterHost {
   openSession(sessionId: string): void | Promise<void>;
   button?: HTMLButtonElement;
 }
-interface Draft { values: Record<string, { selected?: string; text?: string }>; phase?: 'sending' | 'sent' | 'uncertain'; error?: string }
+interface Draft { values: Record<string, { selected?: string; text?: string }>; phase?: 'sending' | 'sent' | 'uncertain'; openFailed?: boolean }
 const interval = 3_000;
 const key = (item: PendingQuestion) => JSON.stringify([item.sessionId, item.threadId ?? '', item.generation, item.requestId ?? item.id]);
 
@@ -48,7 +48,7 @@ export function createQuestionCenter(host: QuestionCenterHost) {
   const drafts = new Map<string, Draft>();
   const rows = new Map<string, { node: HTMLElement; signature: string }>();
   const abort = new AbortController();
-  let items: PendingQuestion[] = []; let error = ''; let disposed = false; let exiting = false; let nativeVisible = true; let epoch = 0;
+  let items: PendingQuestion[] = []; let readFailed = false; let lastCheckedAt: number | undefined; let disposed = false; let exiting = false; let nativeVisible = true; let epoch = 0;
   let timer: ReturnType<typeof setTimeout> | undefined; let running: Promise<void> | undefined; let lastStarted = -Infinity;
   const responses = new Set<Promise<void>>();
   const text = (tag: string, content: string) => { const node = document.createElement(tag); node.textContent = content; return node; };
@@ -60,19 +60,25 @@ export function createQuestionCenter(host: QuestionCenterHost) {
     const count = items.filter(item => item.kind !== 'unsupported').length;
     const unavailable = items.filter(item => item.kind === 'unsupported').length;
     const stale = items.some(item => item.metadataAvailable === false);
-    const label = t(`질문함 · 미응답 ${count}건`, `Questions · ${count} unanswered`);
-    button.setAttribute('aria-label', label); button.title = label + (stale ? t(' · 마지막 확인 목록 포함', ' · Includes last confirmed requests') : '');
+    const unknown = readFailed && lastCheckedAt === undefined;
+    const label = unknown ? t('질문함 · 상태 확인 불가', 'Questions · Status unavailable') : t(`질문함 · 미응답 ${count}건`, `Questions · ${count} unanswered`);
+    button.setAttribute('aria-label', label); button.title = label + (stale || readFailed && !unknown ? t(' · 마지막 확인 목록 포함', ' · Includes last confirmed requests') : '');
     button.setAttribute('aria-haspopup', 'dialog'); button.setAttribute('aria-controls', element.id);
     badge.textContent = String(count); badge.hidden = !count;
     element.querySelector('h2')!.textContent = t('질문함', 'Questions');
     element.querySelector('.question-close')!.setAttribute('aria-label', t('질문함 닫기', 'Close questions'));
-    element.querySelector('.question-summary')!.textContent = t(`미응답 ${count}건`, `${count} unanswered`) + (unavailable ? t(` · 확인 필요 세션 ${unavailable}개`, ` · ${unavailable} sessions need checking`) : '') + (stale ? t(' · 마지막 확인 목록 포함', ' · Includes last confirmed requests') : '');
-    element.querySelector('.question-list-status')!.textContent = error ? t(`조회 실패 · 이전 목록을 유지합니다. ${error}`, `Could not refresh · Previous list preserved. ${error}`) : !items.length ? t('미응답 질문이 없습니다.', 'No unanswered questions.') : '';
+    element.querySelector('.question-summary')!.textContent = unknown ? t('미응답 상태를 확인할 수 없습니다.', 'Unanswered status is unavailable.')
+      : t(`미응답 ${count}건`, `${count} unanswered`) + (unavailable ? t(` · 확인 필요 세션 ${unavailable}개`, ` · ${unavailable} sessions need checking`) : '') + (stale || readFailed ? t(' · 마지막 확인 목록 포함', ' · Includes last confirmed requests') : '');
+    const checked = lastCheckedAt === undefined ? '' : t(' 마지막 확인: ', ' Last checked: ') + new Date(lastCheckedAt).toLocaleTimeString(locale(), { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    element.querySelector('.question-list-status')!.textContent = readFailed ? (unknown
+      ? t('질문 목록에 연결할 수 없습니다. 잠시 후 다시 확인하거나 원래 세션에서 상태를 확인하세요.', 'Cannot connect to the question list. Try again shortly or check the original session.')
+      : t('조회 실패 · 이전 목록을 유지합니다. 잠시 후 다시 확인하거나 원래 세션에서 상태를 확인하세요.', 'Could not refresh · Previous list preserved. Try again shortly or check the original session.') + checked)
+      : !items.length ? t('미응답 질문이 없습니다.', 'No unanswered questions.') : '';
     const remaining = new Set(items.map(key));
     for (const [id, row] of rows) if (!remaining.has(id)) { row.node.remove(); rows.delete(id); drafts.delete(id); }
     items.forEach((item, index) => {
       const id = key(item); const draft = drafts.get(id) ?? { values: {} }; drafts.set(id, draft);
-      const signature = JSON.stringify([item, draft.phase, draft.error]);
+      const signature = JSON.stringify([item, draft.phase, draft.openFailed]);
       let row = rows.get(id);
       if (!row || force || row.signature !== signature) {
         const node = buildRow(item, draft, index); row?.node.replaceWith(node); row = { node, signature }; rows.set(id, row);
@@ -120,7 +126,8 @@ export function createQuestionCenter(host: QuestionCenterHost) {
       }
       form.append(field);
     }
-    const rowStatus = text('p', draft.error ? t(`응답 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 세션에서 확인하세요. ${draft.error}`, `Response result is unknown. It will not be resent automatically. Check the session. ${draft.error}`)
+    const rowStatus = text('p', draft.openFailed ? t('원래 세션을 열 수 없습니다. 세션 목록에서 해당 세션을 선택해 상태를 확인하세요.', 'Cannot open the original session. Select it in the session list to check its status.')
+      : draft.phase === 'uncertain' ? t('응답 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 원래 세션에서 상태를 확인하세요.', 'Response result is unknown. It will not be resent automatically. Check the original session.')
       : draft.phase === 'sending' ? t('응답 전송 중…', 'Sending response…')
       : item.responded || draft.phase === 'sent' ? t('응답을 보냈습니다. 서버의 해결 확인을 기다립니다.', 'Response sent. Waiting for server confirmation.')
       : item.kind === 'unsupported' ? t('질문 원문을 제공하지 않는 세션입니다. 원래 세션을 열어 확인하고 응답하세요.', 'Question details are unavailable. Open the original session to review and respond.')
@@ -147,16 +154,16 @@ export function createQuestionCenter(host: QuestionCenterHost) {
       control.onclick = () => { if (!draft.phase) void respond(item, draft, { decision: option.id }); }; form.append(control);
     }
     const open = text('button', t('원래 세션 열기 →', 'Open original session →')) as HTMLButtonElement; open.type = 'button'; open.className = 'quiet-button question-open';
-    open.onclick = () => { void Promise.resolve().then(() => host.openSession(item.sessionId)).then(() => { if (!disposed) element.close(); }).catch(reason => { if (!disposed) { rowStatus.textContent = t('세션 열기 실패: ', 'Could not open session: ') + String(reason instanceof Error ? reason.message : reason); } }); };
+    open.onclick = () => { void Promise.resolve().then(() => host.openSession(item.sessionId)).then(() => { if (!disposed) { draft.openFailed = false; element.close(); render(); } }).catch(() => { if (!disposed) { draft.openFailed = true; render(); } }); };
     row.append(form, rowStatus, open); return row;
   }
 
   function respond(item: PendingQuestion, draft: Draft, result: Record<string, unknown>) {
     if (disposed || exiting || draft.phase || item.responded || !item.canRespond || !item.requestId) return Promise.resolve();
-    draft.phase = 'sending'; draft.error = ''; render();
+    draft.phase = 'sending'; draft.openFailed = false; render();
     const operation = Promise.resolve().then(() => host.call('respond_pending_question', { sessionId: item.sessionId, generation: item.generation, requestId: item.requestId, ...result })).then(() => {
       draft.phase = 'sent';
-    }).catch(reason => { draft.phase = 'uncertain'; draft.error = String(reason instanceof Error ? reason.message : reason).slice(0, 1024); }).finally(() => {
+    }).catch(() => { draft.phase = 'uncertain'; }).finally(() => {
       responses.delete(operation); if (!disposed) { render(); poll(); }
     });
     responses.add(operation); return operation;
@@ -171,8 +178,8 @@ export function createQuestionCenter(host: QuestionCenterHost) {
     lastStarted = performance.now(); const token = epoch;
     running = Promise.resolve().then(() => host.call('list_pending_questions')).then(value => {
       if (!active() || token !== epoch) return;
-      items = readItems(value); error = ''; render();
-    }).catch(reason => { if (active() && token === epoch) { error = String(reason instanceof Error ? reason.message : reason).slice(0, 1024); render(); } }).finally(() => { running = undefined; schedule(); });
+      items = readItems(value); readFailed = false; lastCheckedAt = Date.now(); render();
+    }).catch(() => { if (active() && token === epoch) { readFailed = true; render(); } }).finally(() => { running = undefined; schedule(); });
   }
   function visibility() { epoch++; clearTimer(); if (active()) poll(); }
   document.addEventListener('visibilitychange', visibility, { signal: abort.signal });

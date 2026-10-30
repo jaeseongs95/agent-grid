@@ -282,7 +282,7 @@ export function createConversation(options: ConversationOptions) {
       const description = document.createElement('pre'); description.textContent = JSON.stringify(event.params, null, 2); panel.append(title, description);
       const id = event.requestId;
       if (!id) { const reason = document.createElement('p'); bindText(reason, '요청 식별자를 확인하지 못해 응답할 수 없습니다.', 'Cannot respond without a verified request ID.'); panel.append(reason); requests.append(panel); continue; }
-      if (event.method.endsWith('/requestApproval')) {
+      if (event.method === 'item/commandExecution/requestApproval' || event.method === 'item/fileChange/requestApproval') {
         const advertised = event.params.availableDecisions;
         const choices = !Object.prototype.hasOwnProperty.call(event.params, 'availableDecisions') ? ['accept', 'decline', 'cancel']
           : Array.isArray(advertised) ? ['accept', 'acceptForSession', 'decline', 'cancel'].filter(value => advertised.includes(value)) : [];

@@ -12,7 +12,7 @@ const approval = {
 };
 const unsupported = { id: 'unknown', sessionId: 'terminal', generation: 1, kind: 'unsupported', canRespond: false, sessionTitle: '원문 없는 세션' };
 
-async function fixture(page: Page, items: unknown[] = [question, approval, unsupported], options: { holdPoll?: boolean; holdResponse?: boolean; hidden?: boolean } = {}) {
+async function fixture(page: Page, items: unknown[] = [question, approval, unsupported], options: { holdPoll?: boolean; holdResponse?: boolean; hidden?: boolean; pollError?: string } = {}) {
   await page.clock.install({ time: new Date('2026-10-30T00:00:00Z') });
   await page.clock.pauseAt(new Date('2026-10-30T00:00:01Z'));
   await page.route('**/question-harness', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><html><body></body></html>' }));
@@ -22,13 +22,13 @@ async function fixture(page: Page, items: unknown[] = [question, approval, unsup
     const languagePath = '/src/i18n.ts'; const { setLanguage } = await import(languagePath); setLanguage('ko');
     const f = (window as any).questionFixture = {
       items, hidden: options.hidden ?? false, holdPoll: options.holdPoll ?? false, holdResponse: options.holdResponse ?? false,
-      calls: [] as { command: string; args?: any; time: number }[], opens: [] as string[], pollError: '', responseError: '', active: 0, maxActive: 0,
+      calls: [] as { command: string; args?: any; time: number }[], opens: [] as string[], pollError: options.pollError ?? '', responseError: '', openError: '', active: 0, maxActive: 0,
       polls: [] as (() => void)[], responses: [] as (() => void)[], setLanguage,
       releasePoll() { this.polls.shift()?.(); }, releaseResponse() { this.responses.shift()?.(); },
       visibility(value: boolean) { this.hidden = value; document.dispatchEvent(new Event('visibilitychange')); },
     };
     Object.defineProperty(document, 'hidden', { configurable: true, get: () => f.hidden });
-    f.widget = createQuestionCenter({ openSession(id: string) { f.opens.push(id); }, async call(command: string, args?: any) {
+    f.widget = createQuestionCenter({ openSession(id: string) { f.opens.push(id); if (f.openError) throw new Error(f.openError); }, async call(command: string, args?: any) {
       f.calls.push({ command, args, time: performance.now() });
       if (command === 'respond_pending_question') {
         if (f.holdResponse) await new Promise<void>(resolve => f.responses.push(resolve));
@@ -97,7 +97,7 @@ test('응답 불명과 목록 오류·잘못된 응답은 질문을 지우거나
   await page.evaluate(() => { (window as any).questionFixture.pollError = '조회 중단'; }); await page.clock.runFor(3_000);
   await expect(page.locator('.question-list-status')).toContainText('이전 목록을 유지'); await expect(page.locator('#question-count')).toHaveText('1');
   await page.evaluate(() => { const f = (window as any).questionFixture; f.pollError = ''; f.items = [{ ...f.items[0], generation: null }]; }); await page.clock.runFor(3_000);
-  await expect(page.locator('.question-list-status')).toContainText('형식이 올바르지'); await expect(page.locator('#question-count')).toHaveText('1');
+  await expect(page.locator('.question-list-status')).toContainText('이전 목록을 유지'); await expect(page.locator('#question-count')).toHaveText('1');
   expect(await responses(page)).toHaveLength(1);
 });
 
@@ -152,5 +152,58 @@ test('끊긴 연결의 마지막 확인 목록은 건수를 유지하고 재연�
   await expect(page.locator('.question-metadata-status')).toHaveCount(0);
   await expect(page.locator('.question-center-button')).not.toHaveAttribute('title', /Includes last confirmed requests/);
   await expect(page.getByRole('button', { name: '이번만 승인' })).toBeEnabled();
+  expect(await responses(page)).toHaveLength(0);
+});
+
+test('조회·응답·세션 이동 실패의 기술정보는 전체 화면과 속성에 노출하지 않고 원문과 마지막 확인 건수는 보존한다', async ({ page }) => {
+  const fault = 'D:\\private-fixture\\runtime.ts fake-token-question-849 INTERNAL_OBSERVER_FAILURE';
+  const source = '도구 본문 원문: D:\\user-work\\keep-this-file.ts';
+  await fixture(page, [{ ...question, message: source }, approval]); await open(page);
+  const hiddenFault = async () => {
+    const dom = await page.locator('html').evaluate(element => element.outerHTML);
+    for (const value of ['private-fixture', 'fake-token-question-849', 'INTERNAL_OBSERVER_FAILURE']) expect(dom).not.toContain(value);
+    await expect(page.locator('.question-item').first()).toContainText(source);
+  };
+  await page.evaluate(fault => { const f = (window as any).questionFixture; f.responseError = fault; f.pollError = fault; f.openError = fault; }, fault);
+  await page.getByRole('button', { name: '거절', exact: true }).click();
+  await expect(page.locator('.question-item').nth(1).getByRole('status')).toContainText('응답 결과를 확인하지 못했습니다');
+  await expect(page.getByRole('button', { name: '거절', exact: true })).toBeDisabled();
+  await page.locator('.question-item').first().getByRole('button', { name: '원래 세션 열기 →' }).click();
+  await expect(page.locator('.question-item').first().getByRole('status')).toContainText('세션 목록에서 해당 세션을 선택');
+  await page.clock.runFor(3_000);
+  await expect(page.locator('.question-list-status')).toContainText('이전 목록을 유지');
+  await expect(page.locator('.question-list-status')).toContainText('마지막 확인:');
+  const lastChecked = (await page.locator('.question-list-status').textContent())!.split('마지막 확인:')[1];
+  await expect(page.locator('#question-count')).toHaveText('2'); await hiddenFault();
+  await page.clock.runFor(3_000);
+  expect((await page.locator('.question-list-status').textContent())!.split('마지막 확인:')[1]).toBe(lastChecked);
+  await page.evaluate(() => (window as any).questionFixture.setLanguage('en'));
+  await expect(page.locator('.question-list-status')).toContainText('Last checked:');
+  await expect(page.locator('.question-item').first().getByRole('status')).toContainText('Select it in the session list');
+  await expect(page.locator('.question-item').nth(1).getByRole('status')).toContainText('Response result is unknown'); await hiddenFault();
+  await page.evaluate(() => { const f = (window as any).questionFixture; f.pollError = ''; f.items[1].responded = true; });
+  await page.clock.runFor(3_000); await expect(page.locator('.question-list-status')).toHaveText('');
+  await expect(page.locator('#question-count')).toHaveText('2'); await hiddenFault();
+  await page.evaluate(() => { const f = (window as any).questionFixture; f.items.pop(); }); await page.clock.runFor(3_000);
+  await expect(page.locator('#question-count')).toHaveText('1'); await hiddenFault();
+  expect(await responses(page)).toEqual([expect.objectContaining({ args: { sessionId: 'session-two', generation: 2, requestId: 'r1', decision: 'decline' } })]);
+});
+
+test('첫 조회 연결 실패는 확인된 0건과 구분하고 재조회 성공 뒤에만 빈 목록으로 표시한다', async ({ page }) => {
+  const fault = 'D:\\unknown-fixture\\server.exe fake-token-initial-357 INTERNAL_CONNECT_ERROR';
+  await fixture(page, [], { pollError: fault }); await open(page);
+  await expect(page.locator('.question-summary')).toHaveText('미응답 상태를 확인할 수 없습니다.');
+  await expect(page.locator('.question-center-button')).toHaveAttribute('title', '질문함 · 상태 확인 불가');
+  await expect(page.locator('.question-list-status')).toContainText('질문 목록에 연결할 수 없습니다');
+  await expect(page.locator('.question-list-status')).not.toContainText('미응답 질문이 없습니다');
+  for (const language of ['en', 'ko']) {
+    await page.evaluate(language => (window as any).questionFixture.setLanguage(language), language);
+    const dom = await page.locator('html').evaluate(element => element.outerHTML);
+    for (const value of ['unknown-fixture', 'fake-token-initial-357', 'INTERNAL_CONNECT_ERROR']) expect(dom).not.toContain(value);
+  }
+  await page.evaluate(() => { (window as any).questionFixture.pollError = ''; }); await page.clock.runFor(3_000);
+  await expect(page.locator('.question-summary')).toHaveText('미응답 0건');
+  await expect(page.locator('.question-list-status')).toHaveText('미응답 질문이 없습니다.');
+  await expect(page.locator('.question-center-button')).toHaveAttribute('title', '질문함 · 미응답 0건');
   expect(await responses(page)).toHaveLength(0);
 });

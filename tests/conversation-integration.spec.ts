@@ -17,11 +17,11 @@ test.beforeEach(async ({ page }) => {
         if (command === 'list_projects') return [];
         if (command === 'list_sessions') return [{ id: 'chat-session', generation: 1, title: '기존 세션', cwd: 'D:\\Work', threadId: 'original-thread', state: 'idle', active: true }];
         if (command === 'conversation_request') {
-          if (args.request.type === 'attach' && state.attachFailure) throw new Error('fixture attach failure');
-          if (args.request.type === 'handoffToTerminal' && state.handoffFailure) throw new Error('fixture handoff failure');
+          if (args.request.type === 'attach' && state.attachFailure) throw new Error(state.failureRaw ?? 'fixture attach failure');
+          if (args.request.type === 'handoffToTerminal' && state.handoffFailure) throw new Error(state.failureRaw ?? 'fixture handoff failure');
           if (args.request.type === 'attach') return { threadId: 'original-thread', model: 'available-model', reasoningEffort: 'high' };
           if (args.request.type === 'page' || args.request.type === 'items' || args.request.type === 'models') return { data: [], nextCursor: null };
-          if (args.request.type === 'poll') return { events: [], pendingRequests: [], connected: true, gap: false };
+          if (args.request.type === 'poll') return { events: (state.chatQueue ?? []).splice(0), pendingRequests: [], connected: true, gap: false };
           return {};
         }
         return null;
@@ -92,3 +92,39 @@ test('명시 터미널 인계가 거절되면 대화 화면과 초안을 유지�
   expect(requests.filter((type: string) => type === 'handoffToTerminal')).toHaveLength(2);
   expect(requests).not.toContain('detach');
 });
+
+for (const language of ['ko', 'en'] as const) for (const failure of ['attach', 'handoff'] as const) {
+  test(language + ' 전환 오류를 상위 알림과 전체 화면에 원문으로 노출하지 않는다: ' + failure, async ({ page }) => {
+    await page.goto('/');
+    const card = page.locator('.terminal-card[data-id="chat-session"]');
+    await expect(card).toBeVisible();
+    await page.evaluate(async value => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage(value); }, language);
+    const markers = ['private_fixture_path_701', 'token_fixture_NEVER_REAL_701', 'INTERNAL_PRIVATE_FAILURE_701'];
+    await page.evaluate(values => { (window as any).failureRaw = 'D:/private_fixture_path_701/helper.exe ' + values.join(' '); }, markers);
+    if (failure === 'attach') await page.evaluate(() => { (window as any).attachFailure = true; });
+    else {
+      await card.locator('.conversation-toggle').click();
+      await expect(card.locator('.conversation-input')).toBeEnabled();
+      await card.locator('.conversation-input').fill('오류에서도 보존할 초안');
+      await page.evaluate(() => {
+        const state = window as any; state.handoffFailure = true;
+        state.chatQueue = [{ seq: 1, method: 'turn/started', params: { turn: { id: 'public-turn', status: 'inProgress' } } }, { seq: 2, method: 'item/completed', params: { turnId: 'public-turn', item: { id: 'public-output', type: 'agentMessage', text: '사용자가 볼 실제 대화 표식' } } }];
+      });
+      await expect(card.locator('.conversation-messages')).toContainText('사용자가 볼 실제 대화 표식');
+    }
+    await card.locator('.conversation-toggle').click();
+    await expect(card.locator('.conversation-host')).toBeVisible();
+    await expect(card.locator('.terminal-host')).toBeHidden();
+    await expect(card.locator('.conversation-toggle')).toHaveAttribute('aria-pressed', 'true');
+    const html = await page.locator('body').evaluate(node => node.outerHTML);
+    for (const marker of markers) expect(html).not.toContain(marker);
+    await expect(page.locator('#toast-area .toast.error')).toContainText(language === 'ko' ? '현재 화면과 작성 중인 내용을 확인' : 'Check the current view and your draft');
+    if (failure === 'handoff') {
+      await expect(card.locator('.conversation-input')).toHaveValue('오류에서도 보존할 초안');
+      await expect(card.locator('.conversation-messages')).toContainText('사용자가 볼 실제 대화 표식');
+    }
+    const calls = await page.evaluate(() => (window as any).chatCalls);
+    expect(calls.filter((entry: any) => entry.command === 'session_write')).toHaveLength(0);
+    expect(calls.filter((entry: any) => entry.command === 'conversation_request' && entry.args.request.type === 'send')).toHaveLength(0);
+  });
+}

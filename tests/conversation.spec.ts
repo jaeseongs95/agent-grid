@@ -464,7 +464,42 @@ test('isOther 선택 질문은 직접 입력한 초안을 보존하고 선택값
   expect(responses).toEqual([{ type: 'respond', requestId: 'question-other', result: { answers: { scope: { answers: ['먼저 문서만 살펴보세요'] } } } }]);
 });
 
-test('승인 선택지는 필드 부재와 명시적인 빈 값·미지원 값을 구분하고 안전한 교집합만 표시한다', async ({ page }) => {
+test('미지원 권한·향후 승인 요청은 응답 없이 원문과 대기를 보존하고 명시 인계만 시도한다', async ({ page }) => {
+  await conversation(page);
+  const pending = [
+    { seq: 1, requestId: 'permission-original', method: 'item/permissions/requestApproval', params: { permissions: { network: { enabled: true } }, reason: '권한 원문 유지', availableDecisions: ['accept', 'decline'] } },
+    { seq: 2, requestId: 'future-original', method: 'item/future/requestApproval', params: { futurePayload: { scope: '향후 요청 원문 유지' } } },
+  ];
+  await page.evaluate(pending => { const fixture = (window as any).conversationFixture; fixture.pending = pending; fixture.rejectHandoff = true; }, pending);
+  await expect(view(page).locator('.conversation-request')).toHaveCount(2);
+  for (const [index, request] of pending.entries()) {
+    const panel = view(page).locator('.conversation-request').nth(index);
+    await expect(panel.locator('strong')).toHaveText(request.method);
+    await expect(panel.locator('pre')).toHaveText(JSON.stringify(request.params, null, 2));
+    await expect(panel.locator('button,input,select')).toHaveCount(0);
+    await expect(panel).toContainText('요청이 시작된 클라이언트에서 확인하세요');
+  }
+  await page.waitForTimeout(850);
+  const rejected = await page.evaluate(async () => { try { await (window as any).conversation.handoffToTerminal(); return false; } catch { return true; } });
+  expect(rejected).toBe(true);
+  await expect(view(page)).toBeVisible();
+  await expect(view(page).locator('.conversation-request')).toHaveCount(2);
+  expect(await page.evaluate(() => (window as any).conversationFixture.pending)).toEqual(pending);
+  expect(await page.evaluate(() => (window as any).conversationFixture.owners)).toEqual([true]);
+  await page.evaluate(() => { const fixture = (window as any).conversationFixture; fixture.pending = fixture.pending.slice(0, 1); fixture.rejectHandoff = false; });
+  await expect(view(page).locator('.conversation-request')).toHaveCount(1);
+  await page.evaluate(async () => { await (window as any).conversation.handoffToTerminal(); });
+  await expect(view(page)).toBeHidden();
+  const state = await page.evaluate(() => { const fixture = (window as any).conversationFixture; return { pending: fixture.pending, owners: fixture.owners, requests: fixture.calls.map((entry: any) => entry.args.request?.type) }; });
+  expect(state.pending).toEqual(pending.slice(0, 1));
+  expect(state.owners).toEqual([true, false]);
+  expect(state.requests.filter((type: string) => type === 'respond')).toEqual([]);
+  expect(state.requests.filter((type: string) => type === 'handoffToTerminal')).toHaveLength(2);
+  expect(state.requests.filter((type: string) => type === 'detach')).toEqual([]);
+});
+
+for (const method of ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval']) {
+test(`${method} 승인 선택지는 필드 부재와 명시적인 빈 값·미지원 값을 구분하고 안전한 교집합만 표시한다`, async ({ page }) => {
   await conversation(page);
   const cases = [
     { key: '필드 없음', present: false, value: null, labels: ['이번만 승인', '거절', '취소'] },
@@ -476,11 +511,11 @@ test('승인 선택지는 필드 부재와 명시적인 빈 값·미지원 값�
     { key: '혼합 목록', present: true, value: ['decline', 'acceptForSession', { acceptWithExecpolicyAmendment: {} }, 'futureDecision', 'decline'], labels: ['세션 동안 승인', '거절'] },
   ];
   for (const candidate of cases) {
-    await page.evaluate(candidate => {
+    await page.evaluate(({ candidate, method }) => {
       const params: any = { reason: candidate.key };
       if (candidate.present) params.availableDecisions = candidate.value;
-      (window as any).conversationFixture.pending = [{ seq: 1, method: 'item/commandExecution/requestApproval', requestId: `approval-${candidate.key}`, params }];
-    }, candidate);
+      (window as any).conversationFixture.pending = [{ seq: 1, method, requestId: `approval-${candidate.key}`, params }];
+    }, { candidate, method });
     const panel = view(page).locator('.conversation-request'); await expect(panel.locator('pre')).toContainText(candidate.key);
     await expect(panel.locator('button')).toHaveText(candidate.labels);
     if (candidate.labels.length) await panel.getByRole('button', { name: '거절', exact: true }).click();
@@ -491,6 +526,7 @@ test('승인 선택지는 필드 부재와 명시적인 빈 값·미지원 값�
     { type: 'respond', requestId: 'approval-혼합 목록', result: { decision: 'decline' } },
   ]);
 });
+}
 
 test('같은 스레드의 확정 설정 알림은 현재값을 갱신하고 미전송 모델·추론 선택과 구분한다', async ({ page }) => {
   await conversation(page);
