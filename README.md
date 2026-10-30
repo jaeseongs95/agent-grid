@@ -314,3 +314,9 @@ or unknown request result. The app must use an atomic idle-only runtime operatio
 never falls back to the legacy compaction operation that can replace an active task.
 Unsupported runtimes keep the button unavailable. Acceptance is not completion, and an
 unknown result is never automatically retried. Drafts and original conversations are preserved.
+
+## Session scheduled jobs
+
+The clock icon in a session header opens schedules owned by that session’s CLI. The dialog supports recurring intervals, a one-time local execution time, listing, adding, pausing, resuming, removing, and requesting cancellation of the current occurrence. Schedules end when the owning CLI exits; no separate operating-system schedules are created.
+
+Removing or pausing a schedule does not interrupt an accepted run. Cancelling an occurrence targets only the turn owned by that schedule and preserves recurring schedules. Unknown mutation results are never retried automatically and block further changes until reconciled. Runtimes without structured schedule control show an unsupported state and disable mutations.

@@ -646,6 +646,20 @@ impl Engine {
         connection.request_for_session(&thread_id, Path::new(&info.cwd), request,id,self.inner.attachments.clone())
     }
 
+    pub fn cron_request(&self,id: &str,generation: u64,request: codex::CronRequest) -> Result<serde_json::Value,String> {
+        request.validate()?;
+        if self.inner.exiting.load(Ordering::Acquire) {return Err("앱이 종료 중이어서 예약 요청을 시작하지 않았습니다.".into());}
+        let session=self.lookup(id,generation)?;
+        if session.phase.load(Ordering::Acquire)!=1 || session.stop_requested.load(Ordering::Acquire) {return Err("실행 중인 세션에서만 예약 요청을 사용할 수 있습니다.".into());}
+        let info=session.info.lock().map_err(|_| "예약 대상 세션 상태 오류")?.clone();
+        let thread_id=info.thread_id.ok_or("예약 대상 대화 식별자가 아직 확인되지 않았습니다.")?;
+        let process=session.process.lock().map_err(|_| "예약 대상 프로세스 상태 오류")?.clone().ok_or("예약 대상 프로세스를 확인할 수 없습니다.")?;
+        let adapter=process.adapter.lock().map_err(|_| "예약 제어 연결 상태 오류")?;
+        // 이 경로는 현재 로컬 검증과 미지원 응답뿐이다. 연결·PTY·이력 I/O를 하지 않는다.
+        if self.inner.exiting.load(Ordering::Acquire) || session.phase.load(Ordering::Acquire)!=1 || session.stop_requested.load(Ordering::Acquire) {return Err("세션이 종료 중이어서 예약 요청을 시작하지 않았습니다.".into());}
+        adapter.as_ref().ok_or("예약 대상 CLI를 확인할 수 없습니다.")?.cron_request(&thread_id,request)
+    }
+
     pub fn conversation_attachments(&self) -> crate::conversation_attachments::ConversationAttachments { self.inner.attachments.clone() }
 
     pub fn stage_conversation_image(&self,id: &str,generation: u64,data_url: &str) -> Result<crate::conversation_attachments::ConversationAttachment,String> {
@@ -800,6 +814,21 @@ mod lifecycle_tests {
         assert!(engine.cleanup_conversation_attachment(&info.id,info.generation+1,"external-file").unwrap_err().contains("stale"));
         assert!(session.process.lock().unwrap().is_none());
         session.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn cron_admission_checks_generation_lifetime_and_current_thread_before_transport() {
+        let engine=Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
+        let session=engine.allocate(&request()).unwrap();let info=session.info().unwrap();
+        assert!(engine.cron_request(&info.id,info.generation+1,codex::CronRequest::List{}).unwrap_err().contains("stale"));
+        assert!(engine.cron_request(&info.id,info.generation,codex::CronRequest::List{}).unwrap_err().contains("실행 중"));
+        session.phase.store(1,Ordering::Release);
+        assert!(engine.cron_request(&info.id,info.generation,codex::CronRequest::List{}).unwrap_err().contains("대화 식별자"));
+        session.info.lock().unwrap().thread_id=Some(Uuid::new_v4().to_string());
+        assert!(engine.cron_request(&info.id,info.generation,codex::CronRequest::List{}).unwrap_err().contains("프로세스"));
+        session.stop_requested.store(true,Ordering::Release);
+        assert!(engine.cron_request(&info.id,info.generation,codex::CronRequest::List{}).unwrap_err().contains("실행 중"));
+        assert!(session.process.lock().unwrap().is_none());session.finish("stopped").unwrap();
     }
 
     #[test]

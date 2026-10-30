@@ -16,6 +16,7 @@ test.beforeEach(async ({ page }) => {
         if (command === 'load_layout') return { version: 1, columns: 1, sessions: [] };
         if (command === 'list_projects') return [];
         if (command === 'list_sessions') return [{ id: 'chat-session', generation: 1, title: '기존 세션', cwd: 'D:\\Work', threadId: 'original-thread', state: 'idle', active: true }];
+        if (command === 'cron_request') return state.cronSnapshot ?? { supported: false, connected: false, scope: 'cliLifetime', jobs: [], hasMore: false, reason: 'unsupported' };
         if (command === 'conversation_request') {
           if (args.request.type === 'attach' && state.attachFailure) throw new Error(state.failureRaw ?? 'fixture attach failure');
           if (args.request.type === 'handoffToTerminal' && state.handoffFailure) throw new Error(state.failureRaw ?? 'fixture handoff failure');
@@ -187,3 +188,23 @@ for (const language of ['ko', 'en'] as const) for (const failure of ['attach', '
     expect(calls.filter((entry: any) => entry.command === 'conversation_request' && entry.args.request.type === 'send')).toHaveLength(0);
   });
 }
+
+
+test('세션 상단 예약 아이콘은 원래 세션 목록만 조회하고 터미널 입력이나 새 세션을 만들지 않는다', async ({ page }) => {
+  await page.goto('/');
+  const card = page.locator('.terminal-card[data-id="chat-session"]');
+  const icon = card.getByRole('button', { name: '예약 작업', exact: true });
+  await expect(icon).toBeVisible();
+  expect(await page.evaluate(() => (window as any).chatCalls.filter((c: any) => c.command === 'cron_request'))).toHaveLength(0);
+  await icon.click();
+  const dialog = page.locator('#cron-dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator('.cron-session')).toHaveText('세션: 기존 세션');
+  await expect(dialog.locator('.cron-status')).toContainText('지원하지 않습니다');
+  await expect(dialog.locator('.cron-add')).toBeDisabled();
+  const calls = await page.evaluate(() => (window as any).chatCalls);
+  expect(calls.filter((c: any) => c.command === 'cron_request')).toEqual([{ command: 'cron_request', args: { id: 'chat-session', generation: 1, request: { type: 'list' } } }]);
+  expect(calls.some((c: any) => c.command === 'session_write' || c.command === 'start_session')).toBe(false);
+  await dialog.locator('.cron-close').click();
+  await expect(dialog).not.toBeVisible();
+});
