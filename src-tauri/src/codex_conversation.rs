@@ -195,7 +195,10 @@ impl ConversationConnection {
         let Some(worker)=slot.as_mut() else {return if self.0.owned.load(Ordering::Acquire) {Err("대화 입력 소유권의 종료 근거가 없습니다.".into())} else {Ok(true)};};
         if finished_only && !worker.joined && !worker.join.as_ref().is_some_and(JoinHandle::is_finished) {return Ok(false);}
         // worker의 종료 콜백도 events를 잠그므로 join 중에는 events/input을 잡지 않는다.
-        worker.stop()?;
+        if let Err(error)=worker.stop() {
+            let mut events=self.0.events.lock().map_err(|_| "대화 승인 상태 오류")?;
+            events.connected=false;events.error=Some(error.clone());return Err(error);
+        }
         let mut events=self.0.events.lock().map_err(|_| "대화 승인 상태 오류")?;
         if events.blocks_release(handoff) || self.0.unknown.load(Ordering::Acquire) {
             return Err("미확인 요청 또는 승인 대기가 남아 대화 입력 소유권을 유지했습니다.".into());
@@ -997,6 +1000,7 @@ mod tests {
     fn handoff_closes_admission_and_rechecks_late_requests_after_join() {
         for late in ["general","owner","responded","unknown","panic"] {
             let(control,_rpc,_listener)=fixture();let(entered,ready)=mpsc::sync_channel(1);let(release,released)=mpsc::sync_channel(1);
+            control.0.events.lock().unwrap().connected=true;
             install_actor(&control,move|state,receiver,_cancelled|{
                 let work=receiver.recv_timeout(Duration::from_secs(3)).unwrap();assert!(matches!(work.request,ConversationRequest::HandoffToTerminal));work.reply.send(Ok(json!({}))).unwrap();entered.send(()).unwrap();released.recv_timeout(Duration::from_secs(3)).unwrap();
                 if late=="panic" {panic!("인계 중 actor 종료 실패 합성");}
@@ -1012,6 +1016,7 @@ mod tests {
             // 종료를 기다리는 것이 허용된다. 종료 뒤에는 살아 있는 actor가 없어 wire 입력은 0이다.
             release.send(()).unwrap();let result=caller.join().unwrap();assert_eq!(result.is_ok(),late=="general");
             assert_eq!(control.terminal_write(||Ok(1)).is_ok(),late=="general");assert_eq!(control.0.owned.load(Ordering::Acquire),late!="general");
+            if late=="panic" {let poll=control.request("original",Path::new("."),ConversationRequest::Poll).unwrap();assert_eq!(poll["connected"],false);assert!(poll["error"].as_str().is_some_and(|error|error.contains("비정상 종료")));}
             if late!="panic"&&late!="unknown" {assert_eq!(control.pending_snapshot().unwrap().2.len(),1);}
             if late!="general" {assert!(control.request("original",Path::new("."),ConversationRequest::Page{cursor:None}).is_err());}control.cancel();
         }
