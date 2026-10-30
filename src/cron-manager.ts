@@ -57,7 +57,7 @@ export function createCronManager(host: Host) {
     if (!jobs.length) { const empty = document.createElement('p'); bindText(empty, knownList && fresh ? '이 세션에 등록된 예약이 없습니다.' : '예약 목록을 아직 확인하지 못했습니다.', knownList && fresh ? 'This session has no scheduled jobs.' : 'The job list has not been confirmed.'); list.append(empty); }
     for (const job of jobs) {
       const row = document.createElement('article'); row.className = 'cron-job'; row.dataset.jobId = job.id;
-      const title = document.createElement('strong'); title.textContent = `#${job.id} · ${job.paused ? t('일시정지', 'Paused') : t(...states[job.state])}${job.removed ? t(' · 삭제됨, 실행 종료 확인 중', ' · Removed, waiting for execution to end') : ''}`;
+      const title = document.createElement('strong'); title.textContent = `#${job.id} · ${job.paused ? t('일시정지 · ', 'Paused · ') : ''}${t(...states[job.state])}${job.removed ? t(' · 삭제됨, 실행 종료 확인 중', ' · Removed, waiting for execution to end') : ''}`;
       const text = document.createElement('p'); text.className = 'cron-preview'; text.textContent = job.promptPreview.slice(0, 512);
       const detail = document.createElement('small');
       const schedule = job.schedule.type === 'every' ? t(`${job.schedule.seconds}초 간격`, `Every ${job.schedule.seconds} seconds`) : formatTime(job.schedule.atUnixMs);
@@ -77,7 +77,7 @@ export function createCronManager(host: Host) {
     if (!value || typeof value.supported !== 'boolean' || typeof value.connected !== 'boolean' || value.scope !== 'cliLifetime' || !Array.isArray(value.jobs)) throw Error('예약 응답 형식 불일치');
     const ids = new Set<string>();
     for (const job of value.jobs.slice(0, LIMIT)) { if (ids.has(job?.id)) throw Error('중복 예약 식별자'); ids.add(job?.id); }
-    if (value.jobs.slice(0, LIMIT).some(job => !job || typeof job.id !== 'string' || !/^[1-9][0-9]{0,19}$/.test(job.id) || BigInt(job.id) > 18446744073709551615n || typeof job.promptPreview !== 'string' || typeof job.state !== 'string' || !Object.hasOwn(states, job.state) || typeof job.paused !== 'boolean' || typeof job.removed !== 'boolean' || !job.schedule || (job.schedule.type === 'every' ? !Number.isSafeInteger(job.schedule.seconds) || job.schedule.seconds <= 0 : job.schedule.type !== 'at' || !Number.isSafeInteger(job.schedule.atUnixMs) || job.schedule.atUnixMs <= 0))) throw Error('예약 목록 형식 불일치');
+    if (value.jobs.slice(0, LIMIT).some(job => !job || typeof job.id !== 'string' || !/^[1-9][0-9]{0,19}$/.test(job.id) || BigInt(job.id) > 18446744073709551615n || typeof job.promptPreview !== 'string' || typeof job.state !== 'string' || !Object.hasOwn(states, job.state) || typeof job.paused !== 'boolean' || typeof job.removed !== 'boolean' || (job.nextRunAt != null && (!Number.isSafeInteger(job.nextRunAt) || job.nextRunAt <= 0)) || (job.skipped != null && (!Number.isSafeInteger(job.skipped) || job.skipped < 0)) || !job.schedule || (job.schedule.type === 'every' ? !Number.isSafeInteger(job.schedule.seconds) || job.schedule.seconds <= 0 : job.schedule.type !== 'at' || !Number.isSafeInteger(job.schedule.atUnixMs) || job.schedule.atUnixMs <= 0))) throw Error('예약 목록 형식 불일치');
   }
   function scheduleRefresh() { clearTimeout(timer); if (dialog.open && visible && !document.hidden && !exiting && available) timer = setTimeout(() => void refresh(), 5000); }
   function track(work: () => Promise<void>) {
