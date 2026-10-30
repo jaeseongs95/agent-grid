@@ -16,7 +16,7 @@ pub enum ConversationRequest {
     Poll,
     Page { cursor: Option<String> },
     Items { turn_id: String, cursor: Option<String> },
-    Detail { turn_id: String, item_id: String, offset: Option<usize> },
+    Detail { turn_id: String, item_id: String, offset: Option<usize>, snapshot_id: Option<String> },
     Models { cursor: Option<String> },
     Send { request_id: String, text: String, #[serde(default)] attachments: Vec<Attachment>, model: Option<String>, effort: Option<String> },
     Interrupt { turn_id: String },
@@ -47,7 +47,9 @@ struct Control {
     events: Mutex<Events>,
     sent: Mutex<HashSet<String>>,
     unknown: AtomicBool,
+    detail: Mutex<Option<DetailSnapshot>>,
 }
+struct DetailSnapshot { id: String, turn_id: String, item_id: String, text: Arc<str> }
 struct Worker {
     sender: mpsc::SyncSender<Work>,
     cancelled: Arc<AtomicBool>,
@@ -109,7 +111,7 @@ impl Events {
 }
 impl ConversationConnection {
     pub(super) fn new(endpoint: Endpoint, stopped: Arc<AtomicBool>) -> Self {
-        Self(Arc::new(Control {endpoint,stopped,input:Mutex::new(false),owned:AtomicBool::new(false),worker:Mutex::new(None),events:Mutex::new(Events::default()),sent:Mutex::new(HashSet::new()),unknown:AtomicBool::new(false)}))
+        Self(Arc::new(Control {endpoint,stopped,input:Mutex::new(false),owned:AtomicBool::new(false),worker:Mutex::new(None),events:Mutex::new(Events::default()),sent:Mutex::new(HashSet::new()),unknown:AtomicBool::new(false),detail:Mutex::new(None)}))
     }
     pub(crate) fn terminal_write<T>(&self, write: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let gui = self.0.input.lock().map_err(|_| "대화 입력 소유 상태를 확인할 수 없습니다.")?;
@@ -150,6 +152,7 @@ impl ConversationConnection {
         }
         *self.0.input.lock().unwrap_or_else(|e| e.into_inner()) = false;
         self.0.owned.store(false,Ordering::Release);
+        self.0.detail.lock().unwrap_or_else(|e|e.into_inner()).take();
     }
     pub(crate) fn request(&self, thread_id: &str, cwd: &Path, request: ConversationRequest) -> Result<Value, String> {
         validate_request(&request)?;
@@ -321,7 +324,7 @@ fn validate_request(request: &ConversationRequest) -> Result<(), String> {
     match request {
         ConversationRequest::Page {cursor: value} | ConversationRequest::Models {cursor: value} => cursor(value),
         ConversationRequest::Items {turn_id,cursor: value} => {valid_id(turn_id)?;cursor(value)},
-        ConversationRequest::Detail {turn_id,item_id,..} => {valid_id(turn_id)?;valid_id(item_id)},
+        ConversationRequest::Detail {turn_id,item_id,snapshot_id,..} => {valid_id(turn_id)?;valid_id(item_id)?;if let Some(id)=snapshot_id {valid_id(id)?;}Ok(())},
         ConversationRequest::Interrupt {turn_id} => valid_id(turn_id),
         ConversationRequest::Send {request_id,text,attachments,model,effort} => {
             Uuid::parse_str(request_id).map_err(|_| "전송 식별자는 UUID여야 합니다.")?;
@@ -355,12 +358,25 @@ fn execute<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str
     match request {
         ConversationRequest::Page {cursor: page_cursor} => { cursor(&page_cursor)?; bounded_page(call(control,rpc,thread_id,"thread/turns/list",json!({"threadId":thread_id,"cursor":page_cursor,"limit":20,"sortDirection":"desc","itemsView":"summary"}),cancelled)?,20) },
         ConversationRequest::Items {turn_id,cursor: page_cursor} => { valid_id(&turn_id)?; cursor(&page_cursor)?; bounded_page(call(control,rpc,thread_id,"thread/items/list",json!({"threadId":thread_id,"turnId":turn_id,"cursor":page_cursor,"limit":20,"sortDirection":"desc"}),cancelled)?,20) },
-        ConversationRequest::Detail {turn_id,item_id,offset} => {
+        ConversationRequest::Detail {turn_id,item_id,offset,snapshot_id} => {
             valid_id(&turn_id)?; valid_id(&item_id)?;
-            let result = call(control,rpc,thread_id,"thread/items/read",json!({"threadId":thread_id,"turnId":turn_id,"itemIds":[item_id]}),cancelled)?;
-            let data = result["data"].as_array().filter(|data| data.len() == 1).ok_or("상세 대화 항목을 찾을 수 없습니다.")?;
-            if data[0]["turnId"] != turn_id || data[0]["item"]["id"] != item_id { return Err("다른 대화 항목의 상세 응답을 거부했습니다.".into()); }
-            detail_chunk(&serde_json::to_string_pretty(&data[0]["item"]).map_err(|e| e.to_string())?,offset.unwrap_or(0))
+            let offset=offset.unwrap_or(0);
+            if offset==0 {
+                let result = call(control,rpc,thread_id,"thread/items/read",json!({"threadId":thread_id,"turnId":turn_id,"itemIds":[item_id]}),cancelled)?;
+                let data = result["data"].as_array().filter(|data| data.len() == 1).ok_or("상세 대화 항목을 찾을 수 없습니다.")?;
+                if data[0]["turnId"] != turn_id || data[0]["item"]["id"] != item_id { return Err("다른 대화 항목의 상세 응답을 거부했습니다.".into()); }
+                let text=serde_json::to_string(&data[0]["item"]).map_err(|e|e.to_string())?;
+                if text.len()>MAX_FRAME {return Err("상세 항목이 8MiB 프로토콜 상한을 넘었습니다. 원문을 잘라내지 않았습니다.".into());}
+                *control.detail.lock().map_err(|_| "대화 상세 스냅샷 상태 오류")?=Some(DetailSnapshot{id:Uuid::new_v4().to_string(),turn_id:turn_id.clone(),item_id:item_id.clone(),text:Arc::from(text)});
+            }
+            let (id,text)={
+                let detail=control.detail.lock().map_err(|_| "대화 상세 스냅샷 상태 오류")?;
+                let detail=detail.as_ref().filter(|detail| detail.turn_id==turn_id&&detail.item_id==item_id&&(offset==0||snapshot_id.as_ref()==Some(&detail.id))).ok_or("상세 스냅샷이 교체되었거나 만료되었습니다. 처음부터 다시 조회하세요.")?;
+                (detail.id.clone(),detail.text.clone())
+            };
+            let mut page=detail_chunk(&text,offset)?; page["snapshotId"]=json!(id);
+            if page["nextOffset"].is_null() {control.detail.lock().map_err(|_| "대화 상세 스냅샷 상태 오류")?.take();}
+            Ok(page)
         },
         ConversationRequest::Models {cursor: page_cursor} => { cursor(&page_cursor)?; bounded_page(call(control,rpc,thread_id,"model/list",json!({"cursor":page_cursor,"limit":50,"includeHidden":false}),cancelled)?,50) },
         ConversationRequest::Send {request_id,text,attachments,model,effort} => {
@@ -434,6 +450,7 @@ fn record_message(control: &Control, thread_id: &str, message: Value, metadata_o
     if let Some(id) = message.get("id") {
         let key = id.to_string();
         if events.answered.contains(&key) { return Ok(()); }
+        if key.len()>256 {return Err("서버 요청 식별자가 허용 크기를 넘었습니다. 응답을 보내지 않았습니다.".into());}
         if !id.is_string() && !id.is_i64() && !id.is_u64() { return Err("서버 요청 식별자 형식이 올바르지 않습니다.".into()); }
         let count = events.pending.keys().chain(events.observed_pending.keys()).collect::<HashSet<_>>().len();
         if !events.pending.contains_key(&key) && !events.observed_pending.contains_key(&key) && count >= REQUEST_COUNT { return Err("처리 대기 서버 요청이 상한을 넘었습니다. 응답을 자동 승인하지 않았습니다.".into()); }

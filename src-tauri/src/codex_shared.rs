@@ -197,8 +197,9 @@ pub(super) fn prepare(cwd: &Path, requested: Option<&str>, endpoint: SharedEndpo
     // 시작 중 포화 쓰기를 감시한 임시 작업자는 여기서 회수한다. 장기 관측은
     // 세션의 Weak<Job> 정리로 쓰기를 해제하므로 세션마다 감시 스레드를 남기지 않는다.
     proxy.expiry.take();
+    let observed_conversation = conversation.clone();
     let observer = thread::spawn(move || {
-        observe(&mut rpc, Some(id), &observer_cwd, &observing, on_event.as_ref());
+        observe(&mut rpc, Some(id), &observer_cwd, &observing, on_event.as_ref(),observed_conversation.as_ref());
         drop(rpc); // receiver를 먼저 닫아 bounded pipe reader의 send를 깨운다.
         drop(proxy);
     });

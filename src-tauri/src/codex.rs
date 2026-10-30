@@ -421,19 +421,31 @@ pub(crate) fn prepare_with_cancellation(exe: &OsString, cwd: &Path, thread_id: O
     session.socket = Some(rpc.ws.get_ref().try_clone().map_err(|e| e.to_string())?);
     let stopped = session.stopped.clone();
     let selected = thread_id.map(str::to_owned);
+    let conversation = session.conversation.clone();
     session.observer = Some(thread::spawn(move || {
-        observe(&mut rpc, selected, &cwd, &stopped, on_event.as_ref());
+        observe(&mut rpc, selected, &cwd, &stopped, on_event.as_ref(),conversation.as_ref());
     }));
     Ok(session)
 }
 
-fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd: &Path, stopped: &AtomicBool, on_event: &dyn Fn(CodexEvent)) {
+fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd: &Path, stopped: &AtomicBool, on_event: &dyn Fn(CodexEvent), conversation: Option<&ConversationConnection>) {
         let mut next_poll = Instant::now();
         let mut last_state: Option<String> = None;
         let mut failures = 0;
+        let mut subscribed = false;
         while !stopped.load(Ordering::Acquire) {
+            if !subscribed {
+                if let (Some(id),Some(conversation)) = (selected.as_deref(),conversation) {
+                    // 기존 관측 연결로 메타데이터만 구독한다. 입력·승인 응답은 보내지 않는다.
+                    // 미지원 CLI에서도 기존 상태 조회는 보존하며 구독을 반복하지 않는다.
+                    if conversation.observer_subscribe(rpc,id,cwd).is_err() {conversation.observer_disconnected();}
+                    subscribed=true;
+                }
+            }
             if Instant::now() >= next_poll {
-                let snapshot = read_state(rpc, selected.as_deref(), cwd);
+                let snapshot = if let (Some(id),Some(conversation)) = (selected.as_deref(),conversation) {
+                    conversation.observer_call(rpc,id,"thread/read",json!({"threadId":id,"includeTurns":false})).and_then(|result| {verified_thread(&result["thread"],id,cwd)?;Ok(Some(result["thread"].clone()))})
+                } else {read_state(rpc, selected.as_deref(), cwd)};
                 if stopped.load(Ordering::Acquire) { break; }
                 match snapshot {
                     Ok(Some(thread)) => {
@@ -463,6 +475,7 @@ fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd:
             match incoming {
                 Ok(Some(message)) => if let Some(id) = selected.as_deref() {
                     if let Some(state) = event_status(&message, id) { publish_status(&mut last_state, state, on_event); }
+                    if let Some(conversation) = conversation {if conversation.observer_message(id,message).is_err() {publish_status(&mut last_state,"unknown".into(),on_event);break;}}
                 },
                 Ok(None) => {},
                 Err(_) => {
@@ -471,6 +484,7 @@ fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd:
                 }
             }
         }
+        if let Some(conversation) = conversation {conversation.observer_disconnected();}
 }
 
 /// `app-server proxy` relays raw bytes, including the control socket's WebSocket handshake.
