@@ -211,7 +211,8 @@ try {
         else { report.errors.push({ name: 'UnexpectedDialog', message: 'Unexpected browser dialog dismissed; no approval granted' }); await dialog.dismiss(); }
       } catch (error) { report.errors.push(shortError(error)); }
     });
-    await until(() => page.locator('#connection').textContent(), text => text === '로컬 연결됨', 'native IPC connected');
+    await until(() => page.locator('#app').getAttribute('aria-busy'), value => value === 'false', '앱 초기화 완료');
+    assert.equal(await page.locator('.toast.error').count(), 0, '앱 초기화 오류가 없어야 합니다');
     assert.equal(await page.locator('#runtime-banner').isVisible(), false, 'Demo/browser preview is not native evidence');
     assert.equal(await page.locator('.terminal-card').count(), 0, 'Existing owned tiles present; refusing to touch them');
     assert.equal(await page.locator('.broadcast-panel, [id^=broadcast-], #clear-selection, #selected-count').count(), 0, '선택 전송 패널이 제거되어야 합니다');
@@ -296,7 +297,7 @@ try {
       await page.locator('#language-select').selectOption('en');
       await until(() => page.locator('html').getAttribute('lang'), value => value === 'en', 'English language applied');
       assert.match((await page.locator('#new-session').textContent()) ?? '', /new session/i);
-      assert.match((await page.locator('#connection').textContent()) ?? '', /connected/i);
+      assert.equal(await page.locator('#language-select').inputValue(), 'en');
       assert.equal(await page.evaluate(() => localStorage.getItem('agent-grid-language')), 'en');
       const menu = await nativeCall('set_ui_language', { language: 'en' });
       assert.deepEqual(menu, { show: 'Open OpenDIY Desktop', exit: 'Exit…' }, 'Native menu readback did not match English');
@@ -341,7 +342,7 @@ try {
       await closePopups();
       await openSettings();
       await page.locator('#language-select').selectOption('ko');
-      await until(() => page.locator('#connection').textContent(), value => value === '로컬 연결됨', 'Korean restored for existing smoke checks');
+      await until(() => page.locator('html').getAttribute('lang'), value => value === 'ko', '한국어 복원 완료');
       assert.deepEqual(await nativeCall('set_ui_language', { language: 'ko' }), { show: 'OpenDIY Desktop 열기', exit: '종료…' });
       await page.locator('#settings-close').click();
       for (const previous of retained) await previous.screen?.dispose();
@@ -653,6 +654,7 @@ try {
     return { events, marker, markerInitiallyAbsent: true, echoObservedIn: 'VT-rendered xterm rows (composition overlay excluded)', echoWaitMs: Date.now() - dispatchedAt, beforeOutputLength: before.length, afterOutputLength: echoed.length, beforeOutputSha256: hash(before), afterOutputSha256: hash(echoed), enterSent: false, physicalImeVerified: false, koreanPtyRoundTripVerified: true, unsubmittedTextCleared: false, disposition: 'Left unsubmitted until the owned session is stopped; no Ctrl+U sent to a potentially waiting session.' };
   });
   await check('external observations stay read only and report unavailable daemon explicitly', async () => {
+    await openSettings();
     await page.locator('#external-toggle').click();
     const dialog = page.locator('#external-dialog'); await dialog.waitFor({ state: 'visible' });
     await until(() => page.locator('#external-list').textContent(), text => !!text && !text.includes('불러오는 중'), 'external read-only query');
@@ -663,6 +665,7 @@ try {
     const observedRows = await dialog.locator('.external-item').count();
     if (observedRows) assert((await dialog.locator('.external-item small').allTextContents()).some(text => text.includes('현재 상태 미확인')), 'Unknown external state must be explicit');
     await dialog.getByRole('button', { name: '닫기', exact: true }).click();
+    await page.locator('#settings-close').click();
     return { observedRows, readOnly: true, available: !unavailable, ...(unavailable ? { unavailableReasonSha256: hash(list), explicitUnavailableDisplayed: true } : {}), externalProcessesTouched: false };
   });
   if (process.env.AGENT_GRID_NATIVE_PID || process.env.AGENT_GRID_NATIVE_EXE) {

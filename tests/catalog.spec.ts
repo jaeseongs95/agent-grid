@@ -96,7 +96,7 @@ async function mockNative(page: Page, options: { holdSearch?: boolean; holdPrevi
     };
   }, { alpha, beta, options });
   await page.goto('/');
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
 }
 
 test('project import handles cancel/error and opens an empty filtered popup; registry survives reload', async ({ page }) => {

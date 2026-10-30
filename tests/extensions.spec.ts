@@ -105,7 +105,7 @@ async function fixture(page: Page) {
     };
   }, { runtime, projects, live, sourceFolder });
   await page.goto('/');
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect(page.locator('.terminal-card')).toHaveCount(1);
 }
 

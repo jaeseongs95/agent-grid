@@ -56,7 +56,7 @@ async function workspace(page: Page, fixtureSessions = sessions) {
     };
   }, fixtureSessions);
   await page.goto('/');
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect(card(page)).toBeVisible();
   await input(page).focus();
 }

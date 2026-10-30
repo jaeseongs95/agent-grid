@@ -65,7 +65,8 @@ async function nativeFixture(page: Page, options: { stored?: string; nativeLangu
     return;
   }
   const language = options.failLanguageRead ? options.stored === 'en' ? 'en' : 'ko' : options.nativeLanguage ?? 'ko';
-  await expect(page.locator('#connection')).toHaveText(language === 'en' ? /connected/i : '로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
+  await expect(page.locator('#language-select')).toHaveValue(language);
   await expect(page.locator('#projects')).toContainText(project.name);
 }
 
@@ -95,7 +96,7 @@ test('switch applies immediately and the selected language survives a real reloa
   await expect(page.locator('#language-error')).toBeHidden();
   await page.reload();
   await expect(page.locator('#language-select')).toHaveValue('en');
-  await expect(page.locator('#connection')).toHaveText(/connected/i);
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect(page.locator('#new-session')).toContainText(/new session/i);
   await switchLanguage(page, 'ko');
   await expect(page.locator('#language-error')).toBeHidden();
@@ -179,7 +180,7 @@ test('pending native startup language read cannot overwrite the durable preferen
   expect(await commands(page, ['set_ui_language'])).toEqual([]);
   expect(await page.evaluate(() => sessionStorage.getItem('fixture-native-language'))).toBe('en');
   await page.evaluate(() => (window as any).i18nFixture.releaseLanguageRead());
-  await expect(page.locator('#connection')).toHaveText(/connected/i);
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect(page.locator('#language-select')).toHaveValue('en');
   await expect(page.locator('#language-error')).toBeHidden();
   expect(await commands(page, ['set_ui_language'])).toEqual([{ command: 'set_ui_language', args: { language: 'en' } }]);

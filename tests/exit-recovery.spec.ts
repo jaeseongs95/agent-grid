@@ -34,7 +34,7 @@ async function workspace(page: Page, available: boolean | string = true, queryEr
       },
     };
   }, { available, queryError });
-  await page.goto('/'); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await page.goto('/'); await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await page.clock.install(); await page.locator('#exit').click();
 }
 

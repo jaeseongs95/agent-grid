@@ -68,11 +68,10 @@ let projectSelectionVersion = 0;
 let nativeWindowVisible = true;
 
 if (native) $('#app').hidden = true;
+$('#app').setAttribute('aria-busy', 'true');
 $('#app').innerHTML = `
   <aside class="sidebar">
     <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">${version}</span></a>
-    <div class="workspace-label">WORKSPACE <span class="local-pill">LOCAL</span></div>
-    <button class="workspace-choice"><span class="folder-icon">▤</span><span>나의 작업 공간<small>독립된 터미널, 하나의 화면</small></span></button>
     <div class="sidebar-lists">
       <section class="sidebar-projects" aria-labelledby="projects-heading">
         <div id="projects-heading" class="side-heading">프로젝트 <span id="project-count">0</span></div>
@@ -85,10 +84,9 @@ $('#app').innerHTML = `
       </section>
     </div>
 
-    <div class="sidebar-bottom"><span class="connection-dot"></span><span id="connection">연결 확인 중</span><small>Windows · 로컬 실행</small></div>
   </aside>
   <main>
-    <header class="topbar"><div class="workspace-actions"><h1 class="workspace-title">OpenDIY Desktop</h1><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="질문함">?<span id="notification-count" hidden></span></button><button id="settings-open" class="icon-button" aria-label="설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" title="설정">⚙</button><button id="exit" class="quiet-button">앱 종료</button></div></header>
+    <header class="topbar"><div class="workspace-actions"><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="질문함">?<span id="notification-count" hidden></span></button><button id="settings-open" class="icon-button" aria-label="설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" title="설정">⚙</button><button id="exit" class="quiet-button">앱 종료</button></div></header>
     <div id="project-tabs" class="project-tabs" role="tablist" aria-label="프로젝트별 세션"></div>
     <section class="toolbar" aria-label="그리드 도구"><div class="session-summary"><span class="connection-dot"></span><strong id="running-count">0</strong> 실행 중 <span class="divider"></span><span id="total-count">0개 세션</span></div><div class="layout-tools"><button id="search-toggle" class="quiet-button" title="활성 터미널 검색 (Ctrl+Shift+F)">⌕ <span>검색</span></button><span class="divider"></span><span class="layout-label">열</span><div id="column-options" class="segmented" role="group" aria-label="그리드 열 수"><button data-columns="1" aria-label="1열">▯</button><button data-columns="2" class="active" aria-label="2열">▥</button><button data-columns="3" aria-label="3열">▥▯</button><button data-columns="4" aria-label="4열">▥▥</button></div></div></section>
     <div id="runtime-banner" class="runtime-banner" hidden></div>
@@ -108,10 +106,6 @@ $('#app').innerHTML = `
 // Register only app-owned templates, before any terminal or user content is inserted.
 const markupLabels: Record<string, [string, string]> = {
   "OpenDIY Desktop 홈": ["OpenDIY Desktop 홈", "OpenDIY Desktop home"],
-  "WORKSPACE": ["작업 공간", "WORKSPACE"],
-  "LOCAL": ["로컬", "LOCAL"],
-  "나의 작업 공간": ["나의 작업 공간", "My workspace"],
-  "독립된 터미널, 하나의 화면": ["독립된 터미널, 하나의 화면", "Independent terminals, one view"],
   "프로젝트": ["프로젝트", "Projects"],
   "+ 새 프로젝트": ["+ 새 프로젝트", "+ New project"],
   "+ 프로젝트 가져오기": ["+ 프로젝트 가져오기", "+ Import project"],
@@ -125,8 +119,6 @@ const markupLabels: Record<string, [string, string]> = {
   "설정 열기": ["설정 열기", "Open settings"],
   "설정 닫기": ["설정 닫기", "Close settings"],
   "언어": ["언어", "Language"],
-  "연결 확인 중": ["연결 확인 중", "Checking connection"],
-  "Windows · 로컬 실행": ["Windows · 로컬 실행", "Windows · local execution"],
   "LOCAL WORKSPACE": ["로컬 작업 공간", "LOCAL WORKSPACE"],
   "알림 보기": ["알림 보기", "View notifications"],
   "앱 종료": ["앱 종료", "Exit app"],
@@ -803,7 +795,7 @@ const mobileControl = createMobileControl({ call, notify, openExecutableSettings
 const weeklyUsage = createWeeklyUsage({ call });
 const questionCenter = createQuestionCenter({ call, button: $<HTMLButtonElement>('#notifications'), openSession: focusSession });
 document.body.append(questionCenter.element);
-$('.sidebar-bottom').before(weeklyUsage.element);
+$('.sidebar').append(weeklyUsage.element);
 bindText($('#extensions-open-label'), '플러그인·스킬', 'Plugins & skills');
 $('#extensions-open').onclick = () => extensionsManager.open(selectedProjectCwd());
 const executableSettings = createExecutableSettings(async <T>(command: string, args?: Record<string, unknown>) => {
@@ -961,10 +953,10 @@ document.addEventListener('keydown', event => {
 
 async function initialize() {
   if (!native) {
-    bindText($('#connection'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'Design demo' : 'Browser preview'); bindText($('#mode-label'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'DESIGN DEMO' : 'BROWSER PREVIEW'); $('#runtime-banner').hidden = false;
+    bindText($('#mode-label'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'DESIGN DEMO' : 'BROWSER PREVIEW'); $('#runtime-banner').hidden = false;
     bindText($('#runtime-banner'), demo ? '디자인 데모 · 아래 터미널은 정적인 예시입니다. 실제 프로세스 실행·입력·전송은 지원하지 않습니다.' : '브라우저 미리보기입니다. 실제 세션 실행은 OpenDIY Desktop 앱에서 사용할 수 있습니다.', demo ? 'Design demo · These terminals are static examples. Process execution, input and sending are unavailable.' : 'Browser preview. Run real sessions in the OpenDIY Desktop app.');
     bindText($('#save-status'), '미리보기 · 저장 안 함', 'Preview · not saved');
-    if (demo) seedDemo(); renderAll(); return;
+    if (demo) seedDemo(); renderAll(); $('#app').setAttribute('aria-busy', 'false'); return;
   }
   try {
     await initializeNativeLanguage();
@@ -992,9 +984,10 @@ async function initialize() {
       try { await restoreSaved(request, false); } catch (error) { notifyError('자동 복원 실패', 'Could not automatically restore session', error); }
     }
     restoringWorkspace = false; updateRestoreBanner(); scheduleSave();
-    bindText($('#connection'), '로컬 연결됨', 'Connected locally'); renderAll();
+    renderAll();
     void sessionBrowser.refreshProjects().catch(error => notifyError('프로젝트 목록 조회 실패', 'Could not load projects', error));
-  } catch (error) { bindText($('#connection'), '연결 오류', 'Connection error'); notifyError('초기화 실패', 'Could not initialize', error); }
+  } catch (error) { notifyError('초기화 실패', 'Could not initialize', error); }
+  finally { $('#app').setAttribute('aria-busy', 'false'); }
 }
 
 function seedDemo() {

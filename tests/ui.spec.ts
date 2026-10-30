@@ -55,7 +55,8 @@ for (const width of [1440, 800]) {
     await page.goto('/?demo=1');
     await expect(page.locator('.terminal-card')).toHaveCount(4);
     await expect(page.locator('.workspace-header')).toHaveCount(0);
-    await expect(page.getByRole('heading', { name: 'OpenDIY Desktop', exact: true })).toBeVisible();
+    await expect(page.locator('.workspace-title')).toHaveCount(0);
+    await expect(page.locator('.sidebar .brand')).toBeVisible();
     const topbar = (await page.locator('.topbar').boundingBox())!;
     expect(topbar.y).toBe(0);
     expect(topbar.height).toBeLessThanOrEqual(60);

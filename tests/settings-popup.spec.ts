@@ -17,6 +17,7 @@ async function workspace(page: Page) {
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: [] };
         if (command === 'list_projects') return projects;
         if (command === 'list_sessions') return Array.from({ length: 12 }, (_, index) => ({ id: `session-${index}`, title: `열린 작업 ${index + 1}`, cwd: projects[0].cwd, generation: 1, state: 'idle', active: true }));
+        if (command === 'list_external') return [];
         if (command === 'get_codex_settings') return { savedPath: null, resolvedPath: 'D:\\도구\\codex.exe', source: 'path', error: null };
         if (command === 'weekly_usage') return { executable: 'D:\\도구\\codex.exe', observedAt: Date.now(), limitName: '시험 계정', weekly: { usedPercent: 25, resetsAt: 1900000000 } };
         return null;
@@ -24,7 +25,7 @@ async function workspace(page: Page) {
     };
   });
   await page.goto('/');
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
 }
 
 test('설정 팝업으로 진입하고 하위 창을 닫으면 키보드 초점이 돌아온다', async ({ page }, testInfo) => {
@@ -83,6 +84,8 @@ test('설정 안의 언어 선택과 닫기 버튼을 키보드로 사용한다'
 test('최소 창에서 목록과 하단 사용량을 유지하고 외부 세션은 설정에서 연다', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 800, height: 540 });
   await workspace(page);
+  await expect(page.locator('.workspace-label, .workspace-choice, .sidebar-bottom, #connection, .workspace-title')).toHaveCount(0);
+  await expect(page.locator('.sidebar .brand + .sidebar-lists')).toBeVisible();
   await expect(page.locator('#projects .project-row')).toHaveCount(20);
   await expect(page.locator('#session-list .session-link')).toHaveCount(12);
   const geometry = await page.evaluate(() => {
@@ -99,7 +102,7 @@ test('최소 창에서 목록과 하단 사용량을 유지하고 외부 세션�
     expect(await page.locator(`#${id}`).evaluate(node => node.scrollTop)).toBeGreaterThan(0);
   }
   expect(await page.locator('#weekly-usage').boundingBox()).toEqual(fixed);
-  for (const selector of ['#weekly-usage', '.sidebar-bottom', '#settings-open', '#exit']) {
+  for (const selector of ['#weekly-usage', '#settings-open', '#exit']) {
     await expect(page.locator(selector)).toBeVisible();
     const box = (await page.locator(selector).boundingBox())!;
     expect(box.y + box.height).toBeLessThanOrEqual(540);
@@ -107,7 +110,10 @@ test('최소 창에서 목록과 하단 사용량을 유지하고 외부 세션�
   }
   await page.screenshot({ path: testInfo.outputPath('sidebar-minimum-window.png'), fullPage: true });
   await expect(page.locator('.sidebar #external-toggle')).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).settingsPopupCalls.filter((call: any) => call.command === 'list_external'))).toEqual([]);
   await page.locator('#settings-open').click();
   await page.locator('#external-toggle').click();
   await expect(page.locator('#external-dialog')).toBeVisible();
+  await expect(page.locator('#external-list')).toHaveText('발견된 외부 기록이 없습니다.');
+  expect(await page.evaluate(() => (window as any).settingsPopupCalls.filter((call: any) => call.command === 'list_external').length)).toBe(1);
 });

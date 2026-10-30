@@ -98,7 +98,7 @@ async function workspace(page: Page, options: { capacity?: boolean } = {}) {
   const response = await page.goto('/');
   expect(response?.ok(), '작업 공간 문서 응답').toBe(true);
   try {
-    await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+    await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   } finally {
     await test.info().attach('workspace-load.json', { body: JSON.stringify({ url: page.url(), failures }, null, 2), contentType: 'application/json' });
   }
@@ -378,7 +378,7 @@ test('moving a running session preserves its terminal, generation and actual cwd
   expect(calls.filter((item: any) => ['session_stop', 'start_session', 'session_write'].includes(item.command))).toEqual([]);
   await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.savedLayout?.sessions.find((item: any) => item.threadId === 'thread-a1'))).toMatchObject({ projectId: null, projectAssigned: true, cwd: owned[0].cwd });
   await page.reload();
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await tab(page, 'Alpha').click();
   await expect.poll(() => visibleIds(page)).toEqual(['a2']);
 });
