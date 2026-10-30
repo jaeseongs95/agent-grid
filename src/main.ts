@@ -460,7 +460,12 @@ function mountConversation(session: Session) {
       card.querySelector<HTMLElement>('.terminal-host')!.hidden = show;
       toggle.setAttribute('aria-pressed', String(show));
       if (!show) { fit.fit(); terminal.focus(); }
-    } catch (error) { notifyError('보기 전환 실패', 'Could not switch view', error); }
+    } catch (error) {
+      const showingConversation = !conversationHost.hidden;
+      card.querySelector<HTMLElement>('.terminal-host')!.hidden = showingConversation;
+      toggle.setAttribute('aria-pressed', String(showingConversation));
+      notifyError('보기 전환 실패', 'Could not switch view', error);
+    }
     finally { toggle.disabled = false; }
   };
 }
@@ -555,7 +560,7 @@ function receiveSession(info: SessionInfo, persist = true) {
   }
   if (!order.includes(session.id)) order.push(session.id);
   const terminal = terminals.get(session.id)?.terminal ?? createTerminal(session);
-  if (previous && previous.generation !== session.generation) { const view = terminals.get(session.id)!; view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); terminal.reset(); const oldConversation = conversations.get(session.id); conversations.delete(session.id); conversationOwners.delete(session.id); if (oldConversation) void oldConversation.dispose({ sessionEnded: true }).catch(error => notifyError('이전 대화 정리 실패', 'Old conversation cleanup failed', error)); mountConversation(session); }
+  if (previous && previous.generation !== session.generation) { const view = terminals.get(session.id)!; view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); terminal.write('', () => terminal.reset()); const oldConversation = conversations.get(session.id); conversations.delete(session.id); conversationOwners.delete(session.id); if (oldConversation) void oldConversation.dispose({ sessionEnded: true }).catch(error => notifyError('이전 대화 정리 실패', 'Old conversation cleanup failed', error)); mountConversation(session); }
   if (previous && previous.state !== session.state) notify(`${session.title} · ${stateLabels(session.state)[0]}`, false, `${session.title} · ${stateLabels(session.state)[1]}`);
   renderAll();
   if (!previous || previous.state === 'starting') queueResize(session.id);

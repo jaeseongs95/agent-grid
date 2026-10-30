@@ -2,10 +2,10 @@ import { onLanguageChange, t } from './i18n';
 import './question-center.css';
 
 export interface PendingQuestion {
-  id: string; sessionId: string; threadId?: string; generation: number; requestId?: string;
+  id: string; sessionId: string; threadId?: string | null; generation: number; requestId?: string;
   kind: 'question' | 'approval' | 'unsupported'; title?: string; message?: string; sessionTitle?: string;
   canRespond: boolean; responded?: boolean;
-  questions?: { id: string; header?: string; question: string; options?: { label: string; description?: string }[]; isOther?: boolean; isSecret?: boolean }[];
+  questions?: { id: string; header?: string; question: string; options?: { label: string; description?: string }[] | null; isOther?: boolean; isSecret?: boolean }[];
   approval?: { options: { id: string; label: string }[] };
 }
 interface QuestionCenterHost {
@@ -24,9 +24,9 @@ function readItems(value: unknown): PendingQuestion[] {
   for (const item of items as PendingQuestion[]) {
     if (!item || typeof item.id !== 'string' || typeof item.sessionId !== 'string' || !Number.isSafeInteger(item.generation)
       || !['question', 'approval', 'unsupported'].includes(item.kind) || typeof item.canRespond !== 'boolean'
-      || (item.threadId !== undefined && typeof item.threadId !== 'string') || (item.requestId !== undefined && typeof item.requestId !== 'string')
+      || (item.threadId != null && typeof item.threadId !== 'string') || (item.requestId !== undefined && typeof item.requestId !== 'string')
       || (item.questions !== undefined && (!Array.isArray(item.questions) || item.questions.some(question => !question || typeof question.id !== 'string' || typeof question.question !== 'string'
-        || (question.options !== undefined && (!Array.isArray(question.options) || question.options.some(option => !option || typeof option.label !== 'string'))))))
+        || (question.options != null && (!Array.isArray(question.options) || question.options.some(option => !option || typeof option.label !== 'string'))))))
       || (item.approval !== undefined && (!Array.isArray(item.approval?.options) || item.approval.options.some(option => !option || typeof option.id !== 'string' || typeof option.label !== 'string')))) {
       throw new Error(t('질문 목록 형식이 올바르지 않습니다.', 'Invalid question list.'));
     }
@@ -83,11 +83,12 @@ export function createQuestionCenter(host: QuestionCenterHost) {
 
   function buildRow(item: PendingQuestion, draft: Draft, index: number) {
     const row = document.createElement('article'); row.className = 'question-item'; row.dataset.questionKey = key(item);
-    const heading = text('h3', item.title || t(item.kind === 'approval' ? '승인 요청' : item.kind === 'unsupported' ? '원문 확인 필요' : '질문', item.kind === 'approval' ? 'Approval request' : item.kind === 'unsupported' ? 'Details unavailable' : 'Question'));
+    const generatedTitle = !item.title || ['사용자 답변 대기', '사용자 승인 대기', '터미널에서 확인할 요청', '터미널에서 답변할 요청'].includes(item.title);
+    const heading = text('h3', !generatedTitle ? item.title! : t(item.kind === 'approval' ? '승인 요청' : item.kind === 'unsupported' ? '원문 확인 필요' : '질문', item.kind === 'approval' ? 'Approval request' : item.kind === 'unsupported' ? 'Details unavailable' : 'Question'));
     const session = text('small', item.sessionTitle || item.sessionId); session.className = 'question-session';
     const kind = text('span', item.kind === 'approval' ? t('승인 요청', 'Approval request') : item.kind === 'unsupported' ? t('세션 확인 필요', 'Check session') : t('질문', 'Question')); kind.className = 'question-kind';
     row.append(kind, heading, session);
-    if (item.message) row.append(text('p', item.message));
+    if (item.message && item.kind !== 'unsupported') row.append(text('p', item.message));
     const locked = !item.canRespond || !item.requestId || !!item.responded || !!draft.phase || exiting;
     const form = document.createElement('form');
     if (item.kind === 'question') for (const [questionIndex, question] of (item.questions ?? []).entries()) {
@@ -134,7 +135,10 @@ export function createQuestionCenter(host: QuestionCenterHost) {
       };
     }
     if (item.kind === 'approval') for (const option of item.approval?.options ?? []) {
-      const control = text('button', option.label) as HTMLButtonElement; control.type = 'button'; control.className = 'quiet-button'; control.disabled = locked;
+      const labels: Record<string, [string, string]> = { accept: ['승인', 'Approve'], decline: ['거절', 'Decline'], cancel: ['취소', 'Cancel'], acceptForSession: ['이 세션에서 승인', 'Approve for this session'] };
+      const translated = labels[option.id];
+      const label = translated && ['승인', '거절', '취소', '이 세션에서 승인'].includes(option.label) ? t(...translated) : option.label;
+      const control = text('button', label) as HTMLButtonElement; control.type = 'button'; control.className = 'quiet-button'; control.disabled = locked;
       control.onclick = () => { if (!draft.phase) void respond(item, draft, { decision: option.id }); }; form.append(control);
     }
     const open = text('button', t('원래 세션 열기 →', 'Open original session →')) as HTMLButtonElement; open.type = 'button'; open.className = 'quiet-button question-open';
@@ -177,6 +181,6 @@ export function createQuestionCenter(host: QuestionCenterHost) {
     setVisible(visible: boolean) { if (nativeVisible !== visible) { nativeVisible = visible; visibility(); } },
     beginExit(): Promise<void> { exiting = true; epoch++; clearTimer(); render(true); return Promise.all([running, ...responses]).then(() => {}); },
     cancelExit() { exiting = false; render(true); poll(); },
-    dispose() { if (disposed) return; disposed = true; epoch++; clearTimer(); abort.abort(); unlanguage(); element.close(); element.remove(); rows.clear(); drafts.clear(); items = []; },
+    dispose() { if (disposed) return; disposed = true; epoch++; clearTimer(); abort.abort(); unlanguage(); element.close(); element.remove(); element.replaceChildren(); rows.clear(); drafts.clear(); items = []; },
   };
 }

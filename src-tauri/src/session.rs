@@ -679,8 +679,9 @@ impl Engine {
                 let method = request["method"].as_str().unwrap_or("");
                 let kind = match method {"item/tool/requestUserInput" => "question","item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => "approval",_ => "unsupported"};
                 let request_id = request["requestId"].as_str().ok_or("대기 요청 식별자가 없습니다.")?;
-                let mut item = serde_json::json!({"id":format!("{}:{}:{}:{}",info.id,info.thread_id.as_deref().unwrap_or(""),info.generation,request_id),"threadId":info.thread_id,"sessionId":info.id,"generation":info.generation,"requestId":request_id,"kind":kind,"sessionTitle":info.title,"title":if kind=="question" {"사용자 답변 대기"} else if kind=="approval" {"사용자 승인 대기"} else {"터미널에서 확인할 요청"},"message":request["params"]["reason"].as_str().or_else(||request["params"]["command"].as_str()).unwrap_or(""),"canRespond":owned&&connected&&kind!="unsupported"&&request["responded"]!=true,"responded":request["responded"]==true});
+                let mut item = serde_json::json!({"id":format!("{}:{}:{}:{}",info.id,info.thread_id.as_deref().unwrap_or(""),info.generation,request_id),"threadId":info.thread_id,"sessionId":info.id,"generation":info.generation,"requestId":request_id,"kind":kind,"sessionTitle":info.title,"title":if kind=="question" {"사용자 답변 대기"} else if kind=="approval" {"사용자 승인 대기"} else {"터미널에서 확인할 요청"},"message":request["params"]["reason"].as_str().or_else(||request["params"]["command"].as_str()).unwrap_or(""),"canRespond":owned&&connected&&request["guiOwned"]==true&&kind!="unsupported"&&request["responded"]!=true,"responded":request["responded"]==true});
                 if kind=="question" {item["questions"]=request["params"]["questions"].clone();}
+                item["metadataAvailable"]=request["metadataAvailable"].clone();
                 if kind=="approval" {item["approval"]=serde_json::json!({"options":[{"id":"accept","label":"승인"},{"id":"decline","label":"거절"},{"id":"cancel","label":"취소"}]});}
                 items.push(item);
             }
@@ -786,6 +787,29 @@ mod lifecycle_tests {
 
     fn request() -> StartRequest {
         StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 80, rows: 24 }
+    }
+
+    #[test]
+    fn conversation_and_attachment_admission_reject_stale_generations_without_a_transport() {
+        let engine = Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
+        let session = engine.allocate(&request()).unwrap(); let info = session.info().unwrap();
+        assert!(engine.conversation_request(&info.id,info.generation+1,codex::ConversationRequest::Attach).unwrap_err().contains("stale"));
+        assert!(engine.stage_conversation_image(&info.id,info.generation+1,"data:image/png;base64,").unwrap_err().contains("stale"));
+        assert!(engine.cleanup_conversation_attachment(&info.id,info.generation+1,"external-file").unwrap_err().contains("stale"));
+        assert!(session.process.lock().unwrap().is_none());
+        session.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn waiting_terminal_inbox_is_a_read_only_fallback_without_inventing_question_metadata() {
+        let engine = Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
+        let session = engine.allocate(&request()).unwrap();
+        session.update(|info|info.state="waiting".into(),true).unwrap();
+        let inbox = engine.list_pending_questions().unwrap(); let items = inbox["items"].as_array().unwrap();
+        assert_eq!(items.len(),1); assert_eq!(items[0]["kind"],"unsupported"); assert_eq!(items[0]["canRespond"],false);
+        assert!(items[0].get("requestId").is_none()); assert!(items[0].get("questions").is_none());
+        assert!(session.process.lock().unwrap().is_none(),"질문함 조회가 서버나 연결을 만들면 안 된다");
+        session.finish("stopped").unwrap(); assert!(engine.list_pending_questions().unwrap()["items"].as_array().unwrap().is_empty());
     }
 
     #[test]

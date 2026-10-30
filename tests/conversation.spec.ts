@@ -7,7 +7,7 @@ async function conversation(page: Page) {
     const { createConversation } = await import('/src/conversation.ts');
     const host = document.createElement('section'); host.id = 'conversation-fixture';
     host.style.cssText = 'position:fixed;inset:20px;z-index:9999;background:#141820;'; document.body.append(host);
-    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, nextSeq: 1 };
+    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined };
     state.conversation = createConversation({
       sessionId: 'conversation-owned', generation: 7, host,
       ownerChanged: (owned: boolean) => fixture.owners.push(owned),
@@ -30,7 +30,7 @@ async function conversation(page: Page) {
           ], nextCursor: 'items-page-2' };
         }
         if (request.type === 'models') return { data: [{ id: 'runtime-model-id', model: 'runtime-model', displayName: '실제 런타임 모델', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }] }], nextCursor: null };
-        if (request.type === 'poll') return { events: fixture.queue.splice(0), pendingRequests: fixture.pending, connected: true, gap: false };
+        if (request.type === 'poll') return { events: fixture.queue.splice(0), pendingRequests: fixture.pending, connected: true, gap: false, unknownResult: fixture.unknownResult };
         if (request.type === 'send') { if (fixture.rejectSend) throw Error('응답 시간 초과'); return { turn: { id: 'sent-turn', status: 'inProgress' } }; }
         if (request.type === 'interrupt') { fixture.queue.push({ seq: fixture.nextSeq++, method: 'turn/completed', params: { turn: { id: request.turnId, status: 'interrupted' } } }); return {}; }
         if (request.type === 'respond') { fixture.pending = fixture.pending.map((entry: any) => entry.requestId === request.requestId ? { ...entry, responded: true } : entry); return {}; }
@@ -186,4 +186,22 @@ test('이벤트 순번·보존 상한과 이미지 붙여넣기·참조 제거 �
   await expect(view(page).locator('[data-item-id="huge-delta"]')).toContainText('미리보기');
   await expect(view(page).locator('.conversation-refresh')).toHaveClass(/needs-refresh/);
   expect((await view(page).locator('[data-item-id="huge-delta"]').textContent())!.length).toBeLessThan(17000);
+});
+
+test('명시 거절은 초안을 편집할 수 있고 늦은 조회는 숨긴 화면을 다시 채우지 않는다', async ({ page }) => {
+  await conversation(page);
+  await page.evaluate(() => { const fixture = (window as any).conversationFixture; fixture.rejectSend = true; fixture.unknownResult = false; });
+  await view(page).locator('.conversation-input').fill('거절되어도 보존할 초안');
+  await view(page).locator('.conversation-send').click();
+  await expect(view(page).locator('.conversation-status')).toContainText('전송이 거절되었습니다');
+  await expect(view(page).locator('.conversation-input')).toBeEnabled();
+  await expect(view(page).locator('.conversation-input')).toHaveValue('거절되어도 보존할 초안');
+  await page.evaluate(() => { const state = window as any; state.conversationFixture.holdItems = true; state.refreshPromise = state.conversation.refresh(); });
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args.request?.type === 'items').length)).toBe(2);
+  await page.evaluate(async () => { await (window as any).conversation.setForeground(false); (window as any).conversationFixture.releaseItems(); await (window as any).refreshPromise; });
+  await expect(view(page).locator('.conversation-message')).toHaveCount(0);
+  await page.evaluate(async () => { await (window as any).conversation.dispose({ sessionEnded: true }); });
+  const count = await page.evaluate(() => (window as any).conversationFixture.calls.length);
+  await page.waitForTimeout(900);
+  expect(await page.evaluate(() => (window as any).conversationFixture.calls.length)).toBe(count);
 });

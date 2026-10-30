@@ -30,7 +30,7 @@ export function createConversation(options: ConversationOptions) {
     <div class="conversation-requests"></div>
     <form class="conversation-compose"><div class="conversation-attachments" aria-label="첨부 파일"></div>
       <textarea class="conversation-input" rows="3" aria-label="메시지" placeholder="메시지 입력 · Shift+Enter 줄바꿈" maxlength="65536"></textarea>
-      <div class="conversation-controls"><button class="quiet-button conversation-attach" type="button">+ 첨부</button><label>모델 <select class="conversation-model" aria-label="모델"></select></label><label>추론 <select class="conversation-effort" aria-label="추론 수준"></select></label><button class="quiet-button conversation-models-more" type="button" hidden>모델 더 보기</button><button class="quiet-button conversation-stop" type="button" disabled>중단</button><button class="primary-button conversation-send" type="submit" disabled>전송</button></div>
+      <div class="conversation-controls"><button class="quiet-button conversation-attach" type="button">+ 첨부</button><label><span class="conversation-model-label">모델</span> <select class="conversation-model" aria-label="모델"></select></label><label><span class="conversation-effort-label">추론</span> <select class="conversation-effort" aria-label="추론 수준"></select></label><button class="quiet-button conversation-models-more" type="button" hidden>모델 더 보기</button><button class="quiet-button conversation-stop" type="button" disabled>중단</button><button class="primary-button conversation-send" type="submit" disabled>전송</button></div>
       <small class="conversation-hint">Enter 전송 · Shift+Enter 줄바꿈 · 초안은 이 세션에만 유지됩니다.</small>
     </form>`;
   const $ = <T extends HTMLElement = HTMLElement>(selector: string) => host.querySelector<T>(selector)!;
@@ -46,11 +46,13 @@ export function createConversation(options: ConversationOptions) {
   let changing: Promise<void> = Promise.resolve(); let epoch = 0;
   let contentVersion = 0; let pollVersion = 0;
   let polling: ReturnType<typeof setTimeout> | undefined;
-  let sending = false; let uncertain = false; let composing = false; let loading = false; let staging = false;
+  let sending = false; let interrupting = false; let uncertain = false; let composing = false; let loading = false; let staging = false;
+  let modelsLoading = false;
   let lastSendError = '';
   let activeTurn = ''; let selectedTurn = ''; let nextTurns = ''; let nextItems = ''; let nextModels = '';
   let items: Entry[] = []; let turnPage: Json[] = []; let models: Json[] = [];
   let itemsDirty = false;
+  const renderedItems = new Map<string, { signature: string; row: HTMLElement }>();
   let attachments: Attachment[] = []; let pendingRequests: RuntimeEvent[] = [];
   const stagedPaths = new Set<string>();
   const responding = new Set<string>();
@@ -66,12 +68,12 @@ export function createConversation(options: ConversationOptions) {
     const ready = visible && attached && connected && !loading;
     input.disabled = !ready || sending || uncertain;
     button('.conversation-send').disabled = !ready || sending || staging || uncertain || !!activeTurn || (!input.value.trim() && !attachments.length);
-    button('.conversation-stop').disabled = !ready || !activeTurn;
+    button('.conversation-stop').disabled = !ready || !activeTurn || interrupting || uncertain;
     button('.conversation-attach').disabled = !ready || sending || staging || uncertain || attachments.length >= MAX_ATTACHMENTS;
     model.disabled = !ready || sending || uncertain || !models.length || !!activeTurn;
     effort.disabled = model.disabled || effort.options.length <= 1;
     button('.conversation-models-more').hidden = !nextModels;
-    button('.conversation-models-more').disabled = !ready;
+    button('.conversation-models-more').disabled = !ready || modelsLoading;
     turns.disabled = !ready; button('.conversation-older').disabled = !ready;
     button('.conversation-more').disabled = !ready;
     button('.conversation-refresh').disabled = !ready || sending;
@@ -131,8 +133,12 @@ export function createConversation(options: ConversationOptions) {
   }
   function renderItems() {
     const nearEnd = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
-    messages.replaceChildren();
+    messages.querySelector('.conversation-placeholder')?.remove();
+    const keep = new Set(items.map(entry => entry.id));
+    for (const [id, rendered] of renderedItems) if (!keep.has(id)) { rendered.row.remove(); renderedItems.delete(id); }
     for (const entry of items) {
+      const signature = JSON.stringify(entry); const previous = renderedItems.get(entry.id);
+      if (previous?.signature === signature) { messages.append(previous.row); continue; }
       const row = document.createElement('article'); row.className = `conversation-message conversation-${entry.role}`; row.dataset.itemId = entry.id;
       const title = document.createElement('strong');
       const labels: Record<string, [string, string]> = { user: ['나', 'You'], assistant: ['도우미', 'Assistant'], tool: ['도구 실행', 'Tool execution'], error: ['오류', 'Error'], system: ['상태', 'Status'] };
@@ -145,7 +151,7 @@ export function createConversation(options: ConversationOptions) {
       } else row.append(body);
       appendFormatted(body, entry.text);
       if (entry.detail) { const detail = document.createElement('button'); detail.type = 'button'; detail.className = 'quiet-button'; bindText(detail, '전체 내용 보기', 'Read full content'); detail.onclick = () => void loadDetail(entry, body, detail, 0); row.append(detail); }
-      messages.append(row);
+      previous?.row.remove(); renderedItems.set(entry.id, { signature, row }); messages.append(row);
     }
     if (!items.length) { const empty = document.createElement('p'); empty.className = 'conversation-placeholder'; bindText(empty, '표시할 대화가 없습니다. 메시지를 보내 작업을 시작하세요.', 'No conversation to display. Send a message to start.'); messages.append(empty); }
     button('.conversation-more').hidden = !nextItems;
@@ -195,13 +201,13 @@ export function createConversation(options: ConversationOptions) {
     turns.value = selectedTurn; button('.conversation-older').hidden = !nextTurns;
   }
   async function loadItems(turnId: string, cursor = '') {
-    const version = epoch; const content = contentVersion; selectedTurn = turnId; loading = true; updateControls();
+    const version = epoch; const content = contentVersion; selectedTurn = turnId; loading = true; items = []; nextItems = ''; renderItems(); updateControls();
     try {
       const value = await rpc({ type: 'items', turnId, ...(cursor ? { cursor } : {}) });
       if (!alive(version) || !foreground || content !== contentVersion || selectedTurn !== turnId) return;
       const data: Json[] = value.data ?? value.items ?? []; items = data.map(itemEntry).reverse(); nextItems = string(value.nextCursor); renderItems();
-    } catch (error) { if (alive(version)) failure(error); }
-    finally { if (alive(version)) { loading = false; updateControls(); } }
+    } catch (error) { if (alive(version) && content === contentVersion) failure(error); }
+    finally { if (alive(version) && content === contentVersion) { loading = false; updateControls(); } }
   }
   async function loadPage(cursor = '') {
     const version = epoch; const content = contentVersion; loading = true; updateControls();
@@ -212,13 +218,15 @@ export function createConversation(options: ConversationOptions) {
       if (!cursor) activeTurn = turnPage[0]?.status === 'inProgress' ? string(turnPage[0]?.id) : '';
       items = []; nextItems = ''; renderItems();
       if (selectedTurn) await loadItems(selectedTurn);
-    } catch (error) { if (alive(version)) failure(error); }
-    finally { if (alive(version)) { loading = false; updateControls(); } }
+    } catch (error) { if (alive(version) && content === contentVersion) failure(error); }
+    finally { if (alive(version) && content === contentVersion) { loading = false; updateControls(); } }
   }
   async function loadModels(cursor = '') {
+    if (modelsLoading) return; modelsLoading = true; updateControls();
     const version = epoch;
     try { const value = await rpc({ type: 'models', ...(cursor ? { cursor } : {}) }); if (!alive(version)) return; models = value.data ?? []; nextModels = string(value.nextCursor); renderModels(); }
     catch (error) { if (alive(version)) { modelKnown = false; models = []; renderModels(); failure(error); } }
+    finally { modelsLoading = false; if (alive(version)) updateControls(); }
   }
   function renderRequests() {
     const signature = JSON.stringify(pendingRequests); if (signature === requestSignature) return; requestSignature = signature;
@@ -320,16 +328,16 @@ export function createConversation(options: ConversationOptions) {
   }
   async function interrupt() {
     if (!activeTurn || button('.conversation-stop').disabled) return;
-    const id = activeTurn; button('.conversation-stop').disabled = true;
+    const id = activeTurn; interrupting = true; updateControls();
     try { await rpc({ type: 'interrupt', turnId: id }); if (!disposed) status('중단을 요청했습니다. 실제 완료 이벤트를 기다립니다.', 'Interruption requested. Waiting for confirmation.'); }
     catch (error) { if (!disposed) failure(error); }
-    finally { if (!disposed) updateControls(); }
+    finally { interrupting = false; if (!disposed) updateControls(); }
   }
   async function pickAttachments() {
     const version = epoch; staging = true; updateControls();
     try { const value = await options.call<Attachment[]>('choose_conversation_attachments'); if (alive(version)) addAttachments(value); }
     catch (error) { if (alive(version)) failure(error); }
-    finally { staging = false; if (alive(version)) updateControls(); }
+    finally { staging = false; if (alive(version)) { renderAttachments(); updateControls(); } }
   }
   async function stageFiles(files: File[]) {
     if (input.disabled || staging || sending || uncertain) return;
@@ -344,7 +352,7 @@ export function createConversation(options: ConversationOptions) {
         const value = await options.call<Attachment>('stage_conversation_image', { id: options.sessionId, generation: options.generation, dataUrl: `data:${file.type};base64,${btoa(binary)}` });
         if (alive(version)) { stagedPaths.add(value.path); addAttachments([value as Attachment]); }
       } catch (error) { if (alive(version)) failure(error); }
-    } } finally { staging = false; if (alive(version)) updateControls(); }
+    } } finally { staging = false; if (alive(version)) { renderAttachments(); updateControls(); } }
   }
   function setVisible(value: boolean): Promise<void> {
     if (disposed) return Promise.resolve();
@@ -405,16 +413,17 @@ export function createConversation(options: ConversationOptions) {
   turns.addEventListener('change', () => void loadItems(turns.value), events);
   model.addEventListener('change', () => { currentEffort = ''; renderEfforts(); }, events);
   const labels: [string, string, string][] = [
-    ['.conversation-refresh', '최근 대화', 'Recent conversation'], ['.conversation-older', '이전 구간', 'Earlier turns'], ['.conversation-more', '이전 항목', 'Earlier items'], ['.conversation-attach', '+ 첨부', '+ Attach'], ['.conversation-models-more', '모델 더 보기', 'More models'], ['.conversation-stop', '중단', 'Stop'], ['.conversation-send', '전송', 'Send'], ['.conversation-hint', 'Enter 전송 · Shift+Enter 줄바꿈 · 초안은 이 세션에만 유지됩니다.', 'Enter to send · Shift+Enter for a new line · Draft stays in this session.'],
+    ['.conversation-refresh', '최근 대화', 'Recent conversation'], ['.conversation-older', '이전 구간', 'Earlier turns'], ['.conversation-more', '이전 항목', 'Earlier items'], ['.conversation-attach', '+ 첨부', '+ Attach'], ['.conversation-model-label', '모델', 'Model'], ['.conversation-effort-label', '추론', 'Reasoning'], ['.conversation-models-more', '모델 더 보기', 'More models'], ['.conversation-stop', '중단', 'Stop'], ['.conversation-send', '전송', 'Send'], ['.conversation-hint', 'Enter 전송 · Shift+Enter 줄바꿈 · 초안은 이 세션에만 유지됩니다.', 'Enter to send · Shift+Enter for a new line · Draft stays in this session.'],
   ];
   for (const [selector, ko, en] of labels) bindText($(selector), ko, en);
   bindAttribute(input, 'aria-label', '메시지', 'Message'); bindAttribute(input, 'placeholder', '메시지 입력 · Shift+Enter 줄바꿈', 'Message · Shift+Enter for a new line');
-  const unlanguage = onLanguageChange(() => { requestSignature = ''; renderModels(); renderTurns(); renderItems(); renderRequests(); renderAttachments(); });
+  for (const [element, ko, en] of [[model, '모델', 'Model'], [effort, '추론 수준', 'Reasoning effort'], [turns, '대화 구간', 'Conversation turns'], [messages, '대화 내용', 'Conversation'], [$('.conversation-attachments'), '첨부 파일', 'Attachments']] as const) bindAttribute(element, 'aria-label', ko, en);
+  const unlanguage = onLanguageChange(() => { requestSignature = ''; renderedItems.clear(); messages.replaceChildren(); renderModels(); renderTurns(); renderItems(); renderRequests(); renderAttachments(); });
   renderModels(); renderItems(); updateControls();
   return {
     setVisible,
     setForeground,
-    refresh: () => visible ? loadPage() : Promise.resolve(),
+    refresh: () => visible && foreground && !loading ? loadPage() : Promise.resolve(),
     hasDraft: () => !!input.value || !!attachments.length,
     async dispose({ sessionEnded = false }: { sessionEnded?: boolean } = {}) {
       if (disposed) return;
@@ -422,7 +431,7 @@ export function createConversation(options: ConversationOptions) {
       if (!sessionEnded) { await setVisible(false); if (attached) await rpc({ type: 'detach' }); }
       if (attached) { attached = false; options.ownerChanged?.(false); }
       visible = false; disposed = true; epoch++; contentVersion++; stopPolling(); abort.abort(); unlanguage();
-      input.value = ''; attachments = []; stagedPaths.clear(); responding.clear(); questionDrafts.clear(); items = []; turnPage = []; models = []; pendingRequests = []; host.replaceChildren();
+      input.value = ''; attachments = []; stagedPaths.clear(); responding.clear(); questionDrafts.clear(); renderedItems.clear(); items = []; turnPage = []; models = []; pendingRequests = []; host.replaceChildren();
     },
   };
 }

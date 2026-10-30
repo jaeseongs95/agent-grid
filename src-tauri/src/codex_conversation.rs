@@ -85,6 +85,7 @@ struct Events {
     queue: VecDeque<(Value, usize)>, bytes: usize, seq: u64, gap: bool,
     pending: HashMap<String, Value>, connected: bool, error: Option<String>,
     answered: HashSet<String>,
+    observed_pending: HashMap<String,Value>, observer_connected: bool,
 }
 impl Events {
     fn push(&mut self, mut event: Value) {
@@ -118,8 +119,23 @@ impl ConversationConnection {
     pub(crate) fn pending_snapshot(&self) -> Result<(bool,bool,Vec<Value>),String> {
         let owned = self.0.owned.load(Ordering::Acquire);
         let events = self.0.events.lock().map_err(|_| "대화 승인 상태 오류")?;
-        Ok((owned,events.connected,events.pending.values().cloned().collect()))
+        let mut requests = events.observed_pending.clone();
+        requests.extend(events.pending.clone());
+        for request in requests.values_mut() {request["metadataAvailable"]=json!(events.connected || events.observer_connected);}
+        Ok((owned,events.connected,requests.into_values().collect()))
     }
+    pub(super) fn observer_message(&self,thread_id: &str,message: Value) -> Result<(),String> {record_message(&self.0,thread_id,message,true)}
+    pub(super) fn observer_call<S: Read+Write>(&self,rpc: &mut Rpc<S>,thread_id: &str,method: &str,params: Value) -> Result<Value,String> {
+        call_observed(&self.0,rpc,thread_id,method,params,self.0.stopped.as_ref(),true)
+    }
+    pub(super) fn observer_subscribe<S: Read+Write>(&self,rpc: &mut Rpc<S>,thread_id: &str,cwd: &Path) -> Result<(),String> {
+        let result = self.observer_call(rpc,thread_id,"thread/resume",json!({"threadId":thread_id,"excludeTurns":true}))?;
+        verified_thread(&result["thread"],thread_id,cwd)?;
+        if result["thread"]["turns"].as_array().is_some_and(|turns|!turns.is_empty()) {return Err("관측 구독이 전체 이력을 반환해 읽기 구독을 제한했습니다.".into());}
+        self.0.events.lock().map_err(|_| "질문 관측 상태 오류")?.observer_connected=true;
+        Ok(())
+    }
+    pub(super) fn observer_disconnected(&self) {self.0.events.lock().unwrap_or_else(|e|e.into_inner()).observer_connected=false;}
     pub(crate) fn cancel(&self) {
         let mut slot = self.0.worker.lock().unwrap_or_else(|e| e.into_inner());
         let worker = slot.take();
@@ -158,6 +174,11 @@ impl ConversationConnection {
         let mut worker = self.0.worker.lock().map_err(|_| "대화 연결 상태를 확인할 수 없습니다.")?;
         if matches!(request, ConversationRequest::Attach) {
             if worker.is_some() { return Err("이미 대화 화면이 연결되어 있습니다.".into()); }
+            {
+                let mut events = self.0.events.lock().map_err(|_| "대화 이벤트 상태 오류")?;
+                if !events.pending.is_empty() || self.0.unknown.load(Ordering::Acquire) {return Err("이전 연결의 미확인 요청을 보존하고 있어 새 입력 소유권을 만들지 않았습니다.".into());}
+                events.queue.clear(); events.bytes=0; events.gap=false; events.answered.clear(); events.error=None;
+            }
             *self.0.input.lock().map_err(|_| "대화 입력 소유 상태를 확인할 수 없습니다.")? = true;
             self.0.owned.store(true,Ordering::Release);
             let (sender, receiver) = mpsc::sync_channel(8);
@@ -223,9 +244,12 @@ fn live(control: &Control, cancelled: &AtomicBool) -> Result<(), String> {
     if control.stopped.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) { Err("대화 연결이 종료되었습니다. 진행 중 요청 결과는 확인되지 않았습니다.".into()) } else { Ok(()) }
 }
 fn call<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, method: &str, params: Value, cancelled: &AtomicBool) -> Result<Value, String> {
+    call_observed(control,rpc,thread_id,method,params,cancelled,false)
+}
+fn call_observed<S: Read+Write>(control: &Control,rpc: &mut Rpc<S>,thread_id: &str,method: &str,params: Value,cancelled: &AtomicBool,metadata_only: bool) -> Result<Value,String> {
     live(control, cancelled)?;
     let mutation = matches!(method,"turn/start" | "turn/interrupt");
-    if mutation { control.unknown.store(true,Ordering::Release); }
+    let previous_unknown = if mutation {control.unknown.swap(true,Ordering::AcqRel)} else {false};
     rpc.next_id += 1; let id = rpc.next_id;
     rpc.send(json!({"id":id,"method":method,"params":params}))?;
     let deadline = rpc.deadline.unwrap_or_else(|| Instant::now()+RPC_TIMEOUT).min(Instant::now()+RPC_TIMEOUT);
@@ -233,10 +257,10 @@ fn call<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, m
         live(control, cancelled)?;
         if let Some(message) = rpc.read()? {
             if let Some(result) = response(&message, id) {
-                if mutation { control.unknown.store(false,Ordering::Release); }
+                if mutation && (message.get("result").is_some() || message.get("error").is_some()) { control.unknown.store(previous_unknown,Ordering::Release); }
                 return result;
             }
-            observe_message(control, thread_id, message)?;
+            record_message(control, thread_id, message, metadata_only)?;
         }
     }
     Err(format!("대화 {method} 응답 시간이 초과되었습니다. 요청 결과는 불명확하며 재전송하지 않았습니다."))
@@ -394,27 +418,35 @@ fn detail_chunk(text: &str, offset: usize) -> Result<Value, String> {
     Ok(json!({"text":&text[offset..end],"nextOffset":if end < text.len() {Some(end)} else {None},"totalBytes":text.len()}))
 }
 fn observe_message(control: &Control, thread_id: &str, message: Value) -> Result<(), String> {
+    record_message(control,thread_id,message,false)
+}
+fn record_message(control: &Control, thread_id: &str, message: Value, metadata_only: bool) -> Result<(), String> {
     let Some(method) = message["method"].as_str() else { return Ok(()); };
+    if metadata_only && message.get("id").is_none() && method!="serverRequest/resolved" {return Ok(());}
     let params = &message["params"];
     let selected = params["threadId"].as_str().or_else(|| params["thread"]["id"].as_str());
     if selected != Some(thread_id) { return Ok(()); }
     let mut events = control.events.lock().map_err(|_| "대화 이벤트 상태 오류")?;
     if method == "serverRequest/resolved" {
-        if let Some(id) = params.get("requestId") { events.pending.remove(&id.to_string()); }
+        if let Some(id) = params.get("requestId") { events.pending.remove(&id.to_string()); events.observed_pending.remove(&id.to_string()); }
     }
     let mut event = json!({"method":method,"params":params});
     if let Some(id) = message.get("id") {
         let key = id.to_string();
         if events.answered.contains(&key) { return Ok(()); }
         if !id.is_string() && !id.is_i64() && !id.is_u64() { return Err("서버 요청 식별자 형식이 올바르지 않습니다.".into()); }
-        if !events.pending.contains_key(&key) && events.pending.len() >= REQUEST_COUNT { return Err("처리 대기 서버 요청이 상한을 넘었습니다. 응답을 자동 승인하지 않았습니다.".into()); }
+        let count = events.pending.keys().chain(events.observed_pending.keys()).collect::<HashSet<_>>().len();
+        if !events.pending.contains_key(&key) && !events.observed_pending.contains_key(&key) && count >= REQUEST_COUNT { return Err("처리 대기 서버 요청이 상한을 넘었습니다. 응답을 자동 승인하지 않았습니다.".into()); }
         if event.to_string().len() > 64 * 1024 { return Err("서버 승인 요청이 표시 상한을 넘었습니다. 응답을 보내지 않았습니다.".into()); }
         event["requestId"] = json!(key);
-        events.pending.entry(key).or_insert_with(|| event.clone());
+        event["guiOwned"] = json!(!metadata_only);
+        if metadata_only {events.observed_pending.entry(key).or_insert(event);return Ok(());}
+        if events.pending.contains_key(&key) {return Ok(());}
+        events.pending.insert(key,event.clone());
     } else {
         summarize(&mut event);
     }
-    events.push(event);
+    if !metadata_only {events.push(event);}
     Ok(())
 }
 fn validate_response(request: &Value, result: &Value) -> Result<(), String> {
@@ -537,6 +569,16 @@ mod tests {
         drop(rpc); server.join().unwrap();
     }
     #[test]
+    fn acknowledged_interrupt_does_not_erase_an_earlier_unknown_send() {
+        let (control,mut rpc,listener) = fixture(); control.0.unknown.store(true,Ordering::Release);
+        let server = thread::spawn(move || {
+            let (stream,_) = listener.accept().unwrap(); let mut socket = WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);
+            let request = read_request(&mut socket); assert_eq!(request["params"],json!({"threadId":"original","turnId":"original-turn"})); reply(&mut socket,&request,json!({}));
+        });
+        execute(&control.0,&mut rpc,"original",ConversationRequest::Interrupt{turn_id:"original-turn".into()},&AtomicBool::new(false)).unwrap();
+        assert!(control.0.unknown.load(Ordering::Acquire)); server.join().unwrap();
+    }
+    #[test]
     fn request_queue_rejects_oversized_data_before_admission() {
         let request = ConversationRequest::Send {request_id:Uuid::new_v4().to_string(),text:"a".repeat(65537),attachments:vec![],model:None,effort:None};
         assert!(validate_request(&request).is_err());
@@ -568,5 +610,33 @@ mod tests {
         let mut events = control.0.events.lock().unwrap();
         assert_eq!(events.pending.len(),1); assert!(events.gap); assert_eq!(events.poll()["pendingRequests"].as_array().unwrap().len(),1);
         assert_eq!(events.pending.len(),1,"화면 조회가 승인 요청을 소비하면 안 된다");
+    }
+    #[test]
+    fn terminal_observer_preserves_requests_during_reads_without_claiming_or_responding() {
+        let (control,mut rpc,listener) = fixture();
+        let server = thread::spawn(move || {
+            let (stream,_) = listener.accept().unwrap(); stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut socket = WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);
+            let request = read_request(&mut socket); assert_eq!(request["method"],"thread/read");
+            socket.send(Message::Text(json!({"id":44,"method":"item/tool/requestUserInput","params":{"threadId":"original","questions":[{"id":"q","question":"원래 터미널 질문"}]}}).to_string().into())).unwrap();
+            socket.send(Message::Text(json!({"method":"item/agentMessage/delta","params":{"threadId":"original","delta":"두 번 표시하면 안 됨"}}).to_string().into())).unwrap();
+            reply(&mut socket,&request,json!({"thread":{"id":"original"}}));
+            assert!(socket.read().is_err(),"관측 연결에서 질문 응답을 보내면 안 된다");
+        });
+        control.observer_call(&mut rpc,"original","thread/read",json!({"threadId":"original","includeTurns":false})).unwrap();
+        let (owned,connected,pending) = control.pending_snapshot().unwrap();
+        assert!(!owned&&!connected); assert_eq!(pending.len(),1); assert_eq!(pending[0]["params"]["questions"][0]["question"],"원래 터미널 질문"); assert_eq!(pending[0]["guiOwned"],false);
+        assert!(control.0.events.lock().unwrap().queue.is_empty(),"관측 연결이 GUI delta를 중복 적재하면 안 된다");
+        assert!(execute(&control.0,&mut rpc,"original",ConversationRequest::Respond{request_id:"44".into(),result:json!({"answers":{"q":{"answers":["답"]}}})},&AtomicBool::new(false)).is_err());
+        drop(rpc); server.join().unwrap();
+    }
+    #[test]
+    fn observer_and_gui_deduplicate_one_pending_request_and_resolution_clears_both() {
+        let (control,_rpc,_listener)=fixture();
+        let request=json!({"id":9,"method":"item/commandExecution/requestApproval","params":{"threadId":"original"}});
+        control.observer_message("original",request.clone()).unwrap(); observe_message(&control.0,"original",request).unwrap();
+        let (_,_,pending)=control.pending_snapshot().unwrap(); assert_eq!(pending.len(),1); assert_eq!(pending[0]["guiOwned"],true);
+        control.observer_message("original",json!({"method":"serverRequest/resolved","params":{"threadId":"original","requestId":9}})).unwrap();
+        assert!(control.pending_snapshot().unwrap().2.is_empty()); assert!(control.0.events.lock().unwrap().pending.is_empty());
     }
 }

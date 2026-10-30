@@ -63,7 +63,7 @@ test('세션별 질문 항목만 중복 제거해 세고 원문 없는 세션과
 
 test('질문 초안·포커스를 갱신 중 보존하고 전송·responded 상태 뒤에도 서버 해결 전까지 건수를 유지한다', async ({ page }) => {
   await fixture(page, [question], { holdResponse: true }); await open(page);
-  await page.getByLabel('하나', { exact: true }).check(); await page.getByRole('textbox', { name: '덧붙일 내용' }).fill('초안');
+  await page.getByRole('radio', { name: /^하나/ }).check(); await page.getByRole('textbox', { name: '덧붙일 내용' }).fill('초안');
   await page.clock.runFor(3_000);
   await expect(page.getByRole('textbox', { name: '덧붙일 내용' })).toHaveValue('초안');
   await expect(page.getByRole('textbox', { name: '덧붙일 내용' })).toBeFocused();
