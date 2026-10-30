@@ -21,7 +21,10 @@ test.beforeEach(async ({ page }) => {
           if (args.request.type === 'handoffToTerminal' && state.handoffFailure) throw new Error(state.failureRaw ?? 'fixture handoff failure');
           if (args.request.type === 'contextStatus') return state.contextSnapshot ?? {};
           if (args.request.type === 'compact') {
-            if (state.compactFailure) throw Error('PRIVATE_COMPACT_TOKEN_PATH');
+            if (state.compactFailure) {
+              Object.assign(state.contextSnapshot, { canCompact: false, tokenUsageFresh: false, reason: 'unknownResult', revision: 3 });
+              throw Error('PRIVATE_COMPACT_TOKEN_PATH');
+            }
             Object.assign(state.contextSnapshot, { compacting: true, canCompact: false, tokenUsageFresh: false, reason: 'compacting', revision: 3 });
             return { status: 'started', turn: { id: 'compact-turn' } };
           }
@@ -65,6 +68,26 @@ for (const startingView of ['terminal', 'conversation'] as const) {
     expect(calls.some((entry: any) => entry.command === 'start_session' || (entry.command === 'conversation_request' && entry.args.request.type === 'send'))).toBe(false);
   });
 }
+
+test('압축 결과 미확인에서는 초안과 입력 소유권을 보존하고 자동 재전송하지 않는다', async ({ page }) => {
+  await page.goto('/');
+  const card = page.locator('.terminal-card[data-id="chat-session"]');
+  await expect(card).toBeVisible();
+  await page.evaluate(() => { const s = window as any; s.compactFailure = true; s.contextSnapshot = { revision: 1, connected: true, guiConnected: false, active: false, canCompact: false, reason: 'guiDisconnected', compacting: false, tokenUsageFresh: true }; });
+  await card.locator('.context-usage').click();
+  await card.locator('.conversation-toggle').click();
+  await card.locator('.conversation-input').fill('결과 미확인에서도 보존할 초안');
+  await card.locator('.context-compact').click();
+  await expect(card.locator('.conversation-input')).toHaveValue('결과 미확인에서도 보존할 초안');
+  await expect(card.locator('.conversation-input')).toBeDisabled();
+  await expect(card.locator('.context-compact')).toBeDisabled();
+  await expect(card.locator('.conversation-status')).toContainText('자동으로 다시 요청하지 않습니다');
+  await expect(card.locator('.terminal-host')).toBeHidden();
+  expect(await page.locator('body').evaluate(node => node.outerHTML)).not.toContain('PRIVATE_COMPACT_TOKEN_PATH');
+  const calls = await page.evaluate(() => (window as any).chatCalls);
+  expect(calls.filter((entry: any) => entry.command === 'conversation_request' && entry.args.request.type === 'compact')).toHaveLength(1);
+  expect(calls.some((entry: any) => entry.command === 'session_write' || (entry.command === 'conversation_request' && entry.args.request.type === 'send'))).toBe(false);
+});
 
 test('same workspace session switches views without starting a thread and preserves its draft', async ({ page }) => {
   await page.goto('/');

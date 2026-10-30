@@ -7,6 +7,7 @@ const EVENT_BYTES: usize = 1024 * 1024;
 const REQUEST_COUNT: usize = 32;
 const TEXT_PREVIEW: usize = 4096;
 const DETAIL_BYTES: usize = 16 * 1024;
+const MAX_CONTEXT_INTEGER: i64 = 9_007_199_254_740_991;
 const PASSIVE_SUBSCRIBE: &str = "thread/subscribePassive";
 const START_USER_IF_IDLE: &str = "turn/startUserIfIdle";
 const HISTORY_UNAVAILABLE: &str = "대화 이력 원문을 아직 조회할 수 없습니다. 빈 이력으로 처리하지 않았습니다.";
@@ -120,7 +121,7 @@ struct ContextTokenBreakdown {
 }
 impl ContextTokenBreakdown {
     fn valid(&self) -> bool {
-        [self.total_tokens,self.input_tokens,self.cached_input_tokens,self.cache_write_input_tokens,self.output_tokens,self.reasoning_output_tokens].into_iter().all(|value|value>=0)
+        [self.total_tokens,self.input_tokens,self.cached_input_tokens,self.cache_write_input_tokens,self.output_tokens,self.reasoning_output_tokens].into_iter().all(|value|(0..=MAX_CONTEXT_INTEGER).contains(&value))
     }
 }
 #[derive(Default)]
@@ -197,7 +198,7 @@ impl ConversationConnection {
         let events=self.0.events.lock().map_err(|_| "대화 문맥 상태 오류")?;
         let reason=context_block_reason(&self.0,&events,closing);
         Ok(json!({"threadId":thread_id,"connected":events.connected||events.observer_connected,"guiConnected":events.connected,
-            "tokenUsage":events.token_usage,"tokenUsageFresh":events.token_usage_fresh&&(events.connected||events.observer_connected),"compacting":events.context_compaction.is_some(),"active":events.context_active,
+            "tokenUsage":events.token_usage,"tokenUsageFresh":events.token_usage_fresh&&events.observer_connected,"compacting":events.context_compaction.is_some(),"active":events.context_active,
             "canCompact":reason.is_none(),"reason":reason,"revision":events.context_revision}))
     }
     pub(crate) fn is_deleted(&self) -> bool { self.0.deleted.load(Ordering::Acquire) }
@@ -215,12 +216,17 @@ impl ConversationConnection {
         verify_passive(&result,thread_id,cwd)?;
         let mut events=self.0.events.lock().map_err(|_| "질문 관측 상태 오류")?;
         if events.requests_unavailable {return Err("요청 관측을 중단한 세션의 구독을 복구하지 않았습니다.".into());}
-        if !events.connected {events.context_active=context_active(&result["thread"]["status"]);events.token_usage_fresh=false;}
+        events.context_active=context_active(&result["thread"]["status"]);
+        events.token_usage_fresh=false;events.context_compaction=None;
         events.context_revision+=1;
         events.observer_connected=true;
         Ok(true)
     }
-    pub(super) fn observer_disconnected(&self) {self.0.events.lock().unwrap_or_else(|e|e.into_inner()).observer_connected=false;}
+    pub(super) fn observer_disconnected(&self) {
+        let mut events=self.0.events.lock().unwrap_or_else(|e|e.into_inner());
+        events.observer_connected=false;events.token_usage_fresh=false;events.context_revision+=1;
+        events.context_active=None;events.context_compaction=None;
+    }
     pub(crate) fn cancel(&self) {
         let mut slot = self.0.worker.lock().unwrap_or_else(|e| e.into_inner());
         let worker = slot.take();
@@ -307,6 +313,7 @@ impl ConversationConnection {
                 let mut events = self.0.events.lock().map_err(|_| "대화 이벤트 상태 오류")?;
                 if events.blocks_attach(self.0.owned.load(Ordering::Acquire),self.0.unknown.load(Ordering::Acquire)) {return Err("이전 연결의 미확인 요청을 보존하고 있어 새 입력 소유권을 만들지 않았습니다.".into());}
                 events.queue.clear(); events.bytes=0; events.gap=false; events.error=None;
+                events.context_revision+=1;
             }
             *self.0.input.lock().map_err(|_| "대화 입력 소유 상태를 확인할 수 없습니다.")? = true;
             self.0.owned.store(true,Ordering::Release);
@@ -319,7 +326,7 @@ impl ConversationConnection {
             let join = match thread::Builder::new().name("codex-conversation".into()).spawn(move || {
                 let result = run(control.clone(), &thread_id, &cwd, receiver, worker_cancelled, worker_transport);
                 let mut events = control.events.lock().unwrap_or_else(|e| e.into_inner());
-                events.connected = false;events.token_usage_fresh=false;
+                events.connected = false;events.context_revision+=1;
                 if let Err(error) = result { events.error = Some(error); }
             }) { Ok(join) => join, Err(error) => { *self.0.input.lock().unwrap_or_else(|e| e.into_inner()) = false; self.0.owned.store(false,Ordering::Release); return Err(format!("대화 연결 작업자를 시작할 수 없습니다: {error}")); } };
             *worker = Some(Worker {sender,cancelled,transport,join:Some(join),joined:false,closing:None});
@@ -455,7 +462,6 @@ fn serve<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, 
     // loaded 동일 runtime의 수동 구독만 허용한다. resume는 idle 작업을 실행할 수 있어 대체 경로로 쓰지 않는다.
     let mut resumed = call(control, rpc, thread_id, PASSIVE_SUBSCRIBE, json!({"threadId":thread_id}), cancelled)?;
     verify_passive(&resumed, thread_id, cwd)?;
-    {let mut events=control.events.lock().map_err(|_| "대화 문맥 상태 오류")?;events.context_active=context_active(&resumed["thread"]["status"]);events.token_usage_fresh=false;events.context_revision+=1;}
     // CLI는 응답 뒤 복사된 pending을 replay한다. 기존 Attach 전체기한 안에서
     // 실제 동일 원문 또는 resolved를 기다리며 별도 큐/재송신은 만들지 않는다.
     let replay_deadline=rpc.deadline.unwrap_or_else(||Instant::now()+RPC_TIMEOUT);
@@ -477,7 +483,7 @@ fn serve<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, 
         resumed["activeTurnKnown"] = json!(true);
         resumed["activeTurnId"] = current.first().filter(|turn| turn["status"] == "inProgress").and_then(|turn| turn["id"].as_str()).map_or(Value::Null,|id|json!(id));
     }
-    { let mut events = control.events.lock().map_err(|_| "대화 이벤트 상태 오류")?; if events.requests_unavailable {return Err("요청 관측을 중단한 세션의 연결을 복구하지 않았습니다.".into());} events.connected = true; events.error = None; }
+    { let mut events = control.events.lock().map_err(|_| "대화 이벤트 상태 오류")?; if events.requests_unavailable {return Err("요청 관측을 중단한 세션의 연결을 복구하지 않았습니다.".into());} events.connected = true;events.context_revision+=1; events.error = None; }
     rpc.deadline = None; *deadline.lock().map_err(|_| "대화 요청 기한 상태 오류")? = None;
     loop {
         live(control, cancelled)?;
@@ -667,7 +673,7 @@ fn observe_message(control: &Control, thread_id: &str, message: Value) -> Result
 }
 fn record_message(control: &Control, thread_id: &str, message: Value, metadata_only: bool) -> Result<(), String> {
     let Some(method) = message["method"].as_str() else { return Ok(()); };
-    if metadata_only && message.get("id").is_none() && !matches!(method,"serverRequest/resolved" | "thread/deleted" | "thread/tokenUsage/updated" | "thread/status/changed" | "turn/started" | "turn/completed" | "item/started" | "item/completed") {return Ok(());}
+    if metadata_only && message.get("id").is_none() && !matches!(method,"serverRequest/resolved" | "thread/deleted" | "thread/tokenUsage/updated" | "thread/settings/updated" | "model/rerouted" | "thread/status/changed" | "turn/started" | "turn/completed" | "item/started" | "item/completed") {return Ok(());}
     let params = &message["params"];
     let selected = params["threadId"].as_str().or_else(|| params["thread"]["id"].as_str());
     if selected != Some(thread_id) { return Ok(()); }
@@ -684,20 +690,25 @@ fn record_message(control: &Control, thread_id: &str, message: Value, metadata_o
         // 요청 결과 불명은 삭제 알림만으로 해결됐다고 가정하지 않는다. 소유권은 worker join 후 해제한다.
         return Err("원래 대화가 삭제되어 수동 구독을 종료했습니다.".into());
     }
-    // GUI 연결 중에는 같은 서버의 별도 관찰 스트림이 늦게 도착해 최신 상태를
-    // 되돌리지 않도록 GUI 스트림만 사용한다. 터미널에서는 기존 관찰을 재사용한다.
-    if !metadata_only || !events.connected {
+    // 사용량과 그 무효화는 기존 관찰 스트림 하나만 환원한다. GUI 복사본을
+    // 섞지 않아 서로 다른 연결의 도착 순번을 전역 최신 순서로 오인하지 않는다.
+    if metadata_only && message.get("id").is_none() {
         match method {
             "thread/tokenUsage/updated" => {
-                if params["turnId"].as_str().is_some_and(|id|valid_id(id).is_ok()) {
-                    let usage=serde_json::from_value::<ContextTokenUsage>(params["tokenUsage"].clone()).ok()
-                        .filter(|usage|usage.total.valid()&&usage.last.valid()&&usage.model_context_window.map_or(true,|window|window>0));
-                    events.token_usage_fresh=usage.is_some()&&events.context_compaction.is_none();events.token_usage=usage;events.context_revision+=1;
-                }
+                let usage=params["turnId"].as_str().filter(|id|valid_id(id).is_ok()).and_then(|_|serde_json::from_value::<ContextTokenUsage>(params["tokenUsage"].clone()).ok())
+                    .filter(|usage|usage.total.valid()&&usage.last.valid()&&usage.model_context_window.map_or(true,|window|(1..=MAX_CONTEXT_INTEGER).contains(&window)));
+                events.token_usage_fresh=usage.as_ref().is_some_and(|usage|usage.model_context_window.is_some())&&events.context_compaction.is_none();
+                events.token_usage=usage;events.context_revision+=1;
             },
+            "thread/settings/updated" | "model/rerouted" => {events.token_usage_fresh=false;events.context_revision+=1;},
             "thread/status/changed" => {events.context_active=context_active(&params["status"]);events.context_revision+=1;},
             "turn/started" => {events.context_active=Some(true);events.context_revision+=1;},
-            "turn/completed" => {events.context_active=Some(false);if events.context_compaction.is_some() {events.token_usage_fresh=false;}events.context_compaction=None;events.context_revision+=1;},
+            "turn/completed" => {
+                let turn=params["turn"]["id"].as_str().or_else(||params["turnId"].as_str());
+                if events.context_compaction.as_ref().is_some_and(|(id,_)|Some(id.as_str())==turn) {events.token_usage_fresh=false;events.context_compaction=None;}
+                if events.context_compaction.is_none() {events.context_active=Some(false);}
+                events.context_revision+=1;
+            },
             "item/started" | "item/completed" if params["item"]["type"]=="contextCompaction" => {
                 if let (Some(turn),Some(item))=(params["turnId"].as_str(),params["item"]["id"].as_str()) {
                     if valid_id(turn).is_ok()&&valid_id(item).is_ok() {
@@ -825,6 +836,7 @@ mod tests {
         control.observer_message("original",json!({"method":"item/started","params":{"threadId":"original","turnId":"compact","item":{"id":"compact-item","type":"contextCompaction"}}})).unwrap();
         control.observer_message("original",update(usage.clone())).unwrap();
         let status=control.context_status("original").unwrap();assert_eq!(status["compacting"],true);assert_eq!(status["tokenUsageFresh"],false);
+        control.observer_message("original",json!({"method":"turn/completed","params":{"threadId":"original","turn":{"id":"other","status":"completed"}}})).unwrap();assert_eq!(control.context_status("original").unwrap()["compacting"],true);
         control.observer_message("original",json!({"method":"item/completed","params":{"threadId":"original","turnId":"compact","item":{"id":"compact-item","type":"contextCompaction"}}})).unwrap();
         assert_eq!(control.context_status("original").unwrap()["tokenUsageFresh"],false);
         control.observer_message("original",update(usage.clone())).unwrap();assert_eq!(control.context_status("original").unwrap()["tokenUsageFresh"],true);
@@ -832,7 +844,87 @@ mod tests {
         let status=control.context_status("original").unwrap();assert!(status["tokenUsage"].is_null());assert_eq!(status["tokenUsageFresh"],false);
     }
     #[test]
-    fn unsupported_compact_and_native_guards_never_send_legacy_compact() {
+    fn context_numeric_limits_reject_invalid_usage_without_inventing_zero() {
+        let(control,_rpc,_listener)=fixture();control.0.events.lock().unwrap().observer_connected=true;
+        let valid=json!({"total":{"totalTokens":400000,"inputTokens":300000,"cachedInputTokens":0,"outputTokens":100000,"reasoningOutputTokens":0},"last":{"totalTokens":56000,"inputTokens":40000,"cachedInputTokens":0,"outputTokens":16000,"reasoningOutputTokens":0},"modelContextWindow":100000});
+        for (path,bad) in [
+            ("/last/totalTokens",json!(-1)),("/last/totalTokens",json!(1.5)),("/last/totalTokens",json!(MAX_CONTEXT_INTEGER+1)),
+            ("/total/totalTokens",json!(MAX_CONTEXT_INTEGER+1)),("/last/inputTokens",json!(-1)),
+            ("/last/reasoningOutputTokens",json!(MAX_CONTEXT_INTEGER+1)),("/modelContextWindow",json!(0)),
+            ("/modelContextWindow",json!(-1)),("/modelContextWindow",json!(MAX_CONTEXT_INTEGER+1)),
+        ] {
+            let mut usage=valid.clone();*usage.pointer_mut(path).unwrap()=bad.clone();
+            control.observer_message("original",json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"turn","tokenUsage":usage}})).unwrap();
+            let snapshot=control.context_status("original").unwrap();assert!(snapshot["tokenUsage"].is_null(),"{path}={bad}");assert_eq!(snapshot["tokenUsageFresh"],false);
+        }
+        let mut missing=valid.clone();missing["last"].as_object_mut().unwrap().remove("totalTokens");
+        control.observer_message("original",json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"turn","tokenUsage":missing}})).unwrap();assert!(control.context_status("original").unwrap()["tokenUsage"].is_null());
+        let mut unknown_window=valid.clone();unknown_window["modelContextWindow"]=Value::Null;
+        control.observer_message("original",json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"turn","tokenUsage":unknown_window}})).unwrap();
+        let snapshot=control.context_status("original").unwrap();assert_eq!(snapshot["tokenUsage"]["last"]["totalTokens"],56000);assert_eq!(snapshot["tokenUsageFresh"],false);
+        for used in [0,12000,100000,100001,MAX_CONTEXT_INTEGER] {
+            let mut usage=valid.clone();usage["last"]["totalTokens"]=json!(used);
+            control.observer_message("original",json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"turn","tokenUsage":usage}})).unwrap();
+            let snapshot=control.context_status("original").unwrap();assert_eq!(snapshot["tokenUsage"]["last"]["totalTokens"],used);assert_eq!(snapshot["tokenUsageFresh"],true);
+        }
+        println!("사용량 경계: 음수·소수·안전정수 초과·누락·분모 0 거부, 분모 null 미확인, 유효 0·큰수 보존");
+    }
+    #[test]
+    fn context_observer_alone_owns_usage_across_gui_handoff_and_disconnect() {
+        let(control,_rpc,_listener)=fixture();
+        let usage=|used:i64|json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"turn","tokenUsage":{"total":{"totalTokens":400000,"inputTokens":300000,"cachedInputTokens":0,"outputTokens":100000,"reasoningOutputTokens":0},"last":{"totalTokens":used,"inputTokens":0,"cachedInputTokens":0,"outputTokens":used,"reasoningOutputTokens":0},"modelContextWindow":100000}}});
+        {let mut events=control.0.events.lock().unwrap();events.connected=true;events.observer_connected=true;}
+        control.observer_message("original",usage(56000)).unwrap();
+        observe_message(&control.0,"original",usage(99000)).unwrap();assert_eq!(control.context_status("original").unwrap()["tokenUsage"]["last"]["totalTokens"],56000);
+        for method in ["thread/settings/updated","model/rerouted"] {
+            // GUI의 복사본은 관찰자의 사용량 순서를 바꾸지 않는다.
+            observe_message(&control.0,"original",json!({"method":method,"params":{"threadId":"original"}})).unwrap();assert_eq!(control.context_status("original").unwrap()["tokenUsageFresh"],true);
+            control.observer_message("original",json!({"method":method,"params":{"threadId":"original"}})).unwrap();assert_eq!(control.context_status("original").unwrap()["tokenUsageFresh"],false);
+            control.observer_message("original",usage(12000)).unwrap();assert_eq!(control.context_status("original").unwrap()["tokenUsageFresh"],true);
+        }
+        // GUI 해제 뒤에도 동일 관찰 스트림에서 감소한 새 사용량을 계속 받는다.
+        control.0.events.lock().unwrap().connected=false;control.observer_message("original",usage(8000)).unwrap();
+        let snapshot=control.context_status("original").unwrap();assert_eq!(snapshot["tokenUsage"]["last"]["totalTokens"],8000);assert_eq!(snapshot["tokenUsageFresh"],true);
+        let revision=snapshot["revision"].as_u64().unwrap();control.observer_disconnected();
+        let snapshot=control.context_status("original").unwrap();assert_eq!(snapshot["tokenUsageFresh"],false);assert!(snapshot["revision"].as_u64().unwrap()>revision);
+        // 연결 여부만 다시 true로 해도 과거값이 fresh로 부활하지 않는다.
+        control.0.events.lock().unwrap().observer_connected=true;assert_eq!(control.context_status("original").unwrap()["tokenUsageFresh"],false);
+        println!("수신 순서: observer 56000 → GUI 99000 무시 → observer 모델 변경 미확인 → 12000 감소 수락 → GUI 인계 후 8000 갱신 → 단절/재연결 과거값 미확인");
+    }
+    #[test]
+    fn context_passive_resubscribe_keeps_old_usage_stale_until_a_new_observer_update() {
+        let(control,mut rpc,listener)=fixture();let cwd=env::current_dir().unwrap().canonicalize().unwrap();let expected_cwd=cwd.clone();
+        control.0.events.lock().unwrap().observer_connected=true;
+        let usage=|used:i64|json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"turn","tokenUsage":{"total":{"totalTokens":used,"inputTokens":used,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"last":{"totalTokens":used,"inputTokens":used,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"modelContextWindow":100000}}});
+        control.observer_message("original",usage(12000)).unwrap();control.observer_disconnected();
+        let server=thread::spawn(move|| {
+            let(stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();let mut socket=WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);
+            let request=read_request(&mut socket);assert_eq!(request["method"],PASSIVE_SUBSCRIBE);
+            reply(&mut socket,&request,json!({"thread":{"id":"original","cwd":expected_cwd,"status":{"type":"idle"},"turns":[]}}));assert_closed_without_input(&mut socket);
+        });
+        assert!(control.observer_subscribe(&mut rpc,"original",&cwd).unwrap());
+        let snapshot=control.context_status("original").unwrap();assert_eq!(snapshot["tokenUsage"]["last"]["totalTokens"],12000);assert_eq!(snapshot["tokenUsageFresh"],false);
+        control.observer_message("original",usage(56000)).unwrap();assert_eq!(control.context_status("original").unwrap()["tokenUsageFresh"],true);
+        assert_eq!(rpc.next_id,1);drop(rpc);server.join().unwrap();
+    }
+    #[test]
+    fn context_ten_thousand_updates_keep_one_snapshot_and_existing_event_bounds() {
+        let(control,_rpc,_listener)=fixture();control.0.events.lock().unwrap().observer_connected=true;
+        for metadata_only in [true,false] {
+            for index in 0..10000 {
+                let message=json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"turn","tokenUsage":{"total":{"totalTokens":index,"inputTokens":index,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"last":{"totalTokens":index,"inputTokens":index,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0},"modelContextWindow":100000}}});
+                record_message(&control.0,"original",message,metadata_only).unwrap();
+            }
+            let events=control.0.events.lock().unwrap();assert!(events.token_usage.is_some());assert_eq!(events.token_usage.as_ref().unwrap().last.total_tokens,9999);
+            assert_eq!(events.queue.len(),if metadata_only {0}else{EVENT_COUNT});assert!(events.bytes<=EVENT_BYTES);assert_eq!(events.gap,!metadata_only);
+            // gap은 표시 이력 큐의 퇴거다. 환원기는 매 프레임을 처리했으므로 최신 snapshot 자체는 유효하다.
+            assert!(events.token_usage_fresh);
+            println!("연속 사용량 10000회: 관찰자={metadata_only}, 스냅샷=1, 큐={}, 바이트={}, 표시이력누락={}, 최신값=9999",events.queue.len(),events.bytes,events.gap);
+            drop(events);assert!(control.0.worker.lock().unwrap().is_none());
+        }
+    }
+    #[test]
+    fn context_unsupported_compact_and_native_guards_never_send_legacy_compact() {
         for state in ["idle","active","statusUnknown","pendingRequest","unknownResult","compacting","deleted","closing"] {
             let(control,mut rpc,listener)=fixture();
             {let mut events=control.0.events.lock().unwrap();events.connected=true;events.context_active=Some(false);
