@@ -455,7 +455,8 @@ function mountConversation(session: Session) {
         conversations.set(session.id, conversation);
       }
       const show = conversationHost.hidden;
-      await conversation.setVisible(show);
+      if (show) await conversation.setVisible(true);
+      else await conversation.handoffToTerminal();
       await conversation.setForeground(!card.hidden && !document.hidden && nativeWindowVisible);
       card.querySelector<HTMLElement>('.terminal-host')!.hidden = show;
       toggle.setAttribute('aria-pressed', String(show));

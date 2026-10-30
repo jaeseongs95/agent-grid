@@ -7,7 +7,7 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
     const { createConversation } = await import('/src/conversation.ts');
     const host = document.createElement('section'); host.id = 'conversation-fixture';
     host.style.cssText = 'position:fixed;inset:20px;z-index:9999;background:#141820;'; document.body.append(host);
-    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, heldItems: [] as any[], historyTag: '', holdPage: false, releasePage: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
+    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, rejectHandoff: false, holdHandoff: false, releaseHandoff: () => {}, holdItems: false, releaseItems: () => {}, heldItems: [] as any[], historyTag: '', holdPage: false, releasePage: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
     state.conversation = createConversation({
       sessionId: 'conversation-owned', generation: 7, host,
       ownerChanged: (owned: boolean) => fixture.owners.push(owned),
@@ -19,6 +19,7 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
         if (command !== 'conversation_request') throw Error(`알 수 없는 명령 ${command}`);
         const request = args.request;
         if (request.type === 'attach') return { threadId: 'thread-a', owner: 'gui', model: 'runtime-model', reasoningEffort: 'medium', historyUnavailable: fixture.historyUnavailable, activeTurnKnown: !fixture.historyUnavailable, activeTurnId: null };
+        if (request.type === 'handoffToTerminal') { if (fixture.holdHandoff) await new Promise<void>(resolve => { fixture.releaseHandoff = resolve; }); if (fixture.rejectHandoff) throw Error('인계할 수 없는 요청 또는 전송 결과 미확인이 남아 있습니다'); return {}; }
         if (request.type === 'detach') { if (fixture.rejectDetach) throw Error('승인 대기 중에는 전환할 수 없습니다'); return {}; }
         if (request.type === 'page') { if (fixture.historyUnavailable) throw Error('대화 이력을 아직 조회할 수 없습니다.'); const snapshot = { data: [{ id: request.cursor ? 'older-turn' : 'recent-turn', status: 'completed' }], nextCursor: request.cursor ? null : 'turn-page-2' }; if (fixture.holdPage) await new Promise<void>(resolve => { fixture.releasePage = resolve; }); return snapshot; }
         if (request.type === 'items') {
@@ -58,6 +59,58 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
   await expect(page.locator('#conversation-fixture .conversation-input')).toBeEnabled();
 }
 const view = (page: Page) => page.locator('#conversation-fixture');
+
+test('명시 인계만 전용 요청을 보내고 성공 확인 뒤 화면과 입력 소유권을 해제한다', async ({ page }) => {
+  await conversation(page);
+  await view(page).locator('.conversation-input').fill('인계 뒤에도 보존할 초안');
+  await page.evaluate(() => { (window as any).conversationFixture.pending = [{ seq: 1, requestId: 'ordinary-approval', method: 'item/commandExecution/requestApproval', params: { command: '검사 명령' } }]; });
+  await expect(view(page).locator('.conversation-request')).toContainText('검사 명령');
+  await page.evaluate(() => {
+    const state = window as any; state.conversationFixture.holdHandoff = true;
+    state.handoff = state.conversation.handoffToTerminal();
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args.request?.type === 'handoffToTerminal').length)).toBe(1);
+  await expect(view(page)).toBeVisible();
+  await expect(view(page).locator('.conversation-request')).toContainText('검사 명령');
+  expect(await page.evaluate(() => (window as any).conversationFixture.owners)).toEqual([true]);
+  await expect(view(page).locator('.conversation-input')).toHaveValue('인계 뒤에도 보존할 초안');
+  await page.evaluate(async () => { const state = window as any; state.conversationFixture.releaseHandoff(); await state.handoff; });
+  await expect(view(page)).toBeHidden();
+  expect(await page.evaluate(() => (window as any).conversationFixture.owners)).toEqual([true, false]);
+  expect(await page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args.request?.type === 'detach').length)).toBe(0);
+  await page.evaluate(async () => { await (window as any).conversation.setVisible(true); });
+  await expect(view(page).locator('.conversation-input')).toHaveValue('인계 뒤에도 보존할 초안');
+});
+
+test('자동 숨김과 dispose는 명시 인계를 사용하지 않고 엄격 detach를 유지한다', async ({ page }) => {
+  await conversation(page);
+  await page.evaluate(async () => { const state = window as any; await state.conversation.setVisible(false); await state.conversation.setVisible(true); await state.conversation.dispose(); });
+  const releaseTypes = await page.evaluate(() => (window as any).conversationFixture.calls.map((entry: any) => entry.args.request?.type).filter((type: string) => type === 'detach' || type === 'handoffToTerminal'));
+  expect(releaseTypes).toEqual(['detach', 'detach']);
+});
+
+for (const unknown of [false, true]) {
+  test(`명시 인계 거절은 연결·결과 미확인 ${unknown} 상태에서 화면·소유권·초안을 보존한다`, async ({ page }) => {
+    await conversation(page);
+    await view(page).locator('.conversation-input').fill('거절 뒤 보존할 초안');
+    await page.evaluate(unknown => {
+      const fixture = (window as any).conversationFixture; fixture.rejectHandoff = true; fixture.unknownResult = unknown;
+      fixture.pending = [{ seq: 1, requestId: 'owner-only', method: 'future/ownerOnlyRequest', params: { purpose: '원래 클라이언트 전용' } }];
+    }, unknown);
+    await expect(view(page).locator('.conversation-request')).toContainText('요청이 시작된 클라이언트에서 확인하세요');
+    if (unknown) await expect(view(page).locator('.conversation-input')).toBeDisabled();
+    const rejected = await page.evaluate(async () => { try { await (window as any).conversation.handoffToTerminal(); return false; } catch { return true; } });
+    expect(rejected).toBe(true);
+    await expect(view(page)).toBeVisible();
+    await expect(view(page).locator('.conversation-input')).toHaveValue('거절 뒤 보존할 초안');
+    await expect(view(page).locator('.conversation-request')).toContainText('원래 클라이언트 전용');
+    expect(await page.evaluate(() => (window as any).conversationFixture.owners)).toEqual([true]);
+    expect(await page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args.request?.type === 'handoffToTerminal').length)).toBe(1);
+    expect(await page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args.request?.type === 'detach').length)).toBe(0);
+    if (unknown) await expect(view(page).locator('.conversation-input')).toBeDisabled();
+    else await expect(view(page).locator('.conversation-input')).toBeEnabled();
+  });
+}
 
 test('지연 항목 스냅샷은 먼저 표시된 실시간 완료·델타를 덮지 않는다', async ({ page }) => {
   await conversation(page);

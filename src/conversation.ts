@@ -320,7 +320,7 @@ export function createConversation(options: ConversationOptions) {
         }
         const submit = document.createElement('button'); submit.type = 'submit'; submit.className = 'primary-button'; bindText(submit, '답변 보내기', 'Send answers'); form.append(submit);
         form.onsubmit = event => { event.preventDefault(); const answers = Object.fromEntries([...answerInputs].map(([key, value]) => [key, { answers: [value()] }])); void respond(id, { answers }, panel); }; panel.append(form);
-      } else { const reason = document.createElement('p'); bindText(reason, '이 요청 형식은 지원하지 않아 자동 응답하지 않습니다. 터미널 보기에서 확인하세요.', 'This request type is unsupported and will not be answered automatically. Check terminal view.'); panel.append(reason); }
+      } else { const reason = document.createElement('p'); bindText(reason, '이 요청 형식은 지원하지 않아 자동 응답하지 않습니다. 요청이 시작된 클라이언트에서 확인하세요.', 'This request type is unsupported and will not be answered automatically. Check the client where the request originated.'); panel.append(reason); }
       if (event.responded || responding.has(id)) { panel.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>('button,input,select').forEach(control => { control.disabled = true; }); const waiting = document.createElement('small'); bindText(waiting, '응답을 보냈습니다. 서버의 처리 확인을 기다립니다.', 'Response sent. Waiting for server confirmation.'); panel.append(waiting); }
       requests.append(panel);
     }
@@ -431,16 +431,23 @@ export function createConversation(options: ConversationOptions) {
     } } finally { staging = false; if (alive(version)) { renderAttachments(); updateControls(); } }
   }
   function setVisible(value: boolean): Promise<void> {
+    return changeVisibility(value, false);
+  }
+  function handoffToTerminal(): Promise<void> {
+    return changeVisibility(false, true);
+  }
+  function changeVisibility(value: boolean, handoff: boolean): Promise<void> {
     if (disposed) return Promise.resolve();
     if (visible === value) return changing;
-    visible = value; host.hidden = !value; const version = ++epoch; stopPolling(); updateControls();
+    visible = value; if (!handoff) host.hidden = !value; const version = ++epoch; stopPolling(); updateControls();
     changing = changing.catch(failure).then(async () => {
       if (attached) {
-        try { await rpc({ type: 'detach' }); }
-        catch (error) { if (!disposed) { visible = true; host.hidden = false; connected = true; failure(error); updateControls(); startPolling(); } throw error; }
+        try { await rpc({ type: handoff ? 'handoffToTerminal' : 'detach' }); }
+        catch (error) { if (!disposed) { visible = true; host.hidden = false; connected = false; failure(error); updateControls(); startPolling(); } throw error; }
         attached = false; connected = false; options.ownerChanged?.(false);
         if (!visible) clearDisplay();
       }
+      if (!visible) host.hidden = true;
       if (deleted) { updateControls(); return; }
       if (!alive(version)) return;
       status('대화에 연결하는 중…', 'Connecting to conversation…');
@@ -450,7 +457,7 @@ export function createConversation(options: ConversationOptions) {
         const value = await rpc({ type: 'attach' });
         if (!alive(version)) {
           try { await rpc({ type: 'detach' }); }
-          catch (error) { if (!disposed) { visible = true; host.hidden = false; connected = true; failure(error); updateControls(); startPolling(); } throw error; }
+          catch (error) { if (!disposed) { visible = true; host.hidden = false; connected = false; failure(error); updateControls(); startPolling(); } throw error; }
           attached = false; options.ownerChanged?.(false); return;
         }
         connected = true; uncertain = false; lastSeq = 0; threadId = string(value.threadId ?? value.thread?.id); confirmedSettings(value.model, value.reasoningEffort);
@@ -502,6 +509,7 @@ export function createConversation(options: ConversationOptions) {
   renderCurrentSettings(); renderModels(); renderItems(); updateControls();
   return {
     setVisible,
+    handoffToTerminal,
     setForeground,
     refresh: () => visible && foreground && !loading ? loadPage() : Promise.resolve(),
     hasDraft: () => !!input.value || !!attachments.length,
