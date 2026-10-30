@@ -9,15 +9,15 @@ async function fixture(page: Page) {
     host.style.cssText = 'position:fixed;top:20px;right:20px;z-index:9999;background:#141820'; document.body.append(host);
     const data = state.contextFixture = {
       reads: 0, preparations: 0, mutations: 0, notices: [] as any[], failure: false, hold: false,
-      release: () => {}, holdRead: false, releaseRead: () => {},
-      snapshot: { connected: true, guiConnected: true, tokenUsage: { total: { totalTokens: 900000 }, last: { totalTokens: 40000 }, modelContextWindow: 100000 }, tokenUsageFresh: true, compacting: false, active: false, canCompact: true } as any,
+      release: () => {}, holdRead: false, releaseRead: () => {}, result: 'started',
+      snapshot: { revision: 1, connected: true, guiConnected: true, tokenUsage: { total: { totalTokens: 900000 }, last: { totalTokens: 40000 }, modelContextWindow: 100000 }, tokenUsageFresh: true, compacting: false, active: false, canCompact: true } as any,
     };
     state.contextControls = createContextControls({
       host, sessionId: 'context-session', generation: 9,
       async call(command: string, args: any) {
         if (command !== 'conversation_request' || args.id !== 'context-session' || args.generation !== 9 || args.request.type !== 'contextStatus') throw Error('관측 이외의 호출');
         data.reads++; const snapshot = structuredClone(data.snapshot);
-        if (data.holdRead) await new Promise<void>(resolve => { data.releaseRead = resolve; });
+        if (data.holdRead) { data.holdRead = false; await new Promise<void>(resolve => { data.releaseRead = resolve; }); }
         if (data.failure) throw Error('PRIVATE_TOKEN_PATH_NEVER_REAL');
         return snapshot;
       },
@@ -26,6 +26,7 @@ async function fixture(page: Page) {
         data.mutations++;
         if (data.hold) await new Promise<void>(resolve => { data.release = resolve; });
         if (data.failure) throw Error('PRIVATE_TOKEN_PATH_NEVER_REAL');
+        if (data.result !== 'started') return { status: data.result };
         data.snapshot.compacting = true; data.snapshot.canCompact = false; data.snapshot.tokenUsageFresh = false; data.snapshot.reason = 'compacting';
         return { status: 'started' };
       },
@@ -44,6 +45,37 @@ test('컨텍스트는 누적 사용량이 아닌 최근 사용량 비율을 표�
   await usage.click();
   await expect(usage).toHaveText('—');
   await expect(usage).toHaveAttribute('aria-label', /미확인/);
+});
+
+test('0과 상한의 유효 비율을 표시하고 잘못된 수치·용량을 미확인으로 표시한다', async ({ page }) => {
+  await fixture(page);
+  const usage = page.locator('#context-fixture .context-usage');
+  const cases: [unknown, unknown, string][] = [
+    [0, 100000, '0%'], [100000, 100000, '100%'], [120000, 100000, '100%'],
+    [56000, 100000, '56%'], [12000, 12000, '100%'], [-1, 100000, '—'],
+    [0.5, 100000, '—'], [Number.MAX_SAFE_INTEGER + 1, 100000, '—'],
+    [40000, 0, '—'], [40000, -1, '—'], [40000, 0.5, '—'],
+    [40000, Number.MAX_SAFE_INTEGER + 1, '—'], [40000, null, '—'], ['40000', 100000, '—'],
+  ];
+  for (const [used, capacity, expected] of cases) {
+    await page.evaluate(({ used, capacity }) => { const s = (window as any).contextFixture.snapshot; s.revision++; s.tokenUsage.last.totalTokens = used; s.tokenUsage.modelContextWindow = capacity; }, { used, capacity });
+    await usage.click();
+    await expect(usage).toHaveText(expected);
+  }
+});
+
+test('늦게 돌아온 낮은 상태 판본이 더 최근 관측을 되돌리지 않는다', async ({ page }) => {
+  await fixture(page);
+  const usage = page.locator('#context-fixture .context-usage');
+  await expect(usage).toHaveText('40%');
+  await page.evaluate(() => { (window as any).contextFixture.holdRead = true; });
+  await usage.click();
+  await page.evaluate(() => { const s = (window as any).contextFixture; s.snapshot.revision = 2; s.snapshot.tokenUsage.last.totalTokens = 10000; s.result = 'skippedBusy'; });
+  await page.locator('#context-fixture .context-compact').click();
+  await expect(usage).toHaveText('10%');
+  await page.evaluate(() => (window as any).contextFixture.releaseRead());
+  await expect(usage).toBeEnabled();
+  await expect(usage).toHaveText('10%');
 });
 
 test('연결 단절과 압축 뒤에는 과거 수치를 현재 사용량으로 표시하지 않는다', async ({ page }) => {
