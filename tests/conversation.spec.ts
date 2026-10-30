@@ -7,7 +7,7 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
     const { createConversation } = await import('/src/conversation.ts');
     const host = document.createElement('section'); host.id = 'conversation-fixture';
     host.style.cssText = 'position:fixed;inset:20px;z-index:9999;background:#141820;'; document.body.append(host);
-    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
+    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, heldItems: [] as any[], historyTag: '', holdPage: false, releasePage: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
     state.conversation = createConversation({
       sessionId: 'conversation-owned', generation: 7, host,
       ownerChanged: (owned: boolean) => fixture.owners.push(owned),
@@ -20,9 +20,8 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
         const request = args.request;
         if (request.type === 'attach') return { threadId: 'thread-a', owner: 'gui', model: 'runtime-model', reasoningEffort: 'medium', historyUnavailable: fixture.historyUnavailable, activeTurnKnown: !fixture.historyUnavailable, activeTurnId: null };
         if (request.type === 'detach') { if (fixture.rejectDetach) throw Error('승인 대기 중에는 전환할 수 없습니다'); return {}; }
-        if (request.type === 'page') { if (fixture.historyUnavailable) throw Error('대화 이력을 아직 조회할 수 없습니다.'); return { data: [{ id: request.cursor ? 'older-turn' : 'recent-turn', status: 'completed' }], nextCursor: request.cursor ? null : 'turn-page-2' }; }
+        if (request.type === 'page') { if (fixture.historyUnavailable) throw Error('대화 이력을 아직 조회할 수 없습니다.'); const snapshot = { data: [{ id: request.cursor ? 'older-turn' : 'recent-turn', status: 'completed' }], nextCursor: request.cursor ? null : 'turn-page-2' }; if (fixture.holdPage) await new Promise<void>(resolve => { fixture.releasePage = resolve; }); return snapshot; }
         if (request.type === 'items') {
-          if (fixture.holdItems) await new Promise<void>(resolve => { fixture.releaseItems = resolve; });
           const turnId = request.turnId === 'older-turn' ? 'older-turn' : 'recent-turn';
           const data = request.cursor ? [{ turnId, item: { id: 'earlier-message', type: 'agentMessage', text: '이전 페이지 원문' } }] : [
             { turnId, item: { id: 'tool-a', type: 'commandExecution', command: 'npm test', aggregatedOutput: '검사 성공', status: 'completed' } },
@@ -32,7 +31,10 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
           if (fixture.largeHistory) data.unshift({ turnId, item: { id: 'large-item', type: 'agentMessage', text: { __detail: true, bytes: 30000 } } } as any);
           if (fixture.invalidHistory === 'other-turn') data[0].turnId = 'unrelated-turn';
           if (fixture.invalidHistory === 'missing-id') delete (data[0].item as any).id;
-          return { data, nextCursor: request.cursor ? null : 'items-page-2', backwardsCursor: null };
+          if (fixture.historyTag) (data.find(entry => entry.item.id === 'assistant-a')!.item as any).text = fixture.historyTag;
+          const snapshot = { data, nextCursor: request.cursor ? null : 'items-page-2', backwardsCursor: null };
+          if (fixture.holdItems) await new Promise<void>(resolve => { fixture.releaseItems = resolve; fixture.heldItems.push({ turnId, release: resolve }); });
+          return snapshot;
         }
         if (request.type === 'models') return { data: [
           { id: 'runtime-model-id', model: 'runtime-model', displayName: '실제 런타임 모델', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }] },
@@ -56,6 +58,70 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
   await expect(page.locator('#conversation-fixture .conversation-input')).toBeEnabled();
 }
 const view = (page: Page) => page.locator('#conversation-fixture');
+
+test('지연 항목 스냅샷은 먼저 표시된 실시간 완료·델타를 덮지 않는다', async ({ page }) => {
+  await conversation(page);
+  await page.evaluate(() => { const state = window as any; state.conversationFixture.holdItems = true; state.delayedRefresh = state.conversation.refresh(); });
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.heldItems.length)).toBe(1);
+  await page.evaluate(() => {
+    const fixture = (window as any).conversationFixture;
+    fixture.queue.push(
+      { seq: fixture.nextSeq++, method: 'item/completed', params: { turnId: 'recent-turn', item: { id: 'live-completed', type: 'agentMessage', text: '실시간 완료 원문' } } },
+      { seq: fixture.nextSeq++, method: 'item/agentMessage/delta', params: { turnId: 'recent-turn', itemId: 'assistant-a', delta: ' · 최신 델타' } },
+    );
+  });
+  await expect(view(page).locator('[data-item-id="live-completed"]')).toHaveText('도우미실시간 완료 원문');
+  await expect(view(page).locator('[data-item-id="assistant-a"]')).toContainText('최신 델타');
+  await page.evaluate(async () => { const state = window as any; state.conversationFixture.releaseItems(); await state.delayedRefresh; });
+  await expect(view(page).locator('[data-item-id="live-completed"]')).toHaveCount(1);
+  await expect(view(page).locator('[data-item-id="assistant-a"]')).toContainText('최신 델타');
+  await expect(view(page).locator('[data-item-id="assistant-a"]')).toContainText('const safe = true;');
+  await expect(view(page).locator('.conversation-status')).toContainText('이전 이력 응답을 적용하지 않았습니다');
+  await page.waitForTimeout(500);
+  expect(await page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args.request?.type === 'items').length)).toBe(2);
+});
+
+test('지연 구간 스냅샷은 새 turn 시작을 유휴 상태로 되돌리지 않는다', async ({ page }) => {
+  await conversation(page);
+  await page.evaluate(() => { const state = window as any; state.conversationFixture.holdPage = true; state.delayedRefresh = state.conversation.refresh(); });
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args.request?.type === 'page').length)).toBe(2);
+  await page.evaluate(() => {
+    const fixture = (window as any).conversationFixture;
+    fixture.queue.push(
+      { seq: fixture.nextSeq++, method: 'turn/started', params: { turn: { id: 'newer-turn', status: 'inProgress' } } },
+      { seq: fixture.nextSeq++, method: 'item/completed', params: { turnId: 'newer-turn', item: { id: 'newer-item', type: 'agentMessage', text: '새 실행 출력' } } },
+    );
+  });
+  await expect(view(page).locator('[data-item-id="newer-item"]')).toHaveCount(1);
+  await page.evaluate(async () => { const state = window as any; state.conversationFixture.releasePage(); await state.delayedRefresh; });
+  await expect(view(page).locator('.conversation-stop')).toBeEnabled();
+  await expect(view(page).locator('.conversation-send')).toBeDisabled();
+  await expect(view(page).locator('[data-item-id="newer-item"]')).toHaveCount(1);
+  await expect(view(page).locator('.conversation-status')).toContainText('이전 이력 응답을 적용하지 않았습니다');
+  expect(await page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args.request?.type === 'items').length)).toBe(1);
+});
+
+test('여러 항목 조회의 역전은 같은 구간으로 돌아와도 최신 조회 의도를 보존한다', async ({ page }) => {
+  await conversation(page);
+  async function selectSnapshot(turnId: string, tag: string) {
+    await page.evaluate(({ turnId, tag }) => {
+      const fixture = (window as any).conversationFixture; fixture.holdItems = true; fixture.historyTag = tag;
+      const select = document.querySelector('#conversation-fixture .conversation-turns') as HTMLSelectElement;
+      if (![...select.options].some(option => option.value === turnId)) select.add(new Option(turnId, turnId));
+      select.value = turnId; select.dispatchEvent(new Event('change', { bubbles: true }));
+    }, { turnId, tag });
+  }
+  await selectSnapshot('recent-turn', '첫 조회 원문');
+  await selectSnapshot('older-turn', '다른 구간 원문');
+  await selectSnapshot('recent-turn', '최신 조회 원문');
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.heldItems.length)).toBe(3);
+  await page.evaluate(() => { (window as any).conversationFixture.heldItems[2].release(); });
+  await expect(view(page).locator('[data-item-id="assistant-a"]')).toContainText('최신 조회 원문');
+  await page.evaluate(() => { (window as any).conversationFixture.heldItems[1].release(); (window as any).conversationFixture.heldItems[0].release(); });
+  await page.waitForTimeout(100);
+  await expect(view(page).locator('[data-item-id="assistant-a"]')).toHaveCount(1);
+  await expect(view(page).locator('[data-item-id="assistant-a"]')).toContainText('최신 조회 원문');
+});
 
 test('최근 페이지와 구조화 출력은 안전한 텍스트로 보이고 페이지 단위로 교체된다', async ({ page }, testInfo) => {
   await conversation(page);
@@ -228,12 +294,13 @@ test('명시 거절은 초안을 편집할 수 있고 늦은 조회는 숨긴 �
 });
 
 for (const [mode, expectedError] of [['other-turn', '다른 대화 구간'], ['missing-id', '항목 식별자']] as const) {
-  test(`실제 이력 항목 구조의 ${mode} 응답은 표시와 상세 조회 전에 거부한다`, async ({ page }) => {
+  test(`실제 이력 항목 구조의 ${mode} 응답은 거부하고 기존 표시를 보존한다`, async ({ page }) => {
     await conversation(page);
+    const previous = await view(page).locator('.conversation-message').evaluateAll(rows => rows.map(row => ({ id: row.getAttribute('data-item-id'), text: row.textContent })));
     await page.evaluate(mode => { (window as any).conversationFixture.invalidHistory = mode; }, mode);
     await view(page).locator('.conversation-refresh').click();
     await expect(view(page).locator('.conversation-status')).toContainText(expectedError);
-    await expect(view(page).locator('.conversation-message')).toHaveCount(0);
+    expect(await view(page).locator('.conversation-message').evaluateAll(rows => rows.map(row => ({ id: row.getAttribute('data-item-id'), text: row.textContent })))).toEqual(previous);
     const details = await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'detail'));
     expect(details).toEqual([]);
   });

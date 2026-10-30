@@ -46,6 +46,7 @@ export function createConversation(options: ConversationOptions) {
   let visible = false; let foreground = true; let disposed = false; let attached = false; let connected = false;
   let changing: Promise<void> = Promise.resolve(); let epoch = 0;
   let contentVersion = 0; let pollVersion = 0;
+  let historyQuery = 0; let liveRevision = 0;
   let polling: ReturnType<typeof setTimeout> | undefined;
   let sending = false; let interrupting = false; let uncertain = false; let composing = false; let loading = false; let staging = false;
   let modelsLoading = false;
@@ -204,6 +205,7 @@ export function createConversation(options: ConversationOptions) {
     return { id: string(value.id), role, text, status: string(value.status), detail };
   }
   function upsert(entry: Entry, delta = false) {
+    liveRevision++;
     const found = items.findIndex(value => value.id === entry.id);
     if (found >= 0) items[found] = delta ? { ...items[found], detail: items[found].detail || entry.detail, text: items[found].text + entry.text } : entry;
     else items.push(entry);
@@ -217,12 +219,20 @@ export function createConversation(options: ConversationOptions) {
     for (const value of turnPage) option(turns, string(value.id), `${string(value.id).slice(0, 10)} · ${string(value.status) || t('상태 미확인', 'Unknown status')}`);
     turns.value = selectedTurn; button('.conversation-older').hidden = !nextTurns;
   }
-  async function loadItems(turnId: string, cursor = '') {
+  function staleHistory() {
+    status('조회 중 새 실시간 변경을 받아 이전 이력 응답을 적용하지 않았습니다. 필요한 구간을 다시 조회하세요.', 'Live updates arrived during the query. The older history response was not applied. Reload the desired turn.');
+    button('.conversation-refresh').classList.add('needs-refresh');
+  }
+  async function loadItems(turnId: string, cursor = '', query = ++historyQuery) {
     if (deleted) return;
-    const version = epoch; const content = contentVersion; selectedTurn = turnId; loading = true; items = []; nextItems = ''; renderItems(); updateControls();
+    const version = epoch; const content = contentVersion; const live = liveRevision;
+    if (selectedTurn !== turnId) { items = []; nextItems = ''; renderItems(); }
+    selectedTurn = turnId; loading = true; updateControls();
     try {
       const value = await rpc({ type: 'items', turnId, ...(cursor ? { cursor } : {}) });
-      if (!alive(version) || !foreground || content !== contentVersion || selectedTurn !== turnId) return;
+      if (!alive(version) || !foreground || content !== contentVersion || query !== historyQuery || selectedTurn !== turnId) return;
+      // The protocol supplies no snapshot revision to order a history response against live deltas.
+      if (live !== liveRevision) { staleHistory(); return; }
       if (!Array.isArray(value.data)) throw new Error(t('대화 이력 목록 형식이 올바르지 않습니다.', 'Invalid conversation history list.'));
       const ids = new Set<string>();
       const data = value.data.map((entry: Json) => {
@@ -234,24 +244,27 @@ export function createConversation(options: ConversationOptions) {
         ids.add(id); return itemEntry(item);
       });
       items = data.reverse(); nextItems = string(value.nextCursor); renderItems();
-    } catch (error) { if (alive(version) && content === contentVersion) failure(error); }
-    finally { if (alive(version) && content === contentVersion) { loading = false; updateControls(); } }
+    } catch (error) { if (alive(version) && content === contentVersion && query === historyQuery && selectedTurn === turnId) failure(error); }
+    finally { if (alive(version) && content === contentVersion && query === historyQuery) { loading = false; updateControls(); } }
   }
   async function loadPage(cursor = '') {
     if (deleted) return;
-    const version = epoch; const content = contentVersion; loading = true; updateControls();
+    const version = epoch; const content = contentVersion; const live = liveRevision; const query = ++historyQuery; loading = true; updateControls();
     try {
       const value = await rpc({ type: 'page', ...(cursor ? { cursor } : {}) });
-      if (!alive(version) || !foreground || content !== contentVersion) return;
+      if (!alive(version) || !foreground || content !== contentVersion || query !== historyQuery) return;
+      if (live !== liveRevision) { staleHistory(); return; }
       if (!Array.isArray(value.data)) throw new Error(t('대화 구간 목록 형식이 올바르지 않습니다.', 'Invalid conversation turn list.'));
       const wasUnknown = historyUnavailable || !activeTurnKnown; historyUnavailable = false;
-      turnPage = value.data; nextTurns = string(value.nextCursor); selectedTurn = string(turnPage[0]?.id); renderTurns();
+      turnPage = value.data; nextTurns = string(value.nextCursor);
+      const nextTurn = string(turnPage[0]?.id);
+      if (selectedTurn !== nextTurn || !nextTurn) { items = []; nextItems = ''; renderItems(); }
+      selectedTurn = nextTurn; renderTurns();
       if (!cursor) { activeTurn = turnPage[0]?.status === 'inProgress' ? string(turnPage[0]?.id) : ''; activeTurnKnown = true; }
       if (wasUnknown) status('대화 이력과 실행 상태를 확인했습니다.', 'Conversation history and activity state confirmed.');
-      items = []; nextItems = ''; renderItems();
-      if (selectedTurn) await loadItems(selectedTurn);
-    } catch (error) { if (alive(version) && content === contentVersion) failure(error); }
-    finally { if (alive(version) && content === contentVersion) { loading = false; updateControls(); } }
+      if (selectedTurn) await loadItems(selectedTurn, '', query);
+    } catch (error) { if (alive(version) && content === contentVersion && query === historyQuery) failure(error); }
+    finally { if (alive(version) && content === contentVersion && query === historyQuery) { loading = false; updateControls(); } }
   }
   async function loadModels(cursor = '') {
     if (deleted) return;
@@ -343,8 +356,8 @@ export function createConversation(options: ConversationOptions) {
     if (event.method === 'thread/settings/updated') {
       if (threadId && value.threadId === threadId && value.threadSettings && typeof value.threadSettings === 'object' && !Array.isArray(value.threadSettings)) confirmedSettings(value.threadSettings.model, value.threadSettings.effort);
     }
-    else if (event.method === 'turn/started') { activeTurn = string(value.turn?.id ?? value.turnId); activeTurnKnown = true; selectedTurn = activeTurn; items = []; nextItems = ''; itemsDirty = true; }
-    else if (event.method === 'turn/completed') { if (activeTurn === string(value.turn?.id ?? value.turnId)) { activeTurn = ''; activeTurnKnown = true; } if (value.turn?.error) upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.turn.error.message) || JSON.stringify(value.turn.error) }); }
+    else if (event.method === 'turn/started') { liveRevision++; activeTurn = string(value.turn?.id ?? value.turnId); activeTurnKnown = true; selectedTurn = activeTurn; items = []; nextItems = ''; itemsDirty = true; }
+    else if (event.method === 'turn/completed') { liveRevision++; if (activeTurn === string(value.turn?.id ?? value.turnId)) { activeTurn = ''; activeTurnKnown = true; } if (value.turn?.error) upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.turn.error.message) || JSON.stringify(value.turn.error) }); }
     else if (event.method === 'error') upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.error?.message ?? value.message) || JSON.stringify(value) });
     else if (!value.turnId || value.turnId === selectedTurn) {
       if (event.method === 'item/started' || event.method === 'item/completed') { if (value.item) upsert(itemEntry(value.item)); }
