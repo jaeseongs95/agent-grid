@@ -31,6 +31,11 @@ struct BusyPicker(Arc<AtomicBool>);
 impl Drop for BusyPicker { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
 
 impl ConversationAttachments {
+    #[cfg(test)]
+    pub(crate) fn test_store(root: PathBuf) -> Self {
+        Self { staged: Arc::new(Mutex::new(Staging { root, sessions: BTreeMap::new() })), ..Self::default() }
+    }
+
     pub fn choose(&self, owner: isize, language: crate::ui_language::UiLanguage) -> Result<Vec<ConversationAttachment>, String> {
         self.busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "첨부 파일 선택창이 이미 열려 있습니다.")?;
@@ -47,7 +52,10 @@ impl ConversationAttachments {
             else { return Err("클립보드 이미지는 PNG 또는 JPEG 형식이어야 합니다.".into()); };
         // ponytail: one bounded decode at a time; add an admission pool only if
         // measured clipboard throughput requires concurrent image decoding.
-        let mut staged = self.staged.lock().map_err(|_| "임시 첨부 파일 상태 잠금 실패")?;
+        let mut staged = self.staged.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => "다른 이미지 저장 작업이 진행 중입니다. 잠시 후 다시 시도하세요.",
+            std::sync::TryLockError::Poisoned(_) => "임시 첨부 파일 상태 잠금 실패",
+        })?;
         let bytes = decode_base64(encoded)?;
         // The OS lock covers the persistent disk budget and the subsequent write,
         // including other app processes. Closing the handle releases the lock.
@@ -231,7 +239,7 @@ fn selected_attachment(path: &Path) -> Result<ConversationAttachment, String> {
     let path = path.canonicalize().map_err(|e| format!("첨부 파일을 열 수 없습니다: {e}"))?;
     if !path.is_file() { return Err("첨부 대상은 파일이어야 합니다.".into()); }
     let name = path.file_name().and_then(|name| name.to_str()).ok_or("첨부 파일명이 올바른 유니코드가 아닙니다.")?.to_owned();
-    let kind = if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| ["png", "jpg", "jpeg", "webp", "gif", "bmp"].iter().any(|image| extension.eq_ignore_ascii_case(image))) { "localImage" } else { "file" };
+    let kind = if path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| ["png", "jpg", "jpeg", "webp", "gif"].iter().any(|image| extension.eq_ignore_ascii_case(image))) { "localImage" } else { "file" };
     let path_text = path.to_str().ok_or("첨부 파일 경로가 올바른 유니코드가 아닙니다.")?.to_owned();
     #[cfg(windows)] {
         let path_text = if let Some(unc) = path_text.strip_prefix(r"\\?\UNC\") { format!(r"\\{unc}") }
@@ -273,7 +281,7 @@ fn choose_files(owner: isize, language: crate::ui_language::UiLanguage) -> Resul
     if initialized < 0 { return Err(format!("첨부 파일 선택창 초기화 실패: {initialized:#010x}")); }
     let _apartment = Apartment;
     let title: Vec<u16> = language.text("대화에 첨부할 파일 선택", "Select conversation attachments").encode_utf16().chain(Some(0)).collect();
-    let filter: Vec<u16> = language.text("모든 파일 (*.*)\0*.*\0이미지 (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp\0\0", "All files (*.*)\0*.*\0Images (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp\0\0").encode_utf16().collect();
+    let filter: Vec<u16> = language.text("모든 파일 (*.*)\0*.*\0이미지 (*.png;*.jpg;*.jpeg;*.webp;*.gif)\0*.png;*.jpg;*.jpeg;*.webp;*.gif\0\0", "All files (*.*)\0*.*\0Images (*.png;*.jpg;*.jpeg;*.webp;*.gif)\0*.png;*.jpg;*.jpeg;*.webp;*.gif\0\0").encode_utf16().collect();
     let mut buffer = vec![0u16; 65536];
     let mut dialog = OPENFILENAMEW { lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32, hwndOwner: owner as HWND, lpstrFilter: filter.as_ptr(), nFilterIndex: 1, lpstrFile: buffer.as_mut_ptr(), nMaxFile: buffer.len() as u32, lpstrTitle: title.as_ptr(), Flags: OFN_EXPLORER | OFN_ALLOWMULTISELECT | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_DONTADDTORECENT | OFN_HIDEREADONLY | OFN_ENABLESIZING, ..Default::default() };
     if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
@@ -422,6 +430,34 @@ mod tests {
         assert!(selected_paths(&[65]).is_err());
         let too_many: Vec<u16> = format!("D:\\자료\0{}\0", "a\0".repeat(MAX_ATTACHMENTS + 1)).encode_utf16().collect();
         assert!(selected_paths(&too_many).is_err());
+    }
+
+    #[test]
+    fn selected_images_match_runtime_support_and_bmp_remains_a_file() {
+        let root = std::env::temp_dir().join(format!("opendiy-attachment-kind-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        for (extension, expected) in [("PNG", "localImage"), ("jpg", "localImage"), ("jpeg", "localImage"), ("webp", "localImage"), ("gif", "localImage"), ("bmp", "file"), ("BMP", "file"), ("txt", "file")] {
+            let path = root.join(format!("한글 첨부.{extension}"));
+            fs::write(&path, []).unwrap();
+            assert_eq!(selected_attachment(&path).unwrap().kind, expected);
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn staging_rejects_concurrent_work_without_queuing_image_input() {
+        let manager = ConversationAttachments::default();
+        let guard = manager.staged.lock().unwrap();
+        let pending = manager.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(pending.stage_image(&uuid::Uuid::new_v4().to_string(), "data:image/png;base64,YQ==")).unwrap();
+        });
+        let observed = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(guard);
+        worker.join().unwrap();
+        assert!(matches!(observed, Ok(Err(error)) if error.contains("다른 이미지 저장 작업")));
     }
 
     #[test]

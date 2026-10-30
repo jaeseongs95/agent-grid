@@ -235,9 +235,9 @@ async fn cleanup_conversation_attachment(engine: State<'_, Engine>, id: String, 
     tauri::async_runtime::spawn_blocking(move || engine.cleanup_conversation_attachment(&id,generation,&path)).await.map_err(|e|format!("첨부 초안 정리 작업자: {e}"))?
 }
 #[tauri::command]
-async fn weekly_usage(engine: State<'_, Engine>) -> Result<codex::WeeklyUsageSnapshot, String> {
+async fn weekly_usage(engine: State<'_, Engine>, manual: Option<bool>) -> Result<codex::WeeklyUsageSnapshot, String> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.weekly_usage()).await.map_err(|e| format!("Weekly usage worker: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || engine.weekly_usage(manual.unwrap_or(false))).await.map_err(|e| format!("Weekly usage worker: {e}"))?
 }
 #[tauri::command]
 async fn choose_skill_folder(app: tauri::AppHandle, picker: State<'_, project::FolderPicker>, ui: State<'_, UiSettings>) -> Result<Option<String>, String> {

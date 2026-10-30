@@ -7,7 +7,7 @@ async function conversation(page: Page) {
     const { createConversation } = await import('/src/conversation.ts');
     const host = document.createElement('section'); host.id = 'conversation-fixture';
     host.style.cssText = 'position:fixed;inset:20px;z-index:9999;background:#141820;'; document.body.append(host);
-    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0 };
+    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '' };
     state.conversation = createConversation({
       sessionId: 'conversation-owned', generation: 7, host,
       ownerChanged: (owned: boolean) => fixture.owners.push(owned),
@@ -23,11 +23,16 @@ async function conversation(page: Page) {
         if (request.type === 'page') return { data: [{ id: request.cursor ? 'older-turn' : 'recent-turn', status: 'completed' }], nextCursor: request.cursor ? null : 'turn-page-2' };
         if (request.type === 'items') {
           if (fixture.holdItems) await new Promise<void>(resolve => { fixture.releaseItems = resolve; });
-          return request.cursor ? { data: [{ id: 'earlier-message', type: 'agentMessage', text: '이전 페이지 원문' }], nextCursor: null } : { data: [
-            { id: 'tool-a', type: 'commandExecution', command: 'npm test', aggregatedOutput: '검사 성공', status: 'completed' },
-            { id: 'assistant-a', type: 'agentMessage', text: '답변\n```ts\nconst safe = true;\n```' },
-            { id: 'user-a', type: 'userMessage', content: [{ type: 'text', text: '<img src=x onerror="window.injected=true">' }] },
-          ], nextCursor: 'items-page-2' };
+          const turnId = request.turnId === 'older-turn' ? 'older-turn' : 'recent-turn';
+          const data = request.cursor ? [{ turnId, item: { id: 'earlier-message', type: 'agentMessage', text: '이전 페이지 원문' } }] : [
+            { turnId, item: { id: 'tool-a', type: 'commandExecution', command: 'npm test', aggregatedOutput: '검사 성공', status: 'completed' } },
+            { turnId, item: { id: 'assistant-a', type: 'agentMessage', text: '답변\n```ts\nconst safe = true;\n```' } },
+            { turnId, item: { id: 'user-a', type: 'userMessage', content: [{ type: 'text', text: '<img src=x onerror="window.injected=true">' }] } },
+          ];
+          if (fixture.largeHistory) data.unshift({ turnId, item: { id: 'large-item', type: 'agentMessage', text: { __detail: true, bytes: 30000 } } } as any);
+          if (fixture.invalidHistory === 'other-turn') data[0].turnId = 'unrelated-turn';
+          if (fixture.invalidHistory === 'missing-id') delete (data[0].item as any).id;
+          return { data, nextCursor: request.cursor ? null : 'items-page-2', backwardsCursor: null };
         }
         if (request.type === 'models') return { data: [{ id: 'runtime-model-id', model: 'runtime-model', displayName: '실제 런타임 모델', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }] }], nextCursor: null };
         if (request.type === 'poll') return { events: fixture.queue.splice(0), pendingRequests: fixture.pending, connected: true, gap: false, unknownResult: fixture.unknownResult };
@@ -52,6 +57,7 @@ const view = (page: Page) => page.locator('#conversation-fixture');
 test('최근 페이지와 구조화 출력은 안전한 텍스트로 보이고 페이지 단위로 교체된다', async ({ page }, testInfo) => {
   await conversation(page);
   await expect(view(page).locator('.conversation-message')).toHaveCount(3);
+  expect(await view(page).locator('.conversation-message').evaluateAll(rows => rows.map(row => row.getAttribute('data-item-id')))).toEqual(['user-a', 'assistant-a', 'tool-a']);
   await expect(view(page).locator('.conversation-user')).toContainText('<img src=x');
   expect(await page.evaluate(() => (window as any).injected)).toBeUndefined();
   await expect(view(page).locator('img')).toHaveCount(0);
@@ -123,7 +129,7 @@ test('승인·선택 질문은 명시 응답만 보내고 poll 동안 선택을 
     const fixture = (window as any).conversationFixture;
     fixture.pending = [
       { seq: 1, method: 'item/commandExecution/requestApproval', requestId: 'approval-1', params: { command: 'npm test' } },
-      { seq: 2, method: 'item/tool/requestUserInput', requestId: 'question-1', params: { questions: [{ id: 'scope', question: '범위를 선택하세요', options: [{ label: '좁게' }, { label: '넓게' }] }] } },
+      { seq: 2, method: 'item/tool/requestUserInput', requestId: 'question-1', params: { questions: [{ id: 'scope', header: '범위', question: '범위를 선택하세요', isOther: true, isSecret: false, options: [{ label: '좁게', description: '작은 범위' }, { label: '넓게', description: '전체 범위' }] }] } },
     ];
   });
   await expect(view(page).locator('.conversation-request')).toHaveCount(2);
@@ -138,10 +144,8 @@ test('승인·선택 질문은 명시 응답만 보내고 poll 동안 선택을 
 
 test('큰 항목은 상세 구간으로 끝까지 접근하고 dispose 후 조회·화면 갱신이 멈춘다', async ({ page }) => {
   await conversation(page);
-  await page.evaluate(() => {
-    const fixture = (window as any).conversationFixture;
-    fixture.queue.push({ seq: fixture.nextSeq++, method: 'item/completed', params: { turnId: 'recent-turn', item: { id: 'large-item', type: 'agentMessage', text: { __detail: true, bytes: 30000 } } } });
-  });
+  await page.evaluate(() => { (window as any).conversationFixture.largeHistory = true; });
+  await view(page).locator('.conversation-refresh').click();
   await expect(view(page).getByRole('button', { name: '전체 내용 보기' })).toBeVisible();
   await view(page).getByRole('button', { name: '전체 내용 보기' }).click();
   await expect(view(page).locator('[data-item-id="large-item"]')).toContainText('첫 원문');
@@ -218,4 +222,62 @@ test('명시 거절은 초안을 편집할 수 있고 늦은 조회는 숨긴 �
   const count = await page.evaluate(() => (window as any).conversationFixture.calls.length);
   await page.waitForTimeout(900);
   expect(await page.evaluate(() => (window as any).conversationFixture.calls.length)).toBe(count);
+});
+
+for (const [mode, expectedError] of [['other-turn', '다른 대화 구간'], ['missing-id', '항목 식별자']] as const) {
+  test(`실제 이력 항목 구조의 ${mode} 응답은 표시와 상세 조회 전에 거부한다`, async ({ page }) => {
+    await conversation(page);
+    await page.evaluate(mode => { (window as any).conversationFixture.invalidHistory = mode; }, mode);
+    await view(page).locator('.conversation-refresh').click();
+    await expect(view(page).locator('.conversation-status')).toContainText(expectedError);
+    await expect(view(page).locator('.conversation-message')).toHaveCount(0);
+    const details = await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'detail'));
+    expect(details).toEqual([]);
+  });
+}
+
+test('isOther 선택 질문은 직접 입력한 초안을 보존하고 선택값 대신 해당 답을 전송한다', async ({ page }) => {
+  await conversation(page);
+  await page.evaluate(() => {
+    (window as any).conversationFixture.pending = [{ seq: 1, method: 'item/tool/requestUserInput', requestId: 'question-other', params: { questions: [{ id: 'scope', header: '범위', question: '작업 범위를 선택하세요', isOther: true, isSecret: false, options: [{ label: '좁게', description: '작은 범위' }, { label: '넓게', description: '전체 범위' }] }] } }];
+  });
+  const select = view(page).locator('.conversation-request select');
+  await expect(select.locator('option')).toHaveText(['선택하세요', '좁게 — 작은 범위', '넓게 — 전체 범위', '직접 입력']);
+  await select.selectOption({ label: '직접 입력' });
+  const other = view(page).getByRole('textbox', { name: '작업 범위를 선택하세요 · 직접 입력', exact: true });
+  await other.fill('먼저 문서만 살펴보세요');
+  await page.waitForTimeout(900); await expect(other).toHaveValue('먼저 문서만 살펴보세요');
+  await select.selectOption('좁게'); await expect(other).toBeHidden();
+  await select.selectOption({ label: '직접 입력' }); await expect(other).toHaveValue('먼저 문서만 살펴보세요');
+  await view(page).getByRole('button', { name: '답변 보내기', exact: true }).click();
+  const responses = await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'respond').map((value: any) => value.args.request));
+  expect(responses).toEqual([{ type: 'respond', requestId: 'question-other', result: { answers: { scope: { answers: ['먼저 문서만 살펴보세요'] } } } }]);
+});
+
+test('승인 선택지는 필드 부재와 명시적인 빈 값·미지원 값을 구분하고 안전한 교집합만 표시한다', async ({ page }) => {
+  await conversation(page);
+  const cases = [
+    { key: '필드 없음', present: false, value: null, labels: ['이번만 승인', '거절', '취소'] },
+    { key: '명시 null', present: true, value: null, labels: [] },
+    { key: '빈 배열', present: true, value: [], labels: [] },
+    { key: '미지원 객체', present: true, value: { accept: true }, labels: [] },
+    { key: '미지원 문자열', present: true, value: ['futureDecision'], labels: [] },
+    { key: '영구 정책 객체', present: true, value: [{ acceptWithExecpolicyAmendment: { execpolicyAmendment: ['command'] } }], labels: [] },
+    { key: '혼합 목록', present: true, value: ['decline', 'acceptForSession', { acceptWithExecpolicyAmendment: {} }, 'futureDecision', 'decline'], labels: ['세션 동안 승인', '거절'] },
+  ];
+  for (const candidate of cases) {
+    await page.evaluate(candidate => {
+      const params: any = { reason: candidate.key };
+      if (candidate.present) params.availableDecisions = candidate.value;
+      (window as any).conversationFixture.pending = [{ seq: 1, method: 'item/commandExecution/requestApproval', requestId: `approval-${candidate.key}`, params }];
+    }, candidate);
+    const panel = view(page).locator('.conversation-request'); await expect(panel.locator('pre')).toContainText(candidate.key);
+    await expect(panel.locator('button')).toHaveText(candidate.labels);
+    if (candidate.labels.length) await panel.getByRole('button', { name: '거절', exact: true }).click();
+  }
+  const responses = await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'respond').map((value: any) => value.args.request));
+  expect(responses).toEqual([
+    { type: 'respond', requestId: 'approval-필드 없음', result: { decision: 'decline' } },
+    { type: 'respond', requestId: 'approval-혼합 목록', result: { decision: 'decline' } },
+  ]);
 });

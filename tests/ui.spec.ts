@@ -42,6 +42,7 @@ test('browser preview shows a real runtime diagnostic and external sessions stay
   await page.getByRole('button', { name: '세션 시작 →', exact: true }).click();
   await expect(page.getByRole('alert')).toHaveText('데스크톱 앱에서 사용할 수 있는 기능입니다.');
   await page.getByRole('button', { name: '취소', exact: true }).click();
+  await page.locator('#settings-open').click();
   await page.locator('#external-toggle').click();
   await expect(page.locator('#external-dialog')).toBeVisible();
   await expect(page.locator('#external-list')).toContainText('데스크톱 앱에서 사용할 수 있는 기능입니다.');

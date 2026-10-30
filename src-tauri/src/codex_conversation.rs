@@ -94,7 +94,8 @@ impl DeadlineWatch {
 impl Drop for DeadlineWatch {
     fn drop(&mut self) { let _ = self.done.send(()); if let Some(join) = self.join.take() { let _ = join.join(); } }
 }
-struct Work { request: ConversationRequest, reply: mpsc::SyncSender<Result<Value, String>>, deadline: Instant }
+struct SendContext { session_id: String, store: crate::conversation_attachments::ConversationAttachments }
+struct Work { request: ConversationRequest, reply: mpsc::SyncSender<Result<Value, String>>, deadline: Instant, send_context: Option<SendContext> }
 #[derive(Default)]
 struct Events {
     queue: VecDeque<(Value, usize)>, bytes: usize, seq: u64, gap: bool,
@@ -123,6 +124,14 @@ impl Events {
     }
 }
 impl ConversationConnection {
+    pub(crate) fn approval_decisions(params: &Value) -> Vec<&'static str> {
+        match params.get("availableDecisions") {
+            None=>vec!["accept","decline","cancel"],
+            Some(Value::Array(advertised))=>["accept","acceptForSession","decline","cancel"].into_iter()
+                .filter(|choice|advertised.iter().any(|value|value.as_str()==Some(*choice))).collect(),
+            Some(_)=>Vec::new(),
+        }
+    }
     pub(super) fn new(endpoint: Endpoint, stopped: Arc<AtomicBool>) -> Self {
         Self(Arc::new(Control {endpoint,stopped,input:Mutex::new(false),owned:AtomicBool::new(false),worker:Mutex::new(None),events:Mutex::new(Events::default()),sent:Mutex::new(HashSet::new()),unknown:AtomicBool::new(false),detail:Mutex::new(None)}))
     }
@@ -136,12 +145,12 @@ impl ConversationConnection {
         let events = self.0.events.lock().map_err(|_| "대화 승인 상태 오류")?;
         let mut requests = events.observed_pending.clone();
         requests.extend(events.pending.clone());
-        for request in requests.values_mut() {request["metadataAvailable"]=json!(events.connected || events.observer_connected);}
+        for (id,request) in &mut requests {request["metadataAvailable"]=json!((events.connected&&events.pending.contains_key(id))||(events.observer_connected&&events.observed_pending.contains_key(id)));}
         Ok((owned,events.connected,requests.into_values().collect()))
     }
     pub(super) fn observer_message(&self,thread_id: &str,message: Value) -> Result<(),String> {record_message(&self.0,thread_id,message,true)}
     pub(super) fn observer_call<S: Read+Write>(&self,rpc: &mut Rpc<S>,thread_id: &str,method: &str,params: Value) -> Result<Value,String> {
-        call_observed(&self.0,rpc,thread_id,method,params,self.0.stopped.as_ref(),true)
+        call_observed(&self.0,rpc,thread_id,method,params,self.0.stopped.as_ref(),true,None)
     }
     pub(super) fn observer_subscribe<S: Read+Write>(&self,rpc: &mut Rpc<S>,thread_id: &str,cwd: &Path) -> Result<(),String> {
         let result = self.observer_call(rpc,thread_id,"thread/resume",json!({"threadId":thread_id,"excludeTurns":true}))?;
@@ -179,7 +188,15 @@ impl ConversationConnection {
         self.0.detail.lock().map_err(|_| "대화 상세 스냅샷 상태 오류")?.take();
         Ok(true)
     }
+    #[cfg(test)]
     pub(crate) fn request(&self, thread_id: &str, cwd: &Path, request: ConversationRequest) -> Result<Value, String> {
+        self.request_context(thread_id,cwd,request,None)
+    }
+    pub(crate) fn request_for_session(&self,thread_id: &str,cwd: &Path,request: ConversationRequest,session_id: &str,store: crate::conversation_attachments::ConversationAttachments) -> Result<Value,String> {
+        let context=matches!(request,ConversationRequest::Send{..}).then(||SendContext{session_id:session_id.to_owned(),store});
+        self.request_context(thread_id,cwd,request,context)
+    }
+    fn request_context(&self, thread_id: &str, cwd: &Path, request: ConversationRequest, send_context: Option<SendContext>) -> Result<Value, String> {
         validate_request(&request)?;
         if matches!(request, ConversationRequest::Poll) {
             let mut poll = self.0.events.lock().map_err(|_| "대화 이벤트 상태를 확인할 수 없습니다.")?.poll();
@@ -193,7 +210,7 @@ impl ConversationConnection {
             {
                 let worker = self.0.worker.lock().map_err(|_| "대화 연결 상태 오류")?;
                 if let Some(worker) = worker.as_ref() {
-                    worker.sender.try_send(Work {request,reply,deadline:Instant::now()+RPC_TIMEOUT}).map_err(|_| "대화 해제 요청을 전달할 수 없습니다. 입력 소유권을 유지했습니다.")?;
+                    worker.sender.try_send(Work {request,reply,deadline:Instant::now()+RPC_TIMEOUT,send_context:None}).map_err(|_| "대화 해제 요청을 전달할 수 없습니다. 입력 소유권을 유지했습니다.")?;
                 } else { return Ok(json!({})); }
             }
             let result = receiver.recv_timeout(RPC_TIMEOUT+Duration::from_secs(2)).map_err(|_| "대화 해제 결과를 확인할 수 없어 입력 소유권을 유지했습니다.")??;
@@ -234,7 +251,7 @@ impl ConversationConnection {
             sent.insert(request_id.clone());
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        worker.as_ref().ok_or("대화 화면을 먼저 연결하세요.")?.sender.try_send(Work {request,reply,deadline:Instant::now() + RPC_TIMEOUT})
+        worker.as_ref().ok_or("대화 화면을 먼저 연결하세요.")?.sender.try_send(Work {request,reply,deadline:Instant::now() + RPC_TIMEOUT,send_context})
             .map_err(|error| match error {mpsc::TrySendError::Full(_) => "대화 요청 대기열이 가득 찼습니다. 요청을 보내지 않았습니다.",mpsc::TrySendError::Disconnected(_) => "대화 연결이 끊겼습니다. 전송 결과는 확인되지 않았습니다."})?;
         drop(worker);
         receiver.recv_timeout(RPC_TIMEOUT + Duration::from_secs(2)).map_err(|_| "대화 요청 응답을 확인할 수 없습니다. 요청을 재전송하지 않았습니다.".to_string())?
@@ -274,14 +291,27 @@ fn live(control: &Control, cancelled: &AtomicBool) -> Result<(), String> {
     if control.stopped.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) { Err("대화 연결이 종료되었습니다. 진행 중 요청 결과는 확인되지 않았습니다.".into()) } else { Ok(()) }
 }
 fn call<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, method: &str, params: Value, cancelled: &AtomicBool) -> Result<Value, String> {
-    call_observed(control,rpc,thread_id,method,params,cancelled,false)
+    call_observed(control,rpc,thread_id,method,params,cancelled,false,None)
 }
-fn call_observed<S: Read+Write>(control: &Control,rpc: &mut Rpc<S>,thread_id: &str,method: &str,params: Value,cancelled: &AtomicBool,metadata_only: bool) -> Result<Value,String> {
+fn call_observed<S: Read+Write>(control: &Control,rpc: &mut Rpc<S>,thread_id: &str,method: &str,params: Value,cancelled: &AtomicBool,metadata_only: bool,send_context: Option<(&SendContext,&[Attachment])>) -> Result<Value,String> {
     live(control, cancelled)?;
+    check_cancelled(rpc.cancelled.as_ref())?;
+    if rpc.deadline.is_some_and(|deadline|Instant::now()>=deadline) {return Err("대화 요청 기한이 지나 전송하지 않았습니다.".into());}
     let mutation = matches!(method,"turn/start" | "turn/interrupt");
     let previous_unknown = if mutation {control.unknown.swap(true,Ordering::AcqRel)} else {false};
+    // 입력·작업 상태·큐·취소·기한 검사가 끝난 실제 송신 시도 경계에서만 보존한다.
+    // 이 뒤의 실패는 일부 바이트 송신 가능성이 있어 파일과 결과 불명을 보존한다.
+    if let Some((context,attachments))=send_context {
+        if let Err(error)=context.store.retain_for_send(&context.session_id,&attachments.iter().map(|item|item.path.clone()).collect::<Vec<_>>()) {
+            control.unknown.store(previous_unknown,Ordering::Release);return Err(error);
+        }
+    }
     rpc.next_id += 1; let id = rpc.next_id;
-    rpc.send(json!({"id":id,"method":method,"params":params}))?;
+    // 최종 사전 검사 뒤의 송신 시도다. retain 뒤에 Rpc::send의 사전 검사를
+    // 다시 실행해 확정 미전송 오류로 바꾸지 않는다. 진행 기한 감시자는 이
+    // 경계 뒤의 포화 쓰기·취소를 소유 transport 종료로 해제한다.
+    rpc.ws.send(Message::Text(json!({"id":id,"method":method,"params":params}).to_string().into()))
+        .map_err(|error|format!("대화 {method} 송신 시도에 실패했습니다. 요청 결과는 확인되지 않았습니다: {error}"))?;
     let deadline = rpc.deadline.unwrap_or_else(|| Instant::now()+RPC_TIMEOUT).min(Instant::now()+RPC_TIMEOUT);
     while Instant::now() < deadline {
         live(control, cancelled)?;
@@ -329,7 +359,7 @@ fn serve<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, 
                     ConversationRequest::Attach => Ok(resumed.clone()),
                     request => {
                         rpc.deadline = Some(work.deadline); *deadline.lock().map_err(|_| "대화 요청 기한 상태 오류")? = Some(work.deadline);
-                        let result = execute(control, rpc, thread_id, request, cancelled);
+                        let result = execute_context(control, rpc, thread_id, request, cancelled, work.send_context.as_ref());
                         rpc.deadline = None; *deadline.lock().map_err(|_| "대화 요청 기한 상태 오류")? = None;
                         result
                     },
@@ -381,7 +411,11 @@ fn summarize(value: &mut Value) {
         _ => {},
     }
 }
+#[cfg(test)]
 fn execute<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, request: ConversationRequest, cancelled: &AtomicBool) -> Result<Value, String> {
+    execute_context(control,rpc,thread_id,request,cancelled,None)
+}
+fn execute_context<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, request: ConversationRequest, cancelled: &AtomicBool,send_context: Option<&SendContext>) -> Result<Value, String> {
     match request {
         ConversationRequest::Page {cursor: page_cursor} => { cursor(&page_cursor)?; bounded_page(call(control,rpc,thread_id,"thread/turns/list",json!({"threadId":thread_id,"cursor":page_cursor,"limit":20,"sortDirection":"desc","itemsView":"summary"}),cancelled)?,20) },
         ConversationRequest::Items {turn_id,cursor: page_cursor} => { valid_id(&turn_id)?; cursor(&page_cursor)?; bounded_page(call(control,rpc,thread_id,"thread/items/list",json!({"threadId":thread_id,"turnId":turn_id,"cursor":page_cursor,"limit":20,"sortDirection":"desc"}),cancelled)?,20) },
@@ -416,7 +450,7 @@ fn execute<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str
             let mut params = json!({"threadId":thread_id,"input":input,"clientUserMessageId":request_id});
             if let Some(model) = model { params["model"] = json!(model); }
             if let Some(effort) = effort { params["effort"] = json!(effort); }
-            call(control,rpc,thread_id,"turn/start",params,cancelled)
+            call_observed(control,rpc,thread_id,"turn/start",params,cancelled,false,send_context.map(|context|(context,attachments.as_slice())))
         },
         ConversationRequest::Interrupt {turn_id} => { valid_id(&turn_id)?; call(control,rpc,thread_id,"turn/interrupt",json!({"threadId":thread_id,"turnId":turn_id}),cancelled) },
         ConversationRequest::Respond {request_id,result} => {
@@ -497,7 +531,7 @@ fn validate_response(request: &Value, result: &Value) -> Result<(), String> {
     if result.to_string().len() > 64 * 1024 || !result.is_object() { return Err("서버 요청 응답 형식 또는 크기가 올바르지 않습니다.".into()); }
     match request["method"].as_str() {
         Some("item/commandExecution/requestApproval" | "item/fileChange/requestApproval") => {
-            if result.as_object().is_some_and(|v| v.len() == 1) && matches!(result["decision"].as_str(), Some("accept" | "acceptForSession" | "decline" | "cancel")) { Ok(()) }
+            if result.as_object().is_some_and(|v| v.len() == 1) && result["decision"].as_str().is_some_and(|decision|ConversationConnection::approval_decisions(&request["params"]).contains(&decision)) { Ok(()) }
             else { Err("지원하지 않는 승인 결정입니다. 권한·정책 변경 응답은 보내지 않았습니다.".into()) }
         },
         Some("item/tool/requestUserInput") => {
@@ -572,6 +606,19 @@ mod tests {
         assert!(validate_response(&request,&json!({"decision":{"acceptWithExecpolicyAmendment":{}}})).is_err());
     }
     #[test]
+    fn approval_choices_intersect_advertised_decisions_and_reject_unknown_or_empty_lists() {
+        let params=json!({"availableDecisions":["decline","acceptForSession",{"acceptWithExecpolicyAmendment":{}},"futureDecision"]});
+        assert_eq!(ConversationConnection::approval_decisions(&params),["acceptForSession","decline"]);
+        let request=json!({"method":"item/commandExecution/requestApproval","params":params});
+        assert!(validate_response(&request,&json!({"decision":"accept"})).is_err());
+        assert!(validate_response(&request,&json!({"decision":"decline"})).is_ok());
+        for advertised in [json!([]),Value::Null,json!(["futureDecision"]),json!({"accept":true})] {
+            let params=json!({"availableDecisions":advertised});assert!(ConversationConnection::approval_decisions(&params).is_empty());
+            assert!(validate_response(&json!({"method":"item/commandExecution/requestApproval","params":params}),&json!({"decision":"accept"})).is_err());
+        }
+        assert_eq!(ConversationConnection::approval_decisions(&json!({})),["accept","decline","cancel"]);
+    }
+    #[test]
     fn lost_mutation_reply_blocks_later_send_and_never_replays_the_message() {
         let (control,mut rpc,listener) = fixture();
         let server = thread::spawn(move || {
@@ -634,15 +681,21 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let mut stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let (_peer,_) = listener.accept().unwrap();
+        let (mut peer,_) = listener.accept().unwrap();peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let transport = Arc::new(Mutex::new(Transport{socket:Some(stream.try_clone().unwrap()),proxy:None}));
         let cancelled = Arc::new(AtomicBool::new(false));
         let start = Instant::now();
-        let watch = DeadlineWatch::start(Arc::new(Mutex::new(Some(start+Duration::from_millis(25)))),transport,cancelled.clone(),Arc::new(AtomicBool::new(false))).unwrap();
+        let mut watch = DeadlineWatch::start(Arc::new(Mutex::new(Some(start+Duration::from_millis(25)))),transport,cancelled.clone(),Arc::new(AtomicBool::new(false))).unwrap();
+        // 감시자의 실제 종료를 먼저 회수한다. 스케줄러 지연을 연결 회수 실패로
+        // 해석하지 않고, 이어지는 두 read의 실제 EOF/연결 종료만 판정한다.
+        watch.join.take().unwrap().join().unwrap();
         let result = stream.read(&mut [0u8;1]);
-        assert!(matches!(result,Ok(0)) || result.is_err());
-        assert!(cancelled.load(Ordering::Acquire)); assert!(start.elapsed()<Duration::from_secs(1));
+        let closed=|result:&io::Result<usize>|match result {Ok(0)=>true,Err(error)=>matches!(error.kind(),io::ErrorKind::ConnectionAborted|io::ErrorKind::ConnectionReset),_=>false};
+        assert!(closed(&result),"socket shutdown 대신 시간 초과·무관한 오류가 관측됨: {result:?}");
+        assert!(cancelled.load(Ordering::Acquire));
         drop(watch);
+        let peer_result=peer.read(&mut [0u8;1]);assert!(closed(&peer_result),"상대 연결도 종료되어야 한다: {peer_result:?}");
+        eprintln!("기한 감시 수명 시험: local={result:?}, peer={peer_result:?}, watcherJoined=true, elapsed={:?}",start.elapsed());
     }
     #[test]
     fn pending_approval_survives_event_overflow_and_duplicate_delivery() {
@@ -683,6 +736,23 @@ mod tests {
         control.observer_message("original",json!({"method":"serverRequest/resolved","params":{"threadId":"original","requestId":9}})).unwrap();
         assert!(control.pending_snapshot().unwrap().2.is_empty()); assert!(control.0.events.lock().unwrap().pending.is_empty());
     }
+    #[test]
+    fn pending_metadata_is_current_only_when_the_connection_holding_that_id_is_live() {
+        let (control,_rpc,_listener)=fixture();
+        let request=json!({"id":9,"method":"item/commandExecution/requestApproval","params":{"threadId":"original"}});
+        control.observer_message("original",request.clone()).unwrap();
+        control.0.events.lock().unwrap().observer_connected=true;
+        assert_eq!(control.pending_snapshot().unwrap().2[0]["metadataAvailable"],true);
+        {let mut events=control.0.events.lock().unwrap();events.observer_connected=false;events.connected=true;}
+        assert_eq!(control.pending_snapshot().unwrap().2[0]["metadataAvailable"],false,"관계없는 살아 있는 GUI 연결이 과거 관측을 확정하면 안 된다");
+        observe_message(&control.0,"original",request).unwrap();
+        let snapshot=control.pending_snapshot().unwrap().2;assert_eq!(snapshot.len(),1);assert_eq!(snapshot[0]["metadataAvailable"],true);assert_eq!(snapshot[0]["guiOwned"],true);
+        {let mut events=control.0.events.lock().unwrap();events.connected=false;events.observer_connected=true;events.pending.get_mut("9").unwrap()["responded"]=json!(true);}
+        let snapshot=control.pending_snapshot().unwrap().2;assert_eq!(snapshot[0]["metadataAvailable"],true);assert_eq!(snapshot[0]["responded"],true);
+        control.0.events.lock().unwrap().observed_pending.clear();
+        assert_eq!(control.pending_snapshot().unwrap().2[0]["metadataAvailable"],false);
+        assert_eq!(control.pending_snapshot().unwrap().2.len(),1,"관측 단절은 서버 해결 확인이 아니므로 요청을 제거하면 안 된다");
+    }
     fn install_finished_worker(control: &ConversationConnection) {
         let (sender,receiver)=mpsc::sync_channel(1);drop(receiver);
         let join=thread::spawn(||()); let deadline=Instant::now()+Duration::from_secs(2);
@@ -715,5 +785,73 @@ mod tests {
         *control.0.input.lock().unwrap()=true;control.0.owned.store(true,Ordering::Release);
         assert!(!control.release(true).unwrap());assert!(control.0.owned.load(Ordering::Acquire));assert!(control.terminal_write(||Ok(1)).is_err());
         control.cancel();assert!(control.0.worker.lock().unwrap().is_none());
+    }
+    #[cfg(windows)]
+    fn staged_send_fixture() -> (SendContext,Attachment,PathBuf) {
+        let root=std::env::temp_dir().join(format!("opendiy-send-retention-test-{}",Uuid::new_v4()));
+        let store=crate::conversation_attachments::ConversationAttachments::test_store(root.clone());
+        let session_id=Uuid::new_v4().to_string();
+        let staged=store.stage_image(&session_id,"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
+        (SendContext{session_id,store},Attachment{r#type:"localImage".into(),path:staged.path},root)
+    }
+    #[cfg(windows)]
+    fn remove_staged_send_fixture(context: SendContext,attachment: Attachment,root: PathBuf) {
+        context.store.cleanup_all().unwrap();let path=PathBuf::from(&attachment.path);let directory=path.parent().unwrap().to_owned();
+        assert!(path.starts_with(&root)&&directory.starts_with(&root));drop(context);
+        if path.exists(){std::fs::remove_file(path).unwrap();}if directory.exists(){std::fs::remove_dir(directory).unwrap();}
+        std::fs::remove_file(root.join(".staging.lock")).unwrap();std::fs::remove_dir(root).unwrap();
+    }
+    #[cfg(windows)]
+    #[test]
+    fn known_pre_send_rejections_leave_staged_images_removable() {
+        for reason in ["noWorker","fullQueue","unknown","invalidInput","notIdle","expired","cancelled"] {
+            let (context,attachment,root)=staged_send_fixture();let (control,mut rpc,listener)=fixture();
+            let request=ConversationRequest::Send{request_id:Uuid::new_v4().to_string(),text:"hello".into(),attachments:vec![Attachment{r#type:if reason=="invalidInput" {"unsupported".into()} else {"localImage".into()},path:attachment.path.clone()}],model:None,effort:None};
+            let result=match reason {
+                "noWorker"=>control.request_for_session("original",Path::new("."),request,&context.session_id,context.store.clone()),
+                "fullQueue"=>{
+                    let (sender,receiver)=mpsc::sync_channel(1);let (reply,_reply_rx)=mpsc::sync_channel(1);
+                    sender.try_send(Work{request:ConversationRequest::Poll,reply,deadline:Instant::now()+RPC_TIMEOUT,send_context:None}).ok().unwrap();
+                    let cancelled=Arc::new(AtomicBool::new(false));let running=cancelled.clone();
+                    let join=thread::spawn(move||{while !running.load(Ordering::Acquire){thread::sleep(Duration::from_millis(1));}drop(receiver);});
+                    *control.0.worker.lock().unwrap()=Some(Worker{sender,cancelled,transport:Arc::new(Mutex::new(Transport::default())),join:Some(join),joined:false});
+                    control.request_for_session("original",Path::new("."),request,&context.session_id,context.store.clone())
+                },
+                "notIdle"=>{
+                    let server=thread::spawn(move||{let(stream,_)=listener.accept().unwrap();let mut socket=WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);let request=read_request(&mut socket);assert_eq!(request["method"],"thread/read");reply(&mut socket,&request,json!({"thread":{"id":"original","status":{"type":"active"}}}));});
+                    let result=execute_context(&control.0,&mut rpc,"original",request,&AtomicBool::new(false),Some(&context));server.join().unwrap();result
+                },
+                _=>{
+                    if reason=="unknown" {control.0.unknown.store(true,Ordering::Release);}
+                    if reason=="expired" {rpc.deadline=Some(Instant::now()-Duration::from_millis(1));}
+                    if reason=="cancelled" {rpc.cancelled=Some(Arc::new(AtomicBool::new(true)));}
+                    execute_context(&control.0,&mut rpc,"original",request,&AtomicBool::new(false),Some(&context))
+                },
+            };
+            assert!(result.is_err(),"{reason}이 송신 경계에 도달하면 안 된다");
+            assert_eq!(control.0.unknown.load(Ordering::Acquire),reason=="unknown","{reason}에서 기존 불명 상태를 훼손하거나 미전송을 불명으로 바꾸면 안 된다");
+            context.store.cleanup_staged(&context.session_id,&attachment.path).unwrap();assert!(!Path::new(&attachment.path).exists(),"{reason}에서 미전송 이미지를 보존 처리하면 안 된다");
+            control.cancel();drop(rpc);remove_staged_send_fixture(context,attachment,root);
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn actual_send_attempts_retain_images_on_acknowledgement_and_lost_reply() {
+        for acknowledge in [true,false] {
+            let (context,attachment,root)=staged_send_fixture();let (control,mut rpc,listener)=fixture();
+            let expected_path=attachment.path.clone();let store=context.store.clone();let session_id=context.session_id.clone();
+            let server=thread::spawn(move||{
+                let(stream,_)=listener.accept().unwrap();let mut socket=WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);
+                let state=read_request(&mut socket);reply(&mut socket,&state,json!({"thread":{"id":"original","status":{"type":"idle"}}}));
+                let send=read_request(&mut socket);assert_eq!(send["method"],"turn/start");assert_eq!(send["params"]["input"][0]["path"],expected_path);
+                assert!(store.cleanup_staged(&session_id,&expected_path).is_err(),"송신 바이트 관측 시에는 원문이 보존되어야 한다");
+                if acknowledge {reply(&mut socket,&send,json!({"turn":{"id":"original-turn"}}));}1
+            });
+            let request=ConversationRequest::Send{request_id:Uuid::new_v4().to_string(),text:String::new(),attachments:vec![Attachment{r#type:"localImage".into(),path:attachment.path.clone()}],model:None,effort:None};
+            let result=execute_context(&control.0,&mut rpc,"original",request,&AtomicBool::new(false),Some(&context));
+            assert_eq!(result.is_ok(),acknowledge);assert_eq!(control.0.unknown.load(Ordering::Acquire),!acknowledge);assert_eq!(server.join().unwrap(),1);
+            assert!(context.store.cleanup_staged(&context.session_id,&attachment.path).is_err());context.store.cleanup_session(&context.session_id).unwrap();assert!(Path::new(&attachment.path).is_file());
+            drop(rpc);remove_staged_send_fixture(context,attachment,root);
+        }
     }
 }

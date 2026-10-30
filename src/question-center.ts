@@ -4,7 +4,7 @@ import './question-center.css';
 export interface PendingQuestion {
   id: string; sessionId: string; threadId?: string | null; generation: number; requestId?: string;
   kind: 'question' | 'approval' | 'unsupported'; title?: string; message?: string; sessionTitle?: string;
-  canRespond: boolean; responded?: boolean;
+  canRespond: boolean; responded?: boolean; metadataAvailable?: boolean;
   questions?: { id: string; header?: string; question: string; options?: { label: string; description?: string }[] | null; isOther?: boolean; isSecret?: boolean }[];
   approval?: { options: { id: string; label: string }[] };
 }
@@ -59,13 +59,14 @@ export function createQuestionCenter(host: QuestionCenterHost) {
     if (disposed) return;
     const count = items.filter(item => item.kind !== 'unsupported').length;
     const unavailable = items.filter(item => item.kind === 'unsupported').length;
+    const stale = items.some(item => item.metadataAvailable === false);
     const label = t(`질문함 · 미응답 ${count}건`, `Questions · ${count} unanswered`);
-    button.setAttribute('aria-label', label); button.title = label;
+    button.setAttribute('aria-label', label); button.title = label + (stale ? t(' · 마지막 확인 목록 포함', ' · Includes last confirmed requests') : '');
     button.setAttribute('aria-haspopup', 'dialog'); button.setAttribute('aria-controls', element.id);
     badge.textContent = String(count); badge.hidden = !count;
     element.querySelector('h2')!.textContent = t('질문함', 'Questions');
     element.querySelector('.question-close')!.setAttribute('aria-label', t('질문함 닫기', 'Close questions'));
-    element.querySelector('.question-summary')!.textContent = t(`미응답 ${count}건`, `${count} unanswered`) + (unavailable ? t(` · 확인 필요 세션 ${unavailable}개`, ` · ${unavailable} sessions need checking`) : '');
+    element.querySelector('.question-summary')!.textContent = t(`미응답 ${count}건`, `${count} unanswered`) + (unavailable ? t(` · 확인 필요 세션 ${unavailable}개`, ` · ${unavailable} sessions need checking`) : '') + (stale ? t(' · 마지막 확인 목록 포함', ' · Includes last confirmed requests') : '');
     element.querySelector('.question-list-status')!.textContent = error ? t(`조회 실패 · 이전 목록을 유지합니다. ${error}`, `Could not refresh · Previous list preserved. ${error}`) : !items.length ? t('미응답 질문이 없습니다.', 'No unanswered questions.') : '';
     const remaining = new Set(items.map(key));
     for (const [id, row] of rows) if (!remaining.has(id)) { row.node.remove(); rows.delete(id); drafts.delete(id); }
@@ -89,6 +90,10 @@ export function createQuestionCenter(host: QuestionCenterHost) {
     const kind = text('span', item.kind === 'approval' ? t('승인 요청', 'Approval request') : item.kind === 'unsupported' ? t('세션 확인 필요', 'Check session') : t('질문', 'Question')); kind.className = 'question-kind';
     row.append(kind, heading, session);
     if (item.message && item.kind !== 'unsupported') row.append(text('p', item.message));
+    if (item.metadataAvailable === false) {
+      const notice = text('p', t('연결이 끊겨 마지막 확인 내용을 표시합니다. 원래 세션에서 상태를 확인하세요.', 'Connection lost. Showing the last confirmed details. Check the status in the original session.'));
+      notice.className = 'question-metadata-status'; notice.setAttribute('role', 'status'); row.append(notice);
+    }
     const locked = !item.canRespond || !item.requestId || !!item.responded || !!draft.phase || exiting;
     const form = document.createElement('form');
     if (item.kind === 'question') for (const [questionIndex, question] of (item.questions ?? []).entries()) {

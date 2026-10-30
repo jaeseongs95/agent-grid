@@ -614,8 +614,8 @@ impl Engine {
         self.with_extension_operation(|exe, permit| codex::extensions_mutate_with_executable(exe, cwd, request, permit))
     }
 
-    pub fn weekly_usage(&self) -> Result<codex::WeeklyUsageSnapshot, String> {
-        self.with_extension_operation(|exe, _permit| codex::weekly_usage_with_executable(exe))
+    pub fn weekly_usage(&self, manual: bool) -> Result<codex::WeeklyUsageSnapshot, String> {
+        self.with_extension_operation(|exe, _permit| codex::weekly_usage_with_executable(exe, manual))
     }
 
     pub fn mobile_control(&self, id: &str, generation: u64, action: codex::MobileAction) -> Result<codex::MobileReply, String> {
@@ -643,10 +643,7 @@ impl Engine {
         let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone().ok_or("session process is unavailable")?;
         let connection = process.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().and_then(CodexSession::conversation_connection).ok_or("이 세션은 구조화 대화 연결을 지원하지 않습니다.")?;
         drop(process);
-        if let codex::ConversationRequest::Send {attachments,..} = &request {
-            self.inner.attachments.retain_for_send(id,&attachments.iter().map(|item|item.path.clone()).collect::<Vec<_>>())?;
-        }
-        connection.request(&thread_id, Path::new(&info.cwd), request)
+        connection.request_for_session(&thread_id, Path::new(&info.cwd), request,id,self.inner.attachments.clone())
     }
 
     pub fn conversation_attachments(&self) -> crate::conversation_attachments::ConversationAttachments { self.inner.attachments.clone() }
@@ -682,7 +679,11 @@ impl Engine {
                 let mut item = serde_json::json!({"id":format!("{}:{}:{}:{}",info.id,info.thread_id.as_deref().unwrap_or(""),info.generation,request_id),"threadId":info.thread_id,"sessionId":info.id,"generation":info.generation,"requestId":request_id,"kind":kind,"sessionTitle":info.title,"title":if kind=="question" {"사용자 답변 대기"} else if kind=="approval" {"사용자 승인 대기"} else {"터미널에서 확인할 요청"},"message":request["params"]["reason"].as_str().or_else(||request["params"]["command"].as_str()).unwrap_or(""),"canRespond":owned&&connected&&request["guiOwned"]==true&&kind!="unsupported"&&request["responded"]!=true,"responded":request["responded"]==true});
                 if kind=="question" {item["questions"]=request["params"]["questions"].clone();}
                 item["metadataAvailable"]=request["metadataAvailable"].clone();
-                if kind=="approval" {item["approval"]=serde_json::json!({"options":[{"id":"accept","label":"승인"},{"id":"decline","label":"거절"},{"id":"cancel","label":"취소"}]});}
+                if kind=="approval" {
+                    let options=codex::ConversationConnection::approval_decisions(&request["params"]).into_iter().map(|decision|serde_json::json!({"id":decision,"label":match decision {"accept"=>"승인","acceptForSession"=>"세션 동안 승인","decline"=>"거절",_=>"취소"}})).collect::<Vec<_>>();
+                    if options.is_empty() {item["canRespond"]=serde_json::json!(false);}
+                    item["approval"]=serde_json::json!({"options":options});
+                }
                 items.push(item);
             }
             if pending.is_empty() && info.active && info.state=="waiting" {

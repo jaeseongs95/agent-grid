@@ -12,6 +12,7 @@ export interface ConversationOptions {
 interface Attachment { type: 'localImage' | 'file'; path: string; name?: string }
 interface RuntimeEvent { seq: number; method: string; params: Json; requestId?: string; responded?: boolean }
 interface Entry { id: string; role: string; text: string; status?: string; detail?: boolean }
+interface QuestionDraft { value: string; other?: string }
 const MAX_VISIBLE_ITEMS = 100;
 const MAX_ATTACHMENTS = 12;
 const PREVIEW_CHARACTERS = 16 * 1024;
@@ -56,7 +57,7 @@ export function createConversation(options: ConversationOptions) {
   let attachments: Attachment[] = []; let pendingRequests: RuntimeEvent[] = [];
   const stagedPaths = new Set<string>();
   const responding = new Set<string>();
-  const questionDrafts = new Map<string, Map<string, string>>();
+  const questionDrafts = new Map<string, Map<string, QuestionDraft>>();
   let lastSeq = 0; let modelKnown = false; let currentModel = ''; let currentEffort = '';
   let requestSignature = '';
   const rpc = <T = Json>(request: Json) => options.call<T>('conversation_request', { id: options.sessionId, generation: options.generation, request });
@@ -205,7 +206,17 @@ export function createConversation(options: ConversationOptions) {
     try {
       const value = await rpc({ type: 'items', turnId, ...(cursor ? { cursor } : {}) });
       if (!alive(version) || !foreground || content !== contentVersion || selectedTurn !== turnId) return;
-      const data: Json[] = value.data ?? value.items ?? []; items = data.map(itemEntry).reverse(); nextItems = string(value.nextCursor); renderItems();
+      if (!Array.isArray(value.data)) throw new Error(t('대화 이력 목록 형식이 올바르지 않습니다.', 'Invalid conversation history list.'));
+      const ids = new Set<string>();
+      const data = value.data.map((entry: Json) => {
+        if (!entry || entry.turnId !== turnId) throw new Error(t('다른 대화 구간의 이력 항목을 거부했습니다.', 'Rejected an item from another conversation turn.'));
+        const item = entry.item;
+        if (!item || typeof item !== 'object' || Array.isArray(item) || !string(item.type)) throw new Error(t('대화 이력 항목 형식이 올바르지 않습니다.', 'Invalid conversation history item.'));
+        const id = string(item.id);
+        if (!id || id.length > 256 || /[\u0000-\u001f\u007f-\u009f]/.test(id) || ids.has(id)) throw new Error(t('대화 이력 항목 식별자가 없거나 올바르지 않습니다.', 'Missing or invalid conversation history item ID.'));
+        ids.add(id); return itemEntry(item);
+      });
+      items = data.reverse(); nextItems = string(value.nextCursor); renderItems();
     } catch (error) { if (alive(version) && content === contentVersion) failure(error); }
     finally { if (alive(version) && content === contentVersion) { loading = false; updateControls(); } }
   }
@@ -238,17 +249,19 @@ export function createConversation(options: ConversationOptions) {
       const id = event.requestId;
       if (!id) { const reason = document.createElement('p'); bindText(reason, '요청 식별자를 확인하지 못해 응답할 수 없습니다.', 'Cannot respond without a verified request ID.'); panel.append(reason); requests.append(panel); continue; }
       if (event.method.endsWith('/requestApproval')) {
-        const choices = Array.isArray(event.params.availableDecisions) ? event.params.availableDecisions : ['accept', 'decline', 'cancel'];
+        const advertised = event.params.availableDecisions;
+        const choices = !Object.prototype.hasOwnProperty.call(event.params, 'availableDecisions') ? ['accept', 'decline', 'cancel']
+          : Array.isArray(advertised) ? ['accept', 'acceptForSession', 'decline', 'cancel'].filter(value => advertised.includes(value)) : [];
         for (const choice of choices) {
-          const value = typeof choice === 'string' ? choice : choice;
           const action = document.createElement('button'); action.type = 'button'; action.className = 'quiet-button';
           const labels: Record<string, string> = { accept: t('이번만 승인', 'Approve once'), acceptForSession: t('세션 동안 승인', 'Approve for session'), decline: t('거절', 'Decline'), cancel: t('취소', 'Cancel') };
-          action.textContent = typeof choice === 'string' ? labels[choice] ?? choice : JSON.stringify(choice);
-          action.onclick = () => void respond(id, { decision: value }, panel); panel.append(action);
+          action.textContent = labels[choice];
+          action.onclick = () => void respond(id, { decision: choice }, panel); panel.append(action);
         }
+        if (!choices.length) { const reason = document.createElement('p'); bindText(reason, '지원되는 승인 선택지가 없어 응답할 수 없습니다.', 'No supported approval choices are available.'); panel.append(reason); }
       } else if (event.method === 'item/tool/requestUserInput') {
-        const form = document.createElement('form'); const answerInputs = new Map<string, HTMLInputElement | HTMLSelectElement>();
-        const draft = questionDrafts.get(id) ?? new Map<string, string>(); questionDrafts.set(id, draft);
+        const form = document.createElement('form'); const answerInputs = new Map<string, () => string>();
+        const draft = questionDrafts.get(id) ?? new Map<string, QuestionDraft>(); questionDrafts.set(id, draft);
         for (const question of event.params.questions ?? []) {
           const label = document.createElement('label'); label.textContent = string(question.question ?? question.header);
           let control: HTMLInputElement | HTMLSelectElement;
@@ -256,12 +269,22 @@ export function createConversation(options: ConversationOptions) {
             control = document.createElement('select'); option(control, '', t('선택하세요', 'Choose an answer'));
             for (const value of question.options) option(control, string(value.label), `${string(value.label)}${value.description ? ` — ${value.description}` : ''}`);
           } else { control = document.createElement('input'); control.type = question.isSecret ? 'password' : 'text'; control.maxLength = 8192; }
-          const questionId = string(question.id); control.value = draft.get(questionId) ?? '';
-          control.oninput = () => draft.set(questionId, control.value); control.onchange = () => draft.set(questionId, control.value);
-          control.required = true; control.setAttribute('aria-label', label.textContent); answerInputs.set(questionId, control); label.append(control); form.append(label);
+          const questionId = string(question.id); const answer = draft.get(questionId) ?? { value: '' }; draft.set(questionId, answer); control.value = answer.value;
+          control.oninput = () => { answer.value = control.value; }; control.onchange = () => { answer.value = control.value; };
+          control.required = true; control.setAttribute('aria-label', label.textContent); answerInputs.set(questionId, () => control.value); label.append(control);
+          if (question.isOther && control instanceof HTMLSelectElement) {
+            let otherValue = '__other__'; while ([...control.options].some(value => value.value === otherValue)) otherValue += '_';
+            option(control, otherValue, t('직접 입력', 'Write an answer')); control.value = answer.value;
+            const other = document.createElement('input'); other.type = question.isSecret ? 'password' : 'text'; other.maxLength = 8192; other.autocomplete = 'off'; other.value = answer.other ?? '';
+            other.setAttribute('aria-label', `${string(question.question ?? question.header)} · ${t('직접 입력', 'Write an answer')}`);
+            const selectAnswer = () => { answer.value = control.value; other.hidden = control.value !== otherValue; other.disabled = other.hidden; other.required = !other.hidden; };
+            control.onchange = selectAnswer; selectAnswer(); other.oninput = () => { answer.other = other.value; };
+            answerInputs.set(questionId, () => control.value === otherValue ? other.value : control.value); label.append(other);
+          }
+          form.append(label);
         }
         const submit = document.createElement('button'); submit.type = 'submit'; submit.className = 'primary-button'; bindText(submit, '답변 보내기', 'Send answers'); form.append(submit);
-        form.onsubmit = event => { event.preventDefault(); const answers = Object.fromEntries([...answerInputs].map(([key, value]) => [key, { answers: [value.value] }])); void respond(id, { answers }, panel); }; panel.append(form);
+        form.onsubmit = event => { event.preventDefault(); const answers = Object.fromEntries([...answerInputs].map(([key, value]) => [key, { answers: [value()] }])); void respond(id, { answers }, panel); }; panel.append(form);
       } else { const reason = document.createElement('p'); bindText(reason, '이 요청 형식은 지원하지 않아 자동 응답하지 않습니다. 터미널 보기에서 확인하세요.', 'This request type is unsupported and will not be answered automatically. Check terminal view.'); panel.append(reason); }
       if (event.responded || responding.has(id)) { panel.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement>('button,input,select').forEach(control => { control.disabled = true; }); const waiting = document.createElement('small'); bindText(waiting, '응답을 보냈습니다. 서버의 처리 확인을 기다립니다.', 'Response sent. Waiting for server confirmation.'); panel.append(waiting); }
       requests.append(panel);

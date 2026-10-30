@@ -134,3 +134,23 @@ test('최초 숨김은 조회하지 않고 종료는 진행 응답을 기다린�
   await page.evaluate(() => (window as any).questionFixture.widget.cancelExit()); await expect.poll(() => polls(page)).toBe(2);
   await expect(page.locator('#question-count')).toHaveText('1'); expect(await responses(page)).toHaveLength(1);
 });
+
+test('끊긴 연결의 마지막 확인 목록은 건수를 유지하고 재연결하면 경고만 해제한다', async ({ page }) => {
+  await fixture(page, [{ ...approval, metadataAvailable: false, canRespond: false }]); await open(page);
+  await expect(page.locator('#question-count')).toHaveText('1');
+  await expect(page.locator('.question-summary')).toHaveText('미응답 1건 · 마지막 확인 목록 포함');
+  await expect(page.locator('.question-center-button')).toHaveAttribute('title', /마지막 확인 목록 포함/);
+  await expect(page.locator('.question-metadata-status')).toHaveText('연결이 끊겨 마지막 확인 내용을 표시합니다. 원래 세션에서 상태를 확인하세요.');
+  await expect(page.getByRole('button', { name: '이번만 승인' })).toBeDisabled();
+  await page.evaluate(() => (window as any).questionFixture.setLanguage('en'));
+  await expect(page.locator('.question-metadata-status')).toContainText('Connection lost. Showing the last confirmed details.');
+  await expect(page.locator('.question-center-button')).toHaveAttribute('title', /Includes last confirmed requests/);
+  await page.evaluate(() => { const f = (window as any).questionFixture; f.items[0].metadataAvailable = true; f.items[0].canRespond = true; });
+  await page.clock.runFor(3_000);
+  await expect(page.locator('#question-count')).toHaveText('1');
+  await expect(page.locator('.question-summary')).toHaveText('1 unanswered');
+  await expect(page.locator('.question-metadata-status')).toHaveCount(0);
+  await expect(page.locator('.question-center-button')).not.toHaveAttribute('title', /Includes last confirmed requests/);
+  await expect(page.getByRole('button', { name: '이번만 승인' })).toBeEnabled();
+  expect(await responses(page)).toHaveLength(0);
+});
