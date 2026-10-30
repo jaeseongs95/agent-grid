@@ -55,6 +55,19 @@ struct Worker {
     cancelled: Arc<AtomicBool>,
     transport: Arc<Mutex<Transport>>,
     join: Option<JoinHandle<()>>,
+    joined: bool,
+}
+impl Worker {
+    fn stop(&mut self) -> Result<(),String> {
+        if self.joined {return Ok(());}
+        self.cancelled.store(true,Ordering::Release);
+        let transport=self.transport.lock().map_err(|_| "대화 연결 정리 상태 오류")?;
+        if let Some(socket)=&transport.socket {let _=socket.shutdown(Shutdown::Both);}
+        if let Some(job)=transport.proxy.as_ref().and_then(Weak::upgrade) {let _=job.terminate();}
+        drop(transport);
+        self.join.take().ok_or("대화 작업자의 종료 결과를 다시 확인할 수 없습니다.")?.join().map_err(|_| "대화 작업자가 비정상 종료되었습니다.".to_owned())?;
+        self.joined=true;Ok(())
+    }
 }
 #[derive(Default)]
 struct Transport { socket: Option<TcpStream>, proxy: Option<Weak<ProcessJob>> }
@@ -142,17 +155,29 @@ impl ConversationConnection {
         let mut slot = self.0.worker.lock().unwrap_or_else(|e| e.into_inner());
         let worker = slot.take();
         if let Some(mut worker) = worker {
-            worker.cancelled.store(true, Ordering::Release);
-            let transport = worker.transport.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(socket) = &transport.socket { let _ = socket.shutdown(Shutdown::Both); }
-            if let Some(job) = transport.proxy.as_ref().and_then(Weak::upgrade) { let _ = job.terminate(); }
-            drop(transport);
-            drop(worker.sender);
-            if let Some(join) = worker.join.take() { let _ = join.join(); }
+            if let Err(error)=worker.stop() {self.0.events.lock().unwrap_or_else(|e|e.into_inner()).error=Some(error);}
         }
         *self.0.input.lock().unwrap_or_else(|e| e.into_inner()) = false;
         self.0.owned.store(false,Ordering::Release);
         self.0.detail.lock().unwrap_or_else(|e|e.into_inner()).take();
+    }
+    fn release(&self,finished_only: bool) -> Result<bool,String> {
+        let mut slot=self.0.worker.lock().map_err(|_| "대화 연결 상태 오류")?;
+        let Some(worker)=slot.as_mut() else {return if self.0.owned.load(Ordering::Acquire) {Err("대화 입력 소유권의 종료 근거가 없습니다.".into())} else {Ok(true)};};
+        if finished_only && !worker.joined && !worker.join.as_ref().is_some_and(JoinHandle::is_finished) {return Ok(false);}
+        // worker의 종료 콜백도 events를 잠그므로 join 중에는 events/input을 잡지 않는다.
+        worker.stop()?;
+        let events=self.0.events.lock().map_err(|_| "대화 승인 상태 오류")?;
+        if !events.pending.is_empty() || !events.observed_pending.is_empty() || self.0.unknown.load(Ordering::Acquire) {
+            return Err("미확인 요청 또는 승인 대기가 남아 대화 입력 소유권을 유지했습니다.".into());
+        }
+        // 관측자는 이 잠금 해제 뒤 도착한 새 요청만 보관한다. 이 지점에 두 연결의
+        // pending이 모두 없고 worker join이 확인된 경우에만 터미널 입력을 연다.
+        *self.0.input.lock().map_err(|_| "대화 입력 소유 상태 오류")?=false;
+        self.0.owned.store(false,Ordering::Release);
+        slot.take();
+        self.0.detail.lock().map_err(|_| "대화 상세 스냅샷 상태 오류")?.take();
+        Ok(true)
     }
     pub(crate) fn request(&self, thread_id: &str, cwd: &Path, request: ConversationRequest) -> Result<Value, String> {
         validate_request(&request)?;
@@ -163,6 +188,7 @@ impl ConversationConnection {
         // 해제도 같은 단일 작업자의 요청으로 직렬화한다. 승인/결과 불명 상태에서는
         // 연결과 입력 소유권을 보존해 터미널의 두 번째 응답을 막는다.
         if matches!(request, ConversationRequest::Detach) {
+            if self.release(true)? {return Ok(json!({}));}
             let (reply, receiver) = mpsc::sync_channel(1);
             {
                 let worker = self.0.worker.lock().map_err(|_| "대화 연결 상태 오류")?;
@@ -171,7 +197,8 @@ impl ConversationConnection {
                 } else { return Ok(json!({})); }
             }
             let result = receiver.recv_timeout(RPC_TIMEOUT+Duration::from_secs(2)).map_err(|_| "대화 해제 결과를 확인할 수 없어 입력 소유권을 유지했습니다.")??;
-            self.cancel(); return Ok(result);
+            if !self.release(false)? {return Err("대화 입력 소유권의 해제를 확인할 수 없습니다.".into());}
+            return Ok(result);
         }
         if self.0.stopped.load(Ordering::Acquire) { return Err("대화 세션이 종료되었습니다.".into()); }
         let mut worker = self.0.worker.lock().map_err(|_| "대화 연결 상태를 확인할 수 없습니다.")?;
@@ -196,7 +223,7 @@ impl ConversationConnection {
                 events.connected = false;
                 if let Err(error) = result { events.error = Some(error); }
             }) { Ok(join) => join, Err(error) => { *self.0.input.lock().unwrap_or_else(|e| e.into_inner()) = false; self.0.owned.store(false,Ordering::Release); return Err(format!("대화 연결 작업자를 시작할 수 없습니다: {error}")); } };
-            *worker = Some(Worker {sender,cancelled,transport,join:Some(join)});
+            *worker = Some(Worker {sender,cancelled,transport,join:Some(join),joined:false});
         }
         if let ConversationRequest::Send {request_id,..} = &request {
             Uuid::parse_str(request_id).map_err(|_| "전송 식별자는 UUID여야 합니다.")?;
@@ -291,7 +318,7 @@ fn serve<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, 
             Ok(work) => {
                 if Instant::now() >= work.deadline { let _ = work.reply.send(Err("대기 중 대화 요청의 기한이 지나 전송하지 않았습니다.".into())); continue; }
                 if matches!(work.request,ConversationRequest::Detach) {
-                    let pending = !control.events.lock().map_err(|_| "대화 승인 상태 오류")?.pending.is_empty();
+                    let pending = {let events=control.events.lock().map_err(|_| "대화 승인 상태 오류")?;!events.pending.is_empty()||!events.observed_pending.is_empty()};
                     if pending || control.unknown.load(Ordering::Acquire) {
                         let _ = work.reply.send(Err("승인 대기 또는 결과 불명 요청이 있어 대화 입력 소유권을 유지했습니다. 현재 화면에서 요청을 처리하세요.".into()));
                         continue;
@@ -655,5 +682,38 @@ mod tests {
         let (_,_,pending)=control.pending_snapshot().unwrap(); assert_eq!(pending.len(),1); assert_eq!(pending[0]["guiOwned"],true);
         control.observer_message("original",json!({"method":"serverRequest/resolved","params":{"threadId":"original","requestId":9}})).unwrap();
         assert!(control.pending_snapshot().unwrap().2.is_empty()); assert!(control.0.events.lock().unwrap().pending.is_empty());
+    }
+    fn install_finished_worker(control: &ConversationConnection) {
+        let (sender,receiver)=mpsc::sync_channel(1);drop(receiver);
+        let join=thread::spawn(||()); let deadline=Instant::now()+Duration::from_secs(2);
+        while !join.is_finished() && Instant::now()<deadline {thread::yield_now();}
+        assert!(join.is_finished());
+        *control.0.worker.lock().unwrap()=Some(Worker{sender,cancelled:Arc::new(AtomicBool::new(false)),transport:Arc::new(Mutex::new(Transport::default())),join:Some(join),joined:false});
+        *control.0.input.lock().unwrap()=true;control.0.owned.store(true,Ordering::Release);
+    }
+    #[test]
+    fn failed_attach_releases_input_only_after_a_finished_worker_joins_with_no_pending() {
+        let (control,_rpc,_listener)=fixture();install_finished_worker(&control);
+        control.request("original",Path::new("."),ConversationRequest::Detach).unwrap();
+        assert!(!control.0.owned.load(Ordering::Acquire));assert!(control.0.worker.lock().unwrap().is_none());assert_eq!(control.terminal_write(||Ok(1)).unwrap(),1);
+        for source in ["gui","observer","unknown"] {
+            let (control,_rpc,_listener)=fixture();install_finished_worker(&control);
+            let request=json!({"id":9,"method":"item/commandExecution/requestApproval","params":{"threadId":"original"}});
+            match source {"gui"=>observe_message(&control.0,"original",request).unwrap(),"observer"=>control.observer_message("original",request).unwrap(),_=>control.0.unknown.store(true,Ordering::Release)}
+            assert!(control.request("original",Path::new("."),ConversationRequest::Detach).is_err());assert!(control.0.owned.load(Ordering::Acquire));assert!(control.terminal_write(||Ok(1)).is_err());
+            control.observer_message("original",json!({"method":"serverRequest/resolved","params":{"threadId":"original","requestId":9}})).unwrap();
+            if source!="unknown" {control.request("original",Path::new("."),ConversationRequest::Detach).unwrap();assert!(!control.0.owned.load(Ordering::Acquire));}
+            control.cancel();
+        }
+    }
+    #[test]
+    fn a_delayed_worker_is_not_treated_as_a_failed_attach() {
+        let (control,_rpc,_listener)=fixture();let (sender,receiver)=mpsc::sync_channel(1);drop(receiver);
+        let cancelled=Arc::new(AtomicBool::new(false));let running=cancelled.clone();
+        let join=thread::spawn(move||while !running.load(Ordering::Acquire){thread::sleep(Duration::from_millis(1));});
+        *control.0.worker.lock().unwrap()=Some(Worker{sender,cancelled,transport:Arc::new(Mutex::new(Transport::default())),join:Some(join),joined:false});
+        *control.0.input.lock().unwrap()=true;control.0.owned.store(true,Ordering::Release);
+        assert!(!control.release(true).unwrap());assert!(control.0.owned.load(Ordering::Acquire));assert!(control.terminal_write(||Ok(1)).is_err());
+        control.cancel();assert!(control.0.worker.lock().unwrap().is_none());
     }
 }
