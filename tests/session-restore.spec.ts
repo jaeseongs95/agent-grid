@@ -3,7 +3,7 @@ import { test, expect, type Page } from '@playwright/test';
 const a = { title: '복원 첫째', cwd: 'D:\\work', threadId: 'thread-a', sessionId: 'old-a', resumeOnStartup: true };
 const b = { title: '복원 둘째', cwd: 'D:\\work', threadId: 'thread-b', sessionId: 'old-b', resumeOnStartup: true };
 
-async function workspace(page: Page, options: { sessions?: any[]; holdFirst?: boolean; holdSecond?: boolean; holdLayout?: boolean; holdStop?: boolean; cancelStartOnStop?: boolean; lateSuccess?: boolean; project?: boolean; failFirst?: boolean; failActive?: boolean; live?: boolean; failSave?: boolean; failExit?: boolean } = {}) {
+async function workspace(page: Page, options: { sessions?: any[]; holdFirst?: boolean; holdSecond?: boolean; holdLayout?: boolean; holdStop?: boolean; holdError?: boolean; holdReconcile?: boolean; cancelStartOnStop?: boolean; lateSuccess?: boolean; project?: boolean; failFirst?: boolean; failActive?: boolean; live?: boolean; failSave?: boolean; failExit?: boolean } = {}) {
   await page.addInitScript(({ options, a, b }) => {
     const state = window as any; state.isTauri = true;
     let callback = 0;
@@ -11,7 +11,7 @@ async function workspace(page: Page, options: { sessions?: any[]; holdFirst?: bo
     const listeners = new Map<string, (value: any) => void>();
     const live = options.live ? [{ ...a, id: a.sessionId, generation: 1, state: 'idle', active: true }] : [];
     const projects = JSON.parse(localStorage.getItem('restore-test-projects') || 'null') || (options.project ? [{ id: 'p', name: '복원 프로젝트', cwd: a.cwd, createdAt: 1, favorite: false }, { id: 'q', name: '다른 프로젝트', cwd: null, createdAt: 2, favorite: false }] : []);
-    const fixture = state.restoreFixture = { calls: [] as any[], live, starts: 0, current: 0, maxCurrent: 0, stoppedIds: [] as string[], release: () => {}, releaseSecond: () => {}, releaseStop: () => {}, releaseLayout: () => {}, failSave: !!options.failSave, failExit: !!options.failExit,
+    const fixture = state.restoreFixture = { calls: [] as any[], live, starts: 0, current: 0, maxCurrent: 0, stoppedIds: [] as string[], release: () => {}, releaseSecond: () => {}, releaseStop: () => {}, releaseError: () => {}, releaseReconcile: () => {}, releaseLayout: () => {}, failSave: !!options.failSave, failExit: !!options.failExit,
       emit(info: any) { listeners.get('session-changed')?.({ event: 'session-changed', id: 1, payload: info }); },
     };
     state.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
@@ -23,7 +23,10 @@ async function workspace(page: Page, options: { sessions?: any[]; holdFirst?: bo
         if (command.startsWith('plugin:event|')) return callback;
         if (command === 'get_ui_language') return 'ko';
         if (command === 'list_projects') return projects;
-        if (command === 'list_sessions') return fixture.live;
+        if (command === 'list_sessions') {
+          if (options.holdReconcile && fixture.starts === 1) await new Promise<void>(resolve => { fixture.releaseReconcile = resolve; });
+          return fixture.live;
+        }
         if (command === 'load_layout') {
           if (options.holdLayout) await new Promise<void>(resolve => { fixture.releaseLayout = resolve; });
           return JSON.parse(localStorage.getItem('restore-test-layout') || 'null') || { version: 1, columns: 3, columnSizes: [2, 1, 1], rowSizes: [1], sessions: options.sessions ?? [a, b] };
@@ -40,7 +43,11 @@ async function workspace(page: Page, options: { sessions?: any[]; holdFirst?: bo
           if (options.holdSecond && index === 2) await new Promise<void>(resolve => { fixture.releaseSecond = resolve; });
           fixture.current--;
           if (options.cancelStartOnStop && fixture.stoppedIds.includes(info.id) && !options.lateSuccess) { Object.assign(info, { state: 'stopped', active: false }); fixture.emit(info); throw new Error('START_CANCELLED'); }
-          if (options.failFirst && index === 1) { Object.assign(info, { state: 'error', active: !!options.failActive }); fixture.emit(info); throw new Error('FIRST_RESTORE_FAILED'); }
+          if (options.failFirst && index === 1) {
+            Object.assign(info, { state: 'error', active: !!options.failActive }); fixture.emit(info);
+            if (options.holdError) await new Promise<void>(resolve => { fixture.releaseError = resolve; });
+            throw new Error('FIRST_RESTORE_FAILED');
+          }
           Object.assign(info, { state: 'idle' }); fixture.emit(info); return { ...info };
         }
         if (command === 'session_stop') {
@@ -275,4 +282,18 @@ for (const projectRevision of [0, 7]) test(`실패 소유권 카드의 프로젝
   expect((await saved(page)).sessions[0]).toMatchObject({ projectAssigned: true, projectRevision: 1 });
   await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
   expect((await calls(page, 'start_session'))[0].args.request.projectId).toBe('q');
+});
+
+for (const reconcile of [false, true]) test(`비활성 오류 카드의 명시 닫기는 ${reconcile ? '상태 재조회 대기 중' : '시작 거절 응답 전'}에도 저장된 자동 복원을 제거한다`, async ({ page }) => {
+  await workspace(page, { sessions: [a], failFirst: true, holdError: !reconcile, holdReconcile: reconcile });
+  await expect(page.locator('.session-state')).toHaveText('오류');
+  if (reconcile) await expect.poll(async () => (await calls(page, 'list_sessions')).length).toBe(2);
+  await page.locator('.terminal-card .stop').click();
+  await expect(page.locator('.terminal-card')).toHaveCount(0);
+  await page.evaluate(reconcile => { const fixture = (window as any).restoreFixture; if (reconcile) fixture.releaseReconcile(); else fixture.releaseError(); }, reconcile);
+  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect.poll(async () => (await saved(page))?.sessions.length).toBe(0);
+  await expect(page.locator('#restore-banner')).toBeHidden();
+  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  expect(await calls(page, 'start_session')).toEqual([]);
 });

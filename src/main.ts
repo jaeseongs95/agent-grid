@@ -477,11 +477,7 @@ function createTerminal(session: Session) {
     const current = sessions.get(session.id)!;
     if (!current.active) { removeSession(session.id); return; }
     if (confirm(t(`“${current.title}” 세션을 종료할까요? 실행 중인 작업이 중단됩니다.`, `Stop session “${current.title}”? Running work will be interrupted.`))) {
-      exitResumeIntents.delete(current.id); explicitlyStoppedSessions.add(current.id);
-      for (const request of saved) if (request.threadId && request.threadId === current.threadId) {
-        request.resumeOnStartup = false;
-        if (restoringRequests.has(request)) cancelledRestores.add(request);
-      }
+      recordExplicitStop(current);
       void call('session_stop', { id: current.id, generation: current.generation }).then(() => {
         // A reaped error may not emit another state event. A live observation error
         // is removed only after the native stop has completed its actual cleanup.
@@ -500,10 +496,19 @@ function createTerminal(session: Session) {
 }
 
 function move(id: string, offset: number) { const visible = visibleOrder(); const index = visible.indexOf(id); const next = index + offset; if (index < 0 || next < 0 || next >= visible.length) return; const from = order.indexOf(id); const to = order.indexOf(visible[next]); [order[from], order[to]] = [order[to], order[from]]; renderGrid(); renderSide(); scheduleSave(); }
+function recordExplicitStop(session: SessionInfo) {
+  exitResumeIntents.delete(session.id); explicitlyStoppedSessions.add(session.id);
+  if (!session.threadId) return;
+  for (const request of new Set([...saved, ...restoringRequests.keys()])) if (request.threadId === session.threadId) {
+    request.resumeOnStartup = false;
+    if (restoringRequests.has(request)) cancelledRestores.add(request);
+  }
+}
 function removeSession(id: string, preserveRestore = false) {
-  if (!preserveRestore && failedRestoreCards.has(id)) {
-    const threadId = sessions.get(id)?.threadId;
-    const removed = saved.filter(request => request.threadId === threadId);
+  const session = sessions.get(id);
+  if (!preserveRestore && session) recordExplicitStop(session);
+  if (!preserveRestore && session?.threadId) {
+    const removed = saved.filter(request => request.threadId === session.threadId);
     saved = saved.filter(request => !removed.includes(request));
     workspaceSlots = workspaceSlots.filter(slot => typeof slot === 'string' || !removed.includes(slot));
     updateRestoreBanner();
