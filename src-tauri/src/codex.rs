@@ -433,15 +433,9 @@ fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd:
         let mut last_state: Option<String> = None;
         let mut failures = 0;
         let mut subscribed = false;
+        let mut subscription_attempts = 0;
+        let mut subscription_stopped = false;
         while !stopped.load(Ordering::Acquire) {
-            if !subscribed {
-                if let (Some(id),Some(conversation)) = (selected.as_deref(),conversation) {
-                    // 기존 관측 연결로 메타데이터만 구독한다. 입력·승인 응답은 보내지 않는다.
-                    // 미지원 CLI에서도 기존 상태 조회는 보존하며 구독을 반복하지 않는다.
-                    if conversation.observer_subscribe(rpc,id,cwd).is_err() {conversation.observer_disconnected();}
-                    subscribed=true;
-                }
-            }
             if Instant::now() >= next_poll {
                 let snapshot = if let (Some(id),Some(conversation)) = (selected.as_deref(),conversation) {
                     conversation.observer_call(rpc,id,"thread/read",json!({"threadId":id,"includeTurns":false})).and_then(|result| {verified_thread(&result["thread"],id,cwd)?;Ok(Some(result["thread"].clone()))})
@@ -457,6 +451,21 @@ fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd:
                             };
                             selected = Some(id.to_owned());
                             on_event(CodexEvent::ThreadId(id.to_owned()));
+                        }
+                        if thread["status"]["type"]=="notLoaded" {
+                            subscribed=false;
+                            if let Some(conversation)=conversation {conversation.observer_disconnected();}
+                        } else if !subscribed && !subscription_stopped && subscription_attempts<3 && matches!(thread["status"]["type"].as_str(),Some("idle" | "active" | "systemError")) {
+                            if let (Some(id),Some(conversation))=(selected.as_deref(),conversation) {
+                                // 같은 연결에서 최대 세 번, 다음 1초 상태 조회 뒤에만
+                                // 재시도한다. 정확한 구조화 준비 오류 외에는 재시도하지 않는다.
+                                subscription_attempts+=1;
+                                match conversation.observer_subscribe(rpc,id,cwd) {
+                                    Ok(success)=>subscribed=success,
+                                    Err(_)=>subscription_stopped=true,
+                                }
+                                if !subscribed {conversation.observer_disconnected();}
+                            }
                         }
                         publish_status(&mut last_state, status(&thread["status"]), on_event);
                     }

@@ -280,6 +280,11 @@ Ordinary files are local references, not the ChatGPT document upload service. Mo
 controls use runtime-reported settings and supported choices; unavailable values remain unknown.
 Unsupported runtime features are reported explicitly. An uncertain send is never retried automatically
 and its draft is preserved.
+An explicit switch to Terminal can hand input back while ordinary unanswered requests remain.
+Responses already in progress, uncertain sends and unverified request ownership block the switch
+and preserve the conversation view and draft. Automatic hiding or cleanup never performs this handoff.
+If live events arrive during a history query, a stale response is discarded with a reload notice.
+Unavailable history is never treated as an empty or idle conversation.
 
 The upper-right **Question inbox** shows the count of confirmed unanswered questions and approvals.
 Opening the inbox does not reset the count; server-confirmed resolution removes an entry. Questions

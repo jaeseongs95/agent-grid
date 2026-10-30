@@ -251,7 +251,7 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
         assert!(engine.shutdown().is_err());
         assert!(!engine.inner.exiting.load(Ordering::Acquire));
         stage("재시도 반환");
-        assert_eq!(server.join().unwrap(), ["initialize", "initialized", "thread/start", "thread/subscribePassive", "thread/read"]);
+        assert_eq!(server.join().unwrap(), ["initialize", "initialized", "thread/start", "thread/read", "thread/subscribePassive"]);
         stage("server 회수");
         no_more_connections.set_nonblocking(true).unwrap();
         assert!(matches!(no_more_connections.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock), "불명 요청을 다시 연결·전송하면 안 된다");
