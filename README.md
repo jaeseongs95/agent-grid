@@ -273,6 +273,8 @@ Conversation view reads structured runtime history in pages and follows recent e
 not parse terminal text. Earlier pages and large originals are fetched on demand.
 
 Conversation view requires a runtime supporting passive subscriptions and atomic idle user input.
+Selecting a newer executable does not automatically upgrade an already running shared server.
+Conversation view checks the connected server; the app never stops or replaces an existing daemon.
 Older servers show a capability limitation; the app does not fall back to operations that can trigger
 queued work or merge a new message into an active turn. Terminal view remains available. Weekly
 usage also reads only through an existing shared server; unavailable reads preserve the last
