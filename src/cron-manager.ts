@@ -10,6 +10,11 @@ interface Reply { status: 'applied' | 'notApplied' | 'unknown' | 'unsupported' }
 interface Host { call<T>(command: string, args: Record<string, unknown>): Promise<T>; notify(ko: string, error?: boolean, en?: string): void }
 const LIMIT = 100;
 const states: Record<string, [string, string]> = { ready: ['예약됨', 'Scheduled'], pending: ['실행 접수 확인 중', 'Checking admission'], running: ['실행 중', 'Running'], finished: ['종료됨', 'Finished'], unknown: ['실행 상태 미확인', 'Execution unknown'], blockedUnsupported: ['실행 환경 미지원', 'Runtime unsupported'], blockedConnection: ['연결 확인 필요', 'Connection required'] };
+function preview(value: string) {
+  let text = ''; let count = 0;
+  for (const character of value) { if (count++ === 512) break; text += character; }
+  return text;
+}
 
 export function createCronManager(host: Host) {
   const dialog = document.createElement('dialog'); dialog.id = 'cron-dialog'; dialog.className = 'cron-dialog'; dialog.setAttribute('aria-labelledby', 'cron-title');
@@ -59,7 +64,7 @@ export function createCronManager(host: Host) {
   function createRow(job: Job) {
     const row = document.createElement('article'); row.className = 'cron-job'; row.dataset.jobId = job.id;
     const title = document.createElement('strong'); title.textContent = `#${job.id} · ${job.paused ? t('일시정지 · ', 'Paused · ') : ''}${t(...states[job.state])}${job.removed ? t(' · 삭제됨, 실행 종료 확인 중', ' · Removed, waiting for execution to end') : ''}`;
-    const text = document.createElement('p'); text.className = 'cron-preview'; text.textContent = job.promptPreview.slice(0, 512);
+    const text = document.createElement('p'); text.className = 'cron-preview'; text.textContent = preview(job.promptPreview);
     const detail = document.createElement('small');
     const schedule = job.schedule.type === 'every' ? t(`${job.schedule.seconds}초 간격`, `Every ${job.schedule.seconds} seconds`) : formatTime(job.schedule.atUnixMs);
     detail.textContent = `${schedule} · ${t('다음 실행', 'Next run')}: ${formatTime(job.nextRunAt)}${Number.isSafeInteger(job.skipped) && job.skipped! >= 0 ? ` · ${t('건너뜀', 'Skipped')}: ${job.skipped}` : ''}`;
@@ -128,7 +133,7 @@ export function createCronManager(host: Host) {
         const value = await rpc<List>(session, { type: 'list' });
         if (!live(version)) return;
         validate(value); supported = value.supported; connected = value.connected; fresh = supported && connected;
-        if (fresh) { jobs = value.jobs.slice(0, LIMIT).map(job => ({ id: job.id, promptPreview: job.promptPreview.slice(0, 512), state: job.state, paused: job.paused, removed: job.removed, nextRunAt: job.nextRunAt, skipped: job.skipped, schedule: job.schedule.type === 'every' ? { type: 'every', seconds: job.schedule.seconds } : { type: 'at', atUnixMs: job.schedule.atUnixMs } })); hasMore = value.hasMore === true || value.jobs.length > LIMIT; knownList = true; }
+        if (fresh) { jobs = value.jobs.slice(0, LIMIT).map(job => ({ id: job.id, promptPreview: preview(job.promptPreview), state: job.state, paused: job.paused, removed: job.removed, nextRunAt: job.nextRunAt, skipped: job.skipped, schedule: job.schedule.type === 'every' ? { type: 'every', seconds: job.schedule.seconds } : { type: 'at', atUnixMs: job.schedule.atUnixMs } })); hasMore = value.hasMore === true || value.jobs.length > LIMIT; knownList = true; }
         if (fresh && value.mutationState === 'clear' && value.reconciledRequestId === unresolved.get(key(session))) unresolved.delete(key(session));
         $('.cron-error').hidden = true;
         if (!supported) status('이 실행 환경은 예약 관리 연결을 지원하지 않습니다.', 'This runtime does not support scheduled job management.');

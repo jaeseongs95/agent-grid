@@ -4,7 +4,7 @@ use super::*;
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum CronRequest {
     List {},
@@ -14,9 +14,77 @@ pub enum CronRequest {
     Remove { request_id: String, job_id: String },
     Cancel { request_id: String, job_id: String },
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum CronSchedule { Every { seconds: u64 }, At { at_unix_ms: u64 } }
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CronSnapshot {
+    supported: bool,
+    connected: bool,
+    scope: CronScope,
+    jobs: Vec<CronJob>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mutation_state: Option<CronMutationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reconciled_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+#[derive(Deserialize, Serialize)]
+enum CronScope { #[serde(rename = "cliLifetime")] CliLifetime }
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum CronMutationState { Clear, Unknown }
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CronJob {
+    id: String,
+    prompt_preview: String,
+    schedule: CronSchedule,
+    state: CronJobState,
+    paused: bool,
+    removed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_run_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    skipped: Option<u64>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum CronJobState { Ready, Pending, Running, Finished, Unknown, BlockedUnsupported, BlockedConnection }
+
+fn canonical_job_id(id: &str) -> bool {
+    id.len() <= 20 && id.parse::<u64>().is_ok_and(|value| value > 0 && value.to_string() == id)
+}
+
+/// 실제 통로에서 받은 목록만 이 경계로 넘긴다. 소유권·영수증 확인을 대신하지 않는다.
+pub(super) fn bounded_cron_snapshot(value: Value) -> Result<Value, String> {
+    let snapshot: CronSnapshot = serde_json::from_value(value)
+        .map_err(|_| "예약 목록의 필드 또는 자료형이 올바르지 않습니다.")?;
+    if snapshot.jobs.len() > 100 || (snapshot.connected && !snapshot.supported)
+        || snapshot.reason.as_ref().is_some_and(|reason| reason.len() > 256 || reason.contains('\0'))
+        || snapshot.reconciled_request_id.as_ref().is_some_and(|id| id.len() != 36 || Uuid::parse_str(id).is_err()) {
+        return Err("예약 목록의 상한 또는 연결 상태가 올바르지 않습니다.".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    for job in &snapshot.jobs {
+        let schedule_valid = match job.schedule {
+            CronSchedule::Every { seconds } => (1..=MAX_SAFE_INTEGER).contains(&seconds),
+            // 이미 실행한 단발 예약도 조회해야 하므로 미래 시각 조건은 붙이지 않는다.
+            CronSchedule::At { at_unix_ms } => (1..=MAX_SAFE_INTEGER).contains(&at_unix_ms),
+        };
+        if !canonical_job_id(&job.id) || !ids.insert(&job.id) || job.prompt_preview.chars().count() > 512
+            || !schedule_valid || job.next_run_at.is_some_and(|time| !(1..=MAX_SAFE_INTEGER).contains(&time))
+            || job.skipped.is_some_and(|count| count > MAX_SAFE_INTEGER) {
+            return Err("예약 항목의 식별자·미리보기·시각이 허용 범위를 벗어났습니다.".into());
+        }
+    }
+    serde_json::to_value(snapshot).map_err(|error| format!("예약 목록을 변환하지 못했습니다: {error}"))
+}
 
 impl CronRequest {
     pub(crate) fn validate(&self) -> Result<(),String> {
@@ -45,8 +113,7 @@ impl CronRequest {
         if request_id.len()!=36 || Uuid::parse_str(request_id).is_err() {return Err("예약 변경 요청 식별자는 UUID여야 합니다.".into());}
         if let Some(job_id)=job_id {
             if job_id.len()>20 {return Err("예약 식별자가 허용 크기를 넘었습니다.".into());}
-            let id=job_id.parse::<u64>().ok().filter(|id|*id>0).filter(|id|id.to_string()==*job_id);
-            if id.is_none() {return Err("예약 식별자는 양의 64비트 정수의 십진 문자열이어야 합니다.".into());}
+            if !canonical_job_id(job_id) {return Err("예약 식별자는 양의 64비트 정수의 십진 문자열이어야 합니다.".into());}
         }
         Ok(())
     }
@@ -66,7 +133,8 @@ impl CodexSession {
         if self.conversation.as_ref().is_some_and(ConversationConnection::is_deleted) {return Err("원래 대화가 삭제되어 예약을 조회하거나 변경하지 않았습니다.".into());}
         // 예약은 TUI 프로세스가 소유한다. 구조화 제어 계약이 확인되기 전에는
         // app-server 메서드·PTY 입력·별도 실행기로 대체하지 않는다.
-        Ok(request.unsupported())
+        let reply=request.unsupported();
+        match request {CronRequest::List{}=>bounded_cron_snapshot(reply),_=>Ok(reply)}
     }
 }
 
@@ -81,6 +149,50 @@ mod tests {
     }
     fn add(schedule: Value,prompt: String) -> Value {
         json!({"type":"add","requestId":Uuid::new_v4().to_string(),"schedule":schedule,"prompt":prompt})
+    }
+    fn snapshot() -> Value {
+        json!({"supported":true,"connected":true,"scope":"cliLifetime","jobs":[{
+            "id":"1","promptPreview":"시험 예약","schedule":{"type":"at","atUnixMs":1},
+            "state":"finished","paused":false,"removed":false
+        }],"hasMore":false})
+    }
+    #[test]
+    fn cron_control_serialization_preserves_existing_request_shape_and_string_job_ids() {
+        for value in [add(json!({"type":"every","seconds":5}),"여러 줄\n예약".into()),
+            json!({"type":"cancel","requestId":Uuid::new_v4().to_string(),"jobId":"18446744073709551615"}),
+            json!({"type":"list"})] {
+            let request=decode(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(),value);
+        }
+    }
+    #[test]
+    fn cron_snapshot_bounds_real_rows_and_unicode_preview_without_rejecting_past_schedules() {
+        let mut value=snapshot();
+        let job=value["jobs"][0].clone();
+        value["jobs"]=Value::Array((1..=100).map(|id| {
+            let mut row=job.clone();row["id"]=json!(id.to_string());row["promptPreview"]=json!("🐈".repeat(512));row
+        }).collect());
+        assert_eq!(bounded_cron_snapshot(value.clone()).unwrap()["jobs"].as_array().unwrap().len(),100);
+        value["jobs"][0]["promptPreview"]=json!("🐈".repeat(513));
+        assert!(bounded_cron_snapshot(value).is_err());
+        assert!(bounded_cron_snapshot(snapshot()).is_ok(),"과거 단발 예약은 목록 조회 대상이다");
+    }
+    #[test]
+    fn cron_snapshot_rejects_oversized_hidden_duplicate_and_incoherent_peer_data() {
+        let mut invalid=Vec::new();
+        let mut value=snapshot();value["jobs"]=json!([value["jobs"][0].clone(),value["jobs"][0].clone()]);invalid.push(value);
+        let mut value=snapshot();value["jobs"]=Value::Array(vec![value["jobs"][0].clone();101]);invalid.push(value);
+        let mut value=snapshot();value["jobs"][0]["prompt"]=json!("전송하면 안 되는 원문");invalid.push(value);
+        for (field,wrong) in [("id",json!("01")),("id",json!("18446744073709551616")),("state",json!("다른 상태")),("nextRunAt",json!(MAX_SAFE_INTEGER+1)),("skipped",json!(MAX_SAFE_INTEGER+1))] {
+            let mut value=snapshot();value["jobs"][0][field]=wrong;invalid.push(value);
+        }
+        let mut value=snapshot();value["supported"]=json!(false);invalid.push(value);
+        let mut value=snapshot();value["reconciledRequestId"]=json!("다른 요청");invalid.push(value);
+        let mut value=snapshot();value["reason"]=json!("x".repeat(257));invalid.push(value);
+        for value in invalid {
+            let error=bounded_cron_snapshot(value).unwrap_err();
+            assert!(!error.contains("전송하면 안 되는 원문"));
+        }
     }
     fn fixture(socket: Option<TcpStream>) -> CodexSession {
         CodexSession {command:CommandBuilder::new("예약-미송신-시험"),server:None,job:None,_launch_gate:None,stopped:Arc::new(AtomicBool::new(false)),socket,observer:None,mobile:None,shared:None,proxy_job:None,conversation:None}

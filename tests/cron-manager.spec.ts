@@ -89,6 +89,15 @@ test('예약 미지원과 확인된 빈 목록을 구분하고 변경을 차단�
   await expect(page.locator('.cron-lifetime')).toContainText('CLI가 종료되면 예약도 끝납니다');
 });
 
+test('예약 미리보기는 유니코드 512문자를 보존하고 서로게이트 쌍을 자르지 않는다', async ({ page }) => {
+  await fixture(page, { jobs: 1 });
+  const expected = '가'.repeat(511) + '🐈';
+  await page.evaluate(value => { (window as any).cronFixture.snapshot.jobs[0].promptPreview = value; }, expected + '뒤');
+  await refresh(page);
+  await expect(page.locator('.cron-preview')).toHaveText(expected);
+  expect(await page.locator('.cron-preview').evaluate(node => Array.from(node.textContent ?? '').length)).toBe(512);
+});
+
 test('반복은 초 단위로, 단발 현지 시각은 정확한 epoch로 원래 세션에 전송한다', async ({ page }) => {
   await fixture(page);
   await page.locator('.cron-prompt').fill('  원문 작업\n둘째 줄  ');
