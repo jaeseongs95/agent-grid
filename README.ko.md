@@ -1,5 +1,18 @@
 # OpenDIY Desktop
 
+**빠른 로딩, 실제 사용 화면**
+
+기존 ChatGPT 데스크톱 앱보다 빠른 로딩을 체감한 실사용 녹화입니다.
+프로젝트를 전환하며 여러 실행 중 세션이 표시되는 모습을 약 6.5초 동안 확인할 수 있습니다.
+
+![실사용 중 프로젝트·세션의 빠른 로딩 — 원본 재생 속도](docs/loading-demo.gif)
+
+*2026-10-30 실사용 녹화 · 원본 속도 유지 · 배속 없음*
+
+![실사용 환경의 Windows 작업 관리자](docs/real-world-task-manager.png)
+
+*같은 실사용 환경의 작업 관리자입니다. OpenDIY Desktop과 CLI·WebView2 프로세스가 함께 실행 중인 상태입니다.*
+
 [English](README.md) | **한국어**
 
 여러 코딩 에이전트 CLI 세션을 한 화면에 배치하는 Windows 데스크톱 앱입니다.
