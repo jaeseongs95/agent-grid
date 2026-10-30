@@ -183,6 +183,9 @@ These budgets do not limit the entire process, durable history or model context.
 Legacy history still uses the official full-read fallback, so its initial load can
 exceed the display budget. Other selected CLIs retain their own history behavior.
 These bounds and lifecycle tests are not a claim of a completed long-duration leak test.
+Each session retains at most 1,024 answered or resolved server-request IDs. Exceeding this
+limit blocks conversation observation and input handoff, rather than forgetting resolved requests
+that could arrive again in a delayed replay. Original work and conversation data are preserved.
 
 Existing saved settings and projects from Agent Grid are preserved. The longer-term
 product direction is to learn from ChatGPT and Claude desktop workflows; the full

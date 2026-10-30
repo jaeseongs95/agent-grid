@@ -108,13 +108,14 @@ struct Events {
     pending: HashMap<String, Value>, connected: bool, error: Option<String>,
     answered: HashSet<String>,
     observed_pending: HashMap<String,Value>, observer_connected: bool,
+    requests_unavailable: bool,
 }
 impl Events {
     fn blocks_attach(&self,owned: bool,unknown: bool) -> bool {
         owned || unknown || self.blocks_release(true) || self.pending.values().any(|request|request["guiOwned"]!=false)
     }
     fn blocks_release(&self,handoff: bool) -> bool {
-        self.pending.iter().chain(self.observed_pending.iter()).any(|(id,request)| {
+        self.requests_unavailable || self.pending.iter().chain(self.observed_pending.iter()).any(|(id,request)| {
             !handoff || request["responded"]==true || self.answered.contains(id)
                 || !matches!(request["method"].as_str(),Some("item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "item/tool/requestUserInput" | "item/permissions/requestApproval"))
         })
@@ -160,7 +161,7 @@ impl ConversationConnection {
         let events = self.0.events.lock().map_err(|_| "대화 승인 상태 오류")?;
         let mut requests = events.observed_pending.clone();
         requests.extend(events.pending.clone());
-        for (id,request) in &mut requests {request["metadataAvailable"]=json!((events.connected&&events.pending.contains_key(id))||(events.observer_connected&&events.observed_pending.contains_key(id)));}
+        for (id,request) in &mut requests {request["metadataAvailable"]=json!(!events.requests_unavailable&&((events.connected&&events.pending.contains_key(id))||(events.observer_connected&&events.observed_pending.contains_key(id))));}
         Ok((owned,events.connected,requests.into_values().collect()))
     }
     pub(crate) fn is_deleted(&self) -> bool { self.0.deleted.load(Ordering::Acquire) }
@@ -176,7 +177,9 @@ impl ConversationConnection {
             Ok(value)=>value,Err(_) if preparing=>return Ok(false),Err(error)=>return Err(error),
         };
         verify_passive(&result,thread_id,cwd)?;
-        self.0.events.lock().map_err(|_| "질문 관측 상태 오류")?.observer_connected=true;
+        let mut events=self.0.events.lock().map_err(|_| "질문 관측 상태 오류")?;
+        if events.requests_unavailable {return Err("요청 관측을 중단한 세션의 구독을 복구하지 않았습니다.".into());}
+        events.observer_connected=true;
         Ok(true)
     }
     pub(super) fn observer_disconnected(&self) {self.0.events.lock().unwrap_or_else(|e|e.into_inner()).observer_connected=false;}
@@ -262,7 +265,7 @@ impl ConversationConnection {
             {
                 let mut events = self.0.events.lock().map_err(|_| "대화 이벤트 상태 오류")?;
                 if events.blocks_attach(self.0.owned.load(Ordering::Acquire),self.0.unknown.load(Ordering::Acquire)) {return Err("이전 연결의 미확인 요청을 보존하고 있어 새 입력 소유권을 만들지 않았습니다.".into());}
-                events.queue.clear(); events.bytes=0; events.gap=false; events.answered.clear(); events.error=None;
+                events.queue.clear(); events.bytes=0; events.gap=false; events.error=None;
             }
             *self.0.input.lock().map_err(|_| "대화 입력 소유 상태를 확인할 수 없습니다.")? = true;
             self.0.owned.store(true,Ordering::Release);
@@ -328,7 +331,8 @@ fn run(control: Arc<Control>, thread_id: &str, cwd: &Path, receiver: mpsc::Recei
 }
 fn live(control: &Control, cancelled: &AtomicBool) -> Result<(), String> {
     if control.deleted.load(Ordering::Acquire) { Err("원래 대화가 삭제되어 연결과 이력 조회를 종료했습니다.".into()) }
-    else if control.stopped.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) { Err("대화 연결이 종료되었습니다. 진행 중 요청 결과는 확인되지 않았습니다.".into()) } else { Ok(()) }
+    else if control.stopped.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) { Err("대화 연결이 종료되었습니다. 진행 중 요청 결과는 확인되지 않았습니다.".into()) }
+    else if control.events.lock().map_err(|_| "대화 승인 상태 오류")?.requests_unavailable {Err("해결 기록 상한으로 요청 관측을 중단했습니다. 마지막 확인 내용을 보존했습니다.".into())} else { Ok(()) }
 }
 fn verify_passive(result: &Value,thread_id: &str,cwd: &Path) -> Result<(),String> {
     verified_thread(&result["thread"],thread_id,cwd)?;
@@ -410,8 +414,17 @@ fn serve<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, 
     // loaded 동일 runtime의 수동 구독만 허용한다. resume는 idle 작업을 실행할 수 있어 대체 경로로 쓰지 않는다.
     let mut resumed = call(control, rpc, thread_id, PASSIVE_SUBSCRIBE, json!({"threadId":thread_id}), cancelled)?;
     verify_passive(&resumed, thread_id, cwd)?;
-    if control.events.lock().map_err(|_| "대화 승인 상태 오류")?.pending.values().any(|request|request["guiOwned"]==false) {
-        return Err("인계한 요청의 동일 원문을 재구독에서 확인하지 못했습니다. 이전 요청을 보존했습니다.".into());
+    // CLI는 응답 뒤 복사된 pending을 replay한다. 기존 Attach 전체기한 안에서
+    // 실제 동일 원문 또는 resolved를 기다리며 별도 큐/재송신은 만들지 않는다.
+    let replay_deadline=rpc.deadline.unwrap_or_else(||Instant::now()+RPC_TIMEOUT);
+    loop {
+        live(control,cancelled)?;
+        let events=control.events.lock().map_err(|_| "대화 승인 상태 오류")?;
+        if events.blocks_release(true) || control.unknown.load(Ordering::Acquire) {return Err("재구독 중 미확인 요청이 확인되어 입력 소유권을 유지했습니다.".into());}
+        let waiting=events.pending.values().any(|request|request["guiOwned"]==false);drop(events);
+        if !waiting {break;}
+        if Instant::now()>=replay_deadline {return Err("기한 안에 인계한 요청의 동일 원문을 확인하지 못했습니다. 이전 요청을 보존했습니다.".into());}
+        if let Some(message)=rpc.read()? {observe_message(control,thread_id,message)?;}
     }
     resumed["threadId"] = json!(thread_id); resumed["owner"] = json!("gui");
     let current = call(control,rpc,thread_id,"thread/turns/list",json!({"threadId":thread_id,"limit":1,"sortDirection":"desc","itemsView":"summary"}),cancelled)?;
@@ -422,7 +435,7 @@ fn serve<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, 
         resumed["activeTurnKnown"] = json!(true);
         resumed["activeTurnId"] = current.first().filter(|turn| turn["status"] == "inProgress").and_then(|turn| turn["id"].as_str()).map_or(Value::Null,|id|json!(id));
     }
-    { let mut events = control.events.lock().map_err(|_| "대화 이벤트 상태 오류")?; events.connected = true; events.error = None; }
+    { let mut events = control.events.lock().map_err(|_| "대화 이벤트 상태 오류")?; if events.requests_unavailable {return Err("요청 관측을 중단한 세션의 연결을 복구하지 않았습니다.".into());} events.connected = true; events.error = None; }
     rpc.deadline = None; *deadline.lock().map_err(|_| "대화 요청 기한 상태 오류")? = None;
     loop {
         live(control, cancelled)?;
@@ -606,8 +619,20 @@ fn record_message(control: &Control, thread_id: &str, message: Value, metadata_o
         return Err("원래 대화가 삭제되어 수동 구독을 종료했습니다.".into());
     }
     if method == "serverRequest/resolved" {
-        if let Some(id) = params.get("requestId") { events.pending.remove(&id.to_string()); events.observed_pending.remove(&id.to_string()); }
+        if let Some(id) = params.get("requestId") {
+            let key=id.to_string();
+            if key.len()>256 || (!id.is_string()&&!id.is_i64()&&!id.is_u64()) {return Err("해결 요청 식별자 형식을 확인할 수 없어 관측을 중단했습니다.".into());}
+            events.pending.remove(&key);events.observed_pending.remove(&key);
+            // replay는 서버가 복사한 뒤 이미 해결됐을 수 있다. 안전한 eviction 근거가
+            // 없으므로 해결 ID를 세션 동안 보존하고 상한에서는 명시 중단한다.
+            if !events.answered.contains(&key) && events.answered.len()>=1024 {
+                let error="해결 요청 기록 상한에 도달해 늦은 사본을 구분할 수 없습니다. 관측을 중단했습니다.";
+                events.requests_unavailable=true;events.connected=false;events.observer_connected=false;events.error=Some(error.into());return Err(error.into());
+            }
+            events.answered.insert(key);
+        }
     }
+    if events.requests_unavailable {return Err("서버 요청 관측을 중단한 세션입니다. 마지막 확인 내용을 보존했습니다.".into());}
     let mut event = json!({"method":method,"params":params});
     if let Some(id) = message.get("id") {
         let key = id.to_string();
@@ -926,6 +951,26 @@ mod tests {
         assert!(control.pending_snapshot().unwrap().2.is_empty()); assert!(control.0.events.lock().unwrap().pending.is_empty());
     }
     #[test]
+    fn resolved_ids_block_late_replay_and_stop_request_tracking_at_the_bounded_limit() {
+        let(control,_rpc,_listener)=fixture();
+        let pending=json!({"id":9,"method":"item/tool/requestUserInput","params":{"threadId":"original","questions":[]}});
+        control.observer_message("original",pending.clone()).unwrap();observe_message(&control.0,"original",pending.clone()).unwrap();
+        control.observer_message("original",json!({"method":"serverRequest/resolved","params":{"threadId":"original","requestId":9}})).unwrap();
+        install_finished_worker(&control);control.request("original",Path::new("."),ConversationRequest::Detach).unwrap();
+        // 새 Attach의 준비와 같은 경계에서도 해결 기록을 지우지 않는다.
+        assert!(!control.0.events.lock().unwrap().blocks_attach(false,false));assert!(control.0.events.lock().unwrap().answered.contains("9"));
+        observe_message(&control.0,"original",pending.clone()).unwrap();control.observer_message("original",pending).unwrap();assert!(control.pending_snapshot().unwrap().2.is_empty());
+        let(control,_rpc,_listener)=fixture();
+        for id in 0..1024 {control.observer_message("original",json!({"method":"serverRequest/resolved","params":{"threadId":"original","requestId":id}})).unwrap();}
+        control.observer_message("original",json!({"method":"serverRequest/resolved","params":{"threadId":"original","requestId":0}})).unwrap();
+        let pending=json!({"id":9000,"method":"item/commandExecution/requestApproval","params":{"threadId":"original"}});observe_message(&control.0,"original",pending.clone()).unwrap();control.observer_message("original",pending).unwrap();
+        {let mut events=control.0.events.lock().unwrap();events.connected=true;events.observer_connected=true;}
+        assert!(control.observer_message("original",json!({"method":"serverRequest/resolved","params":{"threadId":"original","requestId":1024}})).unwrap_err().contains("상한"));
+        assert!(observe_message(&control.0,"original",json!({"id":1024,"method":"item/commandExecution/requestApproval","params":{"threadId":"original"}})).is_err(),"상한 뒤 다른 연결의 늦은 사본도 삽입하면 안 된다");
+        let(_,connected,pending)=control.pending_snapshot().unwrap();assert!(!connected);assert_eq!(pending.len(),1);assert_eq!(pending[0]["requestId"],"9000");assert_eq!(pending[0]["metadataAvailable"],false);
+        let events=control.0.events.lock().unwrap();assert_eq!(events.answered.len(),1024);assert!(events.answered.contains("0"));assert!(events.blocks_attach(false,false));assert!(events.blocks_release(true));assert!(events.error.as_deref().is_some_and(|error|error.contains("상한")));
+    }
+    #[test]
     fn pending_metadata_is_current_only_when_the_connection_holding_that_id_is_live() {
         let (control,_rpc,_listener)=fixture();
         let request=json!({"id":9,"method":"item/commandExecution/requestApproval","params":{"threadId":"original"}});
@@ -1116,29 +1161,52 @@ mod tests {
     }
     #[test]
     fn handed_off_pending_is_rebound_only_by_identical_replay_and_failed_reentry_preserves_it() {
-        for outcome in ["same","missing","changed","startFailure"] {
+        for outcome in ["same","resolved","missing","changed","startFailure","deleted","responded","stopped"] {
             let(control,mut rpc,listener)=fixture();install_finished_worker(&control);
             let pending=json!({"id":19,"method":"item/commandExecution/requestApproval","params":{"threadId":"original","availableDecisions":[],"reason":"인계 전 원문"}});
             observe_message(&control.0,"original",pending.clone()).unwrap();control.observer_message("original",pending.clone()).unwrap();control.request("original",Path::new("."),ConversationRequest::HandoffToTerminal).unwrap();
             assert!(!control.0.events.lock().unwrap().blocks_attach(false,false));let cwd=env::current_dir().unwrap().canonicalize().unwrap();let expected_cwd=cwd.clone();let expected=pending.clone();
+            let(response_sent,response_ready)=mpsc::sync_channel(1);let(replay_release,replay_ready)=mpsc::sync_channel(1);
             let server=thread::spawn(move||{
                 let(stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();let mut socket=WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);let init=read_request(&mut socket);assert_eq!(init["method"],"initialize");
                 if outcome=="startFailure"{socket.send(Message::Text(json!({"id":init["id"],"error":{"code":-32603,"message":"합성 초기화 실패"}}).to_string().into())).unwrap();assert_closed_without_input(&mut socket);return;}
                 reply(&mut socket,&init,json!({}));assert_eq!(read_request(&mut socket)["method"],"initialized");let subscribe=read_request(&mut socket);assert_eq!(subscribe["method"],PASSIVE_SUBSCRIBE);
-                if outcome!="missing" {let mut replay=expected;if outcome=="changed"{replay["params"]["reason"]=json!("다른 본문");}socket.send(Message::Text(replay.to_string().into())).unwrap();}
-                if outcome!="changed" {reply(&mut socket,&subscribe,json!({"thread":{"id":"original","cwd":expected_cwd,"turns":[]}}));}
-                if outcome=="same"{let history=read_request(&mut socket);assert_eq!(history["method"],"thread/turns/list");reply(&mut socket,&history,json!({"data":[]}));}assert_closed_without_input(&mut socket);
+                reply(&mut socket,&subscribe,json!({"thread":{"id":"original","cwd":expected_cwd,"turns":[]}}));response_sent.send(()).unwrap();replay_ready.recv_timeout(Duration::from_secs(3)).unwrap();
+                match outcome {
+                    "same"|"changed"=>{let mut replay=expected;if outcome=="changed"{replay["params"]["reason"]=json!("다른 본문");}socket.send(Message::Text(replay.to_string().into())).unwrap();},
+                    "resolved"=>{
+                        socket.send(Message::Text(json!({"method":"serverRequest/resolved","params":{"threadId":"original","requestId":19}}).to_string().into())).unwrap();
+                        // 실제 CLI의 복사 후 소비 경합: 해결 알림보다 오래된 replay가 늦게 온다.
+                        socket.send(Message::Text(expected.to_string().into())).unwrap();
+                    },
+                    "deleted"=>{socket.send(Message::Text(json!({"method":"thread/deleted","params":{"threadId":"original"}}).to_string().into())).unwrap();},
+                    _=>{},
+                }
+                if matches!(outcome,"same"|"resolved"){let history=read_request(&mut socket);assert_eq!(history["method"],"thread/turns/list");reply(&mut socket,&history,json!({"data":[]}));}assert_closed_without_input(&mut socket);
             });
-            let(finished,result)=mpsc::sync_channel(1);let(start,started)=mpsc::sync_channel(1);install_actor(&control,move|state,receiver,cancelled|{started.recv_timeout(Duration::from_secs(3)).unwrap();let value=serve(&state,&mut rpc,"original",&cwd,receiver,&cancelled,&Mutex::new(None));finished.send(value).unwrap();});
+            let(finished,result)=mpsc::sync_channel(1);let(start,started)=mpsc::sync_channel(1);install_actor(&control,move|state,receiver,cancelled|{started.recv_timeout(Duration::from_secs(3)).unwrap();let value=serve(&state,&mut rpc,"original",&cwd,receiver,&cancelled,&Mutex::new(Some(Instant::now()+Duration::from_secs(1))));finished.send(value).unwrap();});
             let(reply,attached)=mpsc::sync_channel(1);control.0.worker.lock().unwrap().as_ref().unwrap().sender.try_send(Work{request:ConversationRequest::Attach,reply,deadline:Instant::now()+RPC_TIMEOUT,send_context:None}).ok().unwrap();
             start.send(()).unwrap();
-            if outcome=="same" {attached.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();assert_eq!(control.pending_snapshot().unwrap().2[0]["guiOwned"],true);assert!(control.request("original",Path::new("."),ConversationRequest::Detach).is_err());control.request("original",Path::new("."),ConversationRequest::HandoffToTerminal).unwrap();assert!(result.recv_timeout(Duration::from_secs(3)).unwrap().is_ok());}
-            else {
-                assert!(result.recv_timeout(Duration::from_secs(3)).unwrap().is_err());assert!(attached.recv_timeout(Duration::from_secs(3)).is_err());assert!(control.terminal_write(||Ok(1)).is_err());
-                let deadline=Instant::now()+Duration::from_secs(3);while !control.0.worker.lock().unwrap().as_ref().unwrap().join.as_ref().unwrap().is_finished(){assert!(Instant::now()<deadline);thread::yield_now();}
-                control.request("original",Path::new("."),ConversationRequest::HandoffToTerminal).unwrap();
+            if outcome!="startFailure" {
+                response_ready.recv_timeout(Duration::from_secs(3)).unwrap();assert!(matches!(attached.try_recv(),Err(mpsc::TryRecvError::Empty)));assert!(control.terminal_write(||Ok(1)).is_err());assert_eq!(control.pending_snapshot().unwrap().2[0]["guiOwned"],false);
+                if outcome=="responded" {let mut events=control.0.events.lock().unwrap();events.pending.get_mut("19").unwrap()["responded"]=json!(true);events.answered.insert("19".into());}
+                if outcome=="stopped" {control.0.stopped.store(true,Ordering::Release);}
+                replay_release.send(()).unwrap();
             }
-            let snapshot=control.pending_snapshot().unwrap().2;assert_eq!(snapshot.len(),1);assert_eq!(snapshot[0]["params"],pending["params"]);assert_eq!(snapshot[0]["guiOwned"],false);assert_ne!(snapshot[0]["responded"],true);server.join().unwrap();
+            if matches!(outcome,"same"|"resolved") {
+                attached.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+                if outcome=="same" {assert_eq!(control.pending_snapshot().unwrap().2[0]["guiOwned"],true);assert!(control.request("original",Path::new("."),ConversationRequest::Detach).is_err());control.request("original",Path::new("."),ConversationRequest::HandoffToTerminal).unwrap();}
+                else {assert!(control.pending_snapshot().unwrap().2.is_empty());control.request("original",Path::new("."),ConversationRequest::Detach).unwrap();}
+                assert!(result.recv_timeout(Duration::from_secs(3)).unwrap().is_ok());
+            }
+            else {
+                let error=result.recv_timeout(Duration::from_secs(3)).unwrap().unwrap_err();if outcome=="missing" {assert!(error.contains("기한"),"정상 기한 만료 대신 다른 실패가 발생했다: {error}");}assert!(attached.recv_timeout(Duration::from_secs(3)).is_err());assert!(control.terminal_write(||Ok(1)).is_err());
+                let deadline=Instant::now()+Duration::from_secs(3);while !control.0.worker.lock().unwrap().as_ref().unwrap().join.as_ref().unwrap().is_finished(){assert!(Instant::now()<deadline);thread::yield_now();}
+                let handoff=control.request("original",Path::new("."),ConversationRequest::HandoffToTerminal);assert_eq!(handoff.is_err(),outcome=="responded");
+            }
+            let snapshot=control.pending_snapshot().unwrap().2;assert_eq!(snapshot.len(),if matches!(outcome,"resolved"|"deleted"){0}else{1});
+            if let Some(request)=snapshot.first() {assert_eq!(request["params"],pending["params"]);assert_eq!(request["guiOwned"],false);assert_eq!(request["responded"]==true,outcome=="responded");}
+            assert_eq!(control.is_deleted(),outcome=="deleted");server.join().unwrap();control.cancel();
         }
         for unsafe_copy in ["owned","unknown","responded","answered","owner","unclassified","notHandedOff"] {
             let(control,_rpc,_listener)=fixture();let request=json!({"id":9,"method":"item/commandExecution/requestApproval","params":{"threadId":"original"}});observe_message(&control.0,"original",request.clone()).unwrap();control.observer_message("original",request).unwrap();
