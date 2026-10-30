@@ -6,6 +6,7 @@ mod flow;
 mod launch_gate;
 mod project;
 pub mod process_job;
+mod owned_tui_control;
 mod session;
 pub mod self_test;
 mod storage;

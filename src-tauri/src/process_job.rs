@@ -5,16 +5,70 @@ pub use crate::launch_gate::{run_child, LaunchGate};
 
 #[cfg(windows)]
 mod platform {
-    use std::{net::{Ipv4Addr, SocketAddr, TcpStream}, os::windows::io::AsRawHandle, sync::OnceLock};
+    use std::{net::{Ipv4Addr, SocketAddr, TcpStream}, os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle}, sync::OnceLock};
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE},
+        Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
         NetworkManagement::IpHelper::{GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCP_STATE_ESTAB, TCP_TABLE_OWNER_PID_ALL},
         Networking::WinSock::AF_INET,
         System::{
             JobObjects::{AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE},
-            Threading::{GetCurrentProcess, OpenProcess, PROCESS_QUERY_INFORMATION},
+            Pipes::GetNamedPipeClientProcessId,
+            Threading::{GetCurrentProcess, GetProcessId, GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE},
         },
     };
+
+    /// PID 재사용과 실행 세대를 구분하는 OS 신원. 인증 handshake를 대신하지 않는다.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ProcessIdentity {
+        pub pid: u32,
+        pub created_filetime: u64,
+    }
+
+    /// 조회·종료 확인 권한만 보유한다. Job이나 종료 권한은 보유하지 않는다.
+    #[derive(Debug)]
+    pub struct OwnedProcessIdentity {
+        handle: OwnedHandle,
+        identity: ProcessIdentity,
+    }
+
+    impl OwnedProcessIdentity {
+        pub fn current() -> std::io::Result<Self> {
+            Self::open(std::process::id())
+        }
+
+        fn open(pid: u32) -> std::io::Result<Self> {
+            // SAFETY: 반환된 실제 프로세스 핸들의 유일한 소유권을 받는다.
+            let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid) };
+            if raw.is_null() { return Err(std::io::Error::last_os_error()); }
+            let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+            let mut created: FILETIME = unsafe { std::mem::zeroed() };
+            let (mut exited, mut kernel, mut user): (FILETIME, FILETIME, FILETIME) = unsafe { std::mem::zeroed() };
+            // SAFETY: 유효한 조회 핸들과 초기화 가능한 FILETIME 포인터다.
+            if unsafe { GetProcessTimes(raw, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let identity = ProcessIdentity {
+                pid: unsafe { GetProcessId(raw) },
+                created_filetime: (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime),
+            };
+            if identity.pid == 0 { return Err(std::io::Error::last_os_error()); }
+            if identity.pid != pid { return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "프로세스 신원이 바뀌었습니다.")); }
+            let process = Self { handle, identity };
+            process.ensure_running()?;
+            Ok(process)
+        }
+
+        pub fn identity(&self) -> ProcessIdentity { self.identity }
+
+        pub fn ensure_running(&self) -> std::io::Result<()> {
+            // SAFETY: PROCESS_SYNCHRONIZE 권한을 가진 소유 핸들이다. 대기하지 않는다.
+            match unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } {
+                WAIT_TIMEOUT => Ok(()),
+                WAIT_OBJECT_0 => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "통로 상대 프로세스가 종료됐습니다.")),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        }
+    }
 
     #[derive(Debug)]
     pub struct ProcessJob(HANDLE);
@@ -50,6 +104,33 @@ mod platform {
         pub fn assign_pty(child: &dyn portable_pty::Child) -> Result<Self, String> {
             let handle = child.as_raw_handle().ok_or("owned PTY has no Windows process handle")?;
             Self::assign(handle as HANDLE)
+        }
+
+        /// 실제 연결 상대만 검사한다. Job을 짧게 빌리고 I/O·프로세스 대기를 하지 않는다.
+        pub fn verify_pipe_client(&self, pipe: BorrowedHandle<'_>) -> std::io::Result<OwnedProcessIdentity> {
+            let mut pid = 0;
+            // SAFETY: 호출자가 연결된 서버 통로 핸들의 수명을 빌려준다.
+            if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let process = OwnedProcessIdentity::open(pid)?;
+            let mut owned = 0;
+            // SAFETY: 두 핸들 모두 이 호출이 끝날 때까지 살아 있다.
+            if unsafe { IsProcessInJob(process.handle.as_raw_handle(), self.0, &mut owned) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if owned == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "연결 상대가 이 PTY의 소유 Job에 속하지 않습니다."));
+            }
+            let mut rechecked_pid = 0;
+            if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut rechecked_pid) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if rechecked_pid != process.identity.pid {
+                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "검사 중 통로 상대가 바뀌었습니다."));
+            }
+            process.ensure_running()?;
+            Ok(process)
         }
 
         pub fn terminate(&self) -> Result<(), String> {
@@ -166,3 +247,6 @@ mod platform {
 }
 
 pub use platform::{app_owned_processes, install_app_job, ProcessJob};
+
+#[cfg(windows)]
+pub use platform::{OwnedProcessIdentity, ProcessIdentity};
