@@ -20,11 +20,7 @@ fn exited_with_pending_completion() -> (Engine, SessionInfo, ReleaseCompletion) 
     let completion = ReleaseCompletion(Some(release));
     let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
     let request = StartRequest { cwd, title: "완료 통지 보류 fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 80, rows: 24 };
-    // 이 시험은 셸 초기화가 아니라 실제 소유 PTY의 출력·종료·완료 경계를 검증한다.
-    let root = std::env::var_os("SystemRoot").expect("SystemRoot is not defined");
-    let mut command = CommandBuilder::new(PathBuf::from(root).join("System32/cmd.exe"));
-    command.args(["/d", "/q", "/c", "echo resize-exit-ready"]);
-    let session = engine.start_fixture(request, command).unwrap();
+    let session = engine.start_fixture(request, shell("[Console]::WriteLine('resize-exit-ready')").unwrap()).unwrap();
     let mut output = String::new();
     let mut frames = 0;
     let mut cursor_reply_errors = 0;
@@ -54,9 +50,10 @@ fn exited_with_pending_completion() -> (Engine, SessionInfo, ReleaseCompletion) 
                 }
             }
             BackendEvent::Changed(info) if !info.active => {
+                // 정상 종료가 아닌 경우에도 표식 도달 여부와 정리 직전 관측을 보존한다.
+                eprintln!("종료 이벤트 판별: 상태={}, 활성={}, 경과={:?}, 표식={}, 출력프레임={frames}, 출력바이트={}, 직전상태={last_state:?}, 커서질의={}, 커서응답실패={cursor_reply_errors}, 완료 이벤트 전달 보류 중", info.state, info.active, started.elapsed(), output.contains("resize-exit-ready"), output.len(), output.matches("\x1b[6n").count());
                 assert_eq!(info.state, "exited");
                 assert!(output.contains("resize-exit-ready"));
-                eprintln!("판별 fixture: state={}, active={}, 완료 이벤트 전달 보류 중", info.state, info.active);
                 return (engine, session, completion);
             }
             BackendEvent::Changed(info) => { last_state = (info.state, info.active); }
