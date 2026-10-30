@@ -183,6 +183,7 @@ pub(super) fn prepare(cwd: &Path, requested: Option<&str>, endpoint: SharedEndpo
     let command = endpoint.tui(cwd, &id)?;
     let stopped = Arc::new(AtomicBool::new(false));
     let control = SharedControl { endpoint:endpoint.clone(),thread_id:id.clone(),cwd:cwd.into() };
+    let conversation = Some(ConversationConnection::new(super::conversation::Endpoint::Shared(endpoint.clone()), stopped.clone()));
     let mobile = MobileConnection::shared(endpoint, stopped.clone());
     on_event(CodexEvent::ThreadId(id.clone()));
     on_event(CodexEvent::Status(status(&thread["status"])));
@@ -201,7 +202,7 @@ pub(super) fn prepare(cwd: &Path, requested: Option<&str>, endpoint: SharedEndpo
         drop(rpc); // receiver를 먼저 닫아 bounded pipe reader의 send를 깨운다.
         drop(proxy);
     });
-    Ok(CodexSession { command,server:None,job:None,_launch_gate:None,stopped,socket:None,observer:Some(observer),mobile:Some(mobile),shared:Some(control),proxy_job })
+    Ok(CodexSession { command,server:None,job:None,_launch_gate:None,stopped,socket:None,observer:Some(observer),mobile:Some(mobile),shared:Some(control),proxy_job,conversation })
 }
 
 #[cfg(test)]

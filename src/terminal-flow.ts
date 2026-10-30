@@ -2,6 +2,30 @@ export const MAX_INPUT_OPERATIONS = 128;
 export const MAX_INPUT_BYTES = 256 * 1024;
 export const MAX_INPUT_MESSAGE_BYTES = 64 * 1024;
 
+// Native output acknowledgement is cumulative. xterm calls write callbacks in
+// parser order within a bounded parsing turn, so acknowledge its last completed
+// sequence once after that turn. Never delay terminal.write or input itself.
+type OutputAcknowledgement = { id: string; generation: number; seq: number };
+export class TerminalOutputAcknowledgements {
+  private pending = new Map<string, Map<number, OutputAcknowledgement>>();
+  private scheduled = false;
+  constructor(private send: (output: OutputAcknowledgement) => void) {}
+  enqueue(output: OutputAcknowledgement) {
+    let generations = this.pending.get(output.id);
+    if (!generations) { generations = new Map(); this.pending.set(output.id, generations); }
+    const previous = generations.get(output.generation);
+    if (previous) previous.seq = Math.max(previous.seq, output.seq);
+    else generations.set(output.generation, { id: output.id, generation: output.generation, seq: output.seq });
+    if (this.scheduled) return;
+    this.scheduled = true;
+    queueMicrotask(() => {
+      const completed = this.pending;
+      this.pending = new Map(); this.scheduled = false;
+      for (const generations of completed.values()) for (const value of generations.values()) this.send(value);
+    });
+  }
+}
+
 export class InputQueueError extends Error {
   constructor(readonly reason: 'message' | 'full' | 'cancelled') { super(`Terminal input ${reason}`); }
 }

@@ -151,6 +151,7 @@ struct Session {
     done: (Mutex<bool>, Condvar),
     sink: EventSink,
     store: Arc<Mutex<Store>>,
+    attachments: crate::conversation_attachments::ConversationAttachments,
 }
 impl Session {
     fn info(&self) -> Result<SessionInfo, String> {
@@ -220,7 +221,9 @@ impl Session {
         let mut done = self.done.0.lock().map_err(|_| "session completion lock poisoned")?;
         *done = true;
         self.done.1.notify_all();
-        result
+        drop(done);
+        let id = self.info()?.id;
+        result.and(self.attachments.cleanup_session(&id))
     }
 
     fn request_stop(&self) -> Result<(), String> {
@@ -261,6 +264,7 @@ struct EngineInner {
     store: Arc<Mutex<Store>>,
     sink: EventSink,
     exiting: AtomicBool,
+    attachments: crate::conversation_attachments::ConversationAttachments,
 }
 
 #[derive(Clone)]
@@ -273,11 +277,12 @@ impl Engine {
     pub fn new(database: &Path, sink: EventSink) -> Result<Self, String> {
         let store = Arc::new(Mutex::new(Store::open(database)?));
         let saved = store.lock().map_err(|_| "metadata store lock poisoned")?.sessions()?;
+        let attachments = crate::conversation_attachments::ConversationAttachments::default();
         let mut sessions = HashMap::new();
         for info in saved {
-            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone() }));
+            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone(), attachments:attachments.clone() }));
         }
-        Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: AtomicBool::new(false) }) })
+        Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: AtomicBool::new(false), attachments }) })
     }
 
     fn allocate(&self, request: &StartRequest) -> Result<Arc<Session>, String> {
@@ -311,7 +316,7 @@ impl Engine {
             live_ids.push(info.id.clone());
             store.prune_sessions(&live_ids)?;
         }
-        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone() });
+        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone(),attachments:self.inner.attachments.clone() });
         if let Some(id) = retired_id { sessions.remove(&id); }
         sessions.insert(info.id.clone(), session.clone());
         drop(sessions);
@@ -452,9 +457,13 @@ impl Engine {
         let session = self.lookup(id, generation)?;
         if session.phase.load(Ordering::Acquire) != 1 { return Err("session is not live".into()); }
         let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone().ok_or("session has no PTY process")?;
-        let mut writer = process.writer.lock().map_err(|_| "PTY writer lock poisoned")?;
-        if session.phase.load(Ordering::Acquire) != 1 { return Err("session is stopping".into()); }
-        writer.as_mut().ok_or("session PTY has exited")?.write_all(data.as_bytes()).map_err(|e| format!("write owned PTY: {e}"))
+        let conversation = process.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().and_then(CodexSession::conversation_connection);
+        let write = || {
+            let mut writer = process.writer.lock().map_err(|_| "PTY writer lock poisoned")?;
+            if session.phase.load(Ordering::Acquire) != 1 { return Err("session is stopping".into()); }
+            writer.as_mut().ok_or("session PTY has exited")?.write_all(data.as_bytes()).map_err(|e| format!("write owned PTY: {e}"))
+        };
+        if let Some(conversation) = conversation { conversation.terminal_write(write) } else { write() }
     }
 
     pub fn resize(&self, id: &str, generation: u64, cols: u16, rows: u16) -> Result<(), String> {
@@ -622,6 +631,64 @@ impl Engine {
         let connection = process.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().ok_or("session server is unavailable")?.mobile_connection();
         drop(process);
         connection.request(action)
+    }
+
+    pub fn conversation_request(&self, id: &str, generation: u64, request: codex::ConversationRequest) -> Result<serde_json::Value, String> {
+        request.validate()?;
+        if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 대화 요청을 시작하지 않았습니다.".into()); }
+        let session = self.lookup(id, generation)?;
+        if session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) { return Err("실행 중인 세션에서만 대화 요청을 사용할 수 있습니다.".into()); }
+        let info = session.info.lock().map_err(|_| "session metadata lock poisoned")?.clone();
+        let thread_id = info.thread_id.ok_or("원래 대화 식별자가 아직 확인되지 않았습니다. 잠시 후 다시 시도하세요.")?;
+        let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone().ok_or("session process is unavailable")?;
+        let connection = process.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().and_then(CodexSession::conversation_connection).ok_or("이 세션은 구조화 대화 연결을 지원하지 않습니다.")?;
+        drop(process);
+        if let codex::ConversationRequest::Send {attachments,..} = &request {
+            self.inner.attachments.retain_for_send(id,&attachments.iter().map(|item|item.path.clone()).collect::<Vec<_>>())?;
+        }
+        connection.request(&thread_id, Path::new(&info.cwd), request)
+    }
+
+    pub fn conversation_attachments(&self) -> crate::conversation_attachments::ConversationAttachments { self.inner.attachments.clone() }
+
+    pub fn stage_conversation_image(&self,id: &str,generation: u64,data_url: &str) -> Result<crate::conversation_attachments::ConversationAttachment,String> {
+        let session = self.lookup(id,generation)?;
+        if self.inner.exiting.load(Ordering::Acquire) || session.phase.load(Ordering::Acquire) != 1 {return Err("실행 중인 세션에만 이미지를 첨부할 수 있습니다.".into());}
+        let staged = self.inner.attachments.stage_image(id,data_url)?;
+        if session.phase.load(Ordering::Acquire) != 1 {
+            self.inner.attachments.cleanup_staged(id,&staged.path)?;
+            return Err("이미지 준비 중 세션이 종료되어 미전송 이미지를 정리했습니다.".into());
+        }
+        Ok(staged)
+    }
+
+    pub fn cleanup_conversation_attachment(&self,id: &str,generation: u64,path: &str) -> Result<(),String> {
+        self.lookup(id,generation)?;
+        self.inner.attachments.cleanup_staged(id,path)
+    }
+
+    pub fn list_pending_questions(&self) -> Result<serde_json::Value,String> {
+        let sessions: Vec<_> = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?.values().cloned().collect();
+        let mut items = Vec::new();
+        for session in sessions {
+            let info = session.info()?;
+            let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone();
+            let connection = process.as_ref().map(|process|process.adapter.lock().map_err(|_| "session adapter lock poisoned").map(|adapter|adapter.as_ref().and_then(CodexSession::conversation_connection))).transpose()?.flatten();
+            let (owned,connected,pending) = connection.as_ref().map(|connection|connection.pending_snapshot()).transpose()?.unwrap_or((false,false,Vec::new()));
+            for request in &pending {
+                let method = request["method"].as_str().unwrap_or("");
+                let kind = match method {"item/tool/requestUserInput" => "question","item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => "approval",_ => "unsupported"};
+                let request_id = request["requestId"].as_str().ok_or("대기 요청 식별자가 없습니다.")?;
+                let mut item = serde_json::json!({"id":format!("{}:{}:{}:{}",info.id,info.thread_id.as_deref().unwrap_or(""),info.generation,request_id),"threadId":info.thread_id,"sessionId":info.id,"generation":info.generation,"requestId":request_id,"kind":kind,"sessionTitle":info.title,"title":if kind=="question" {"사용자 답변 대기"} else if kind=="approval" {"사용자 승인 대기"} else {"터미널에서 확인할 요청"},"message":request["params"]["reason"].as_str().or_else(||request["params"]["command"].as_str()).unwrap_or(""),"canRespond":owned&&connected&&kind!="unsupported"&&request["responded"]!=true,"responded":request["responded"]==true});
+                if kind=="question" {item["questions"]=request["params"]["questions"].clone();}
+                if kind=="approval" {item["approval"]=serde_json::json!({"options":[{"id":"accept","label":"승인"},{"id":"decline","label":"거절"},{"id":"cancel","label":"취소"}]});}
+                items.push(item);
+            }
+            if pending.is_empty() && info.active && info.state=="waiting" {
+                items.push(serde_json::json!({"id":format!("{}:{}:{}:terminal",info.id,info.thread_id.as_deref().unwrap_or(""),info.generation),"threadId":info.thread_id,"sessionId":info.id,"generation":info.generation,"kind":"unsupported","title":"터미널에서 답변할 요청","message":"현재 연결에서 질문 원문을 확인할 수 없습니다. 원래 터미널에서 확인하세요.","sessionTitle":info.title,"canRespond":false}));
+            }
+        }
+        Ok(serde_json::json!({"items":items}))
     }
 
     pub fn list_external(&self) -> Result<Vec<codex::ExternalSession>, String> {

@@ -259,3 +259,25 @@ write project files. Keep the report directory outside that project. Omitting
 normal trust screen. The probe
 requires observed thread IDs and live statuses, and records terminal hashes
 rather than transcripts. Neither mode proves physical IME or GUI behavior.
+
+## Conversation view and question inbox
+
+Use a session card's **Conversation / Terminal** button to switch views of the same thread.
+The terminal grid remains available. Switching views does not create a thread or resend input.
+Conversation view reads structured runtime history in pages and follows recent events; it does
+not parse terminal text. Earlier pages and large originals are fetched on demand.
+
+The composer supports multiline text, Korean composition, pasted images and native file selection.
+Ordinary files are local references, not the ChatGPT document upload service. Model and reasoning
+controls use runtime-reported settings and supported choices; unavailable values remain unknown.
+Unsupported runtime features are reported explicitly. An uncertain send is never retried automatically
+and its draft is preserved.
+
+The upper-right **Question inbox** shows the count of confirmed unanswered questions and approvals.
+Opening the inbox does not reset the count; server-confirmed resolution removes an entry. Terminal
+waiting states whose request details are unavailable are listed separately with a link to the original
+session and are not counted as confirmed questions.
+
+Sent pasted images remain in app-owned storage because resumed history can reference them.
+Unsent temporary files are cleaned up; original user files are never deleted. Exceeding the storage
+budget rejects new attachments rather than automatically deleting earlier attachments.

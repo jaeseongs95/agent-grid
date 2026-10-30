@@ -41,6 +41,10 @@ pub use mobile::{MobileAction, MobileConnection, MobileReply, MobileStatus, Mobi
 #[path = "codex_shared.rs"]
 mod shared;
 
+#[path = "codex_conversation.rs"]
+mod conversation;
+pub use conversation::{ConversationConnection, ConversationRequest};
+
 #[path = "codex_usage.rs"]
 mod usage;
 pub use usage::{weekly_usage_with_executable, WeeklyUsageSnapshot};
@@ -70,6 +74,7 @@ pub struct CodexSession {
     mobile: Option<MobileConnection>,
     shared: Option<shared::SharedControl>,
     proxy_job: Option<std::sync::Weak<ProcessJob>>,
+    conversation: Option<ConversationConnection>,
 }
 
 impl CodexSession {
@@ -77,11 +82,13 @@ impl CodexSession {
         self.mobile.as_ref().expect("connected sessions have a mobile management handle").clone()
     }
     pub(crate) fn shared_control(&self) -> Option<shared::SharedControl> { self.shared.clone() }
+    pub(crate) fn conversation_connection(&self) -> Option<ConversationConnection> { self.conversation.clone() }
 }
 
 impl Drop for CodexSession {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        if let Some(conversation) = &self.conversation { conversation.cancel(); }
         if let Some(mobile) = &self.mobile { mobile.cancel(); }
         if let Some(socket) = self.socket.take() { let _ = socket.shutdown(Shutdown::Both); }
         if let Some(job) = self.proxy_job.take().and_then(|job| job.upgrade()) { let _ = job.terminate(); }
@@ -374,10 +381,11 @@ fn launch_server_with_cancellation(exe: &OsString, cwd: &Path, thread_id: Option
     let server = process.spawn().map_err(|e| format!("Cannot start Codex app-server: {e}"))?;
     let mut session = CodexSession {
         command: tui_command(exe, cwd, &endpoint, &token, thread_id), server:Some(server), job:None, _launch_gate:Some(launch_gate),
-        stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None, mobile:None, shared:None, proxy_job:None,
+        stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None, mobile:None, shared:None, proxy_job:None, conversation:None,
     };
     session.job = Some(Arc::new(ProcessJob::assign_std(session.server.as_ref().unwrap())?));
     session.mobile = Some(MobileConnection::new(endpoint.clone(), token.clone(), session.job.as_ref().unwrap(), session.stopped.clone(), namespaced_remote));
+    session.conversation = Some(ConversationConnection::new(conversation::Endpoint::Owned {address:endpoint.clone(),token:token.clone(),job:Arc::downgrade(session.job.as_ref().unwrap())}, session.stopped.clone()));
     session._launch_gate.as_ref().unwrap().release()?;
     let job = session.job.as_ref().ok_or("Codex server has no owned process job")?;
     let mut rpc = connect(&endpoint, &token, session.server.as_mut().unwrap(), job, cancelled)?;
