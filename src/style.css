@@ -35,3 +35,5 @@
 #settings-dialog .language-setting select{font-size:12px;padding:9px}
 @media(max-width:900px){.top-actions{gap:6px}.workspace-title{margin-right:0}.topbar{padding-left:12px;padding-right:12px}}
 @media(max-height:620px){.sidebar>.brand{height:58px}.sidebar>.workspace-label{margin:3px 8px 6px}.sidebar>.workspace-choice{padding:8px 10px}.sidebar-lists{margin-top:8px;gap:4px}.sidebar #weekly-usage{padding:8px;font-size:10px}.sidebar-bottom{padding:10px 8px}.sidebar-bottom small{margin-top:5px}}
+
+.session-id-copy svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.6}

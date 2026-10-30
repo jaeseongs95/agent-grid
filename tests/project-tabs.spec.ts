@@ -522,3 +522,36 @@ test('moving active sessions updates project activity lights without restarting 
   await expect(page.locator('#project-tabs [role=tab]').first().locator('.project-activity')).toHaveClass(/is-active/);
   expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => ['start_session', 'session_stop', 'session_write'].includes(call.command)))).toEqual([]);
 });
+
+
+test('session ID copy uses the latest full thread ID with availability and clipboard failure feedback', async ({ page, context }, testInfo) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await workspace(page);
+  const copy = (id: string) => card(page, id).locator('.session-id-copy');
+  await expect(copy('a1')).toHaveAccessibleName('세션 ID 복사');
+  await copy('a1').click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('thread-a1');
+  await expect(page.locator('#toast-area')).toContainText('세션 ID를 복사했습니다.');
+  await copy('b1').click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('thread-b1');
+  await page.evaluate(session => (window as any).tabsFixture.emit('session-changed', { ...session, threadId: undefined }), owned[0]);
+  await expect(copy('a1')).toBeDisabled();
+  const fullId = '01234567-89ab-7cde-8fab-0123456789ab';
+  await page.evaluate(({ session, fullId }) => (window as any).tabsFixture.emit('session-changed', { ...session, generation: 8, threadId: fullId }), { session: owned[0], fullId });
+  await expect(copy('a1')).toBeEnabled();
+  await page.locator('#settings-open').click();
+  await page.locator('#language-select').selectOption('en');
+  await page.locator('#settings-close').click();
+  await expect(copy('a1')).toHaveAccessibleName('Copy session ID');
+  await copy('a1').click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(fullId);
+  await expect(page.locator('#toast-area')).toContainText('Session ID copied.');
+  await page.evaluate(({ session, fullId }) => (window as any).tabsFixture.emit('session-changed', { ...session, generation: 8, threadId: fullId, active: false, state: 'exited' }), { session: owned[0], fullId });
+  await expect(copy('a1')).toBeEnabled();
+  await page.evaluate(() => { navigator.clipboard.writeText = async () => { throw new Error('PRIVATE_CLIPBOARD_FAILURE'); }; });
+  await copy('a1').click();
+  await expect(page.locator('#toast-area')).toContainText('Could not copy the session ID. Try again.');
+  await expect(page.locator('#toast-area')).not.toContainText('PRIVATE_CLIPBOARD_FAILURE');
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(fullId);
+  await page.screenshot({ path: testInfo.outputPath('session-id-copy.png') });
+});
