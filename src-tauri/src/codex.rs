@@ -526,6 +526,7 @@ struct Proxy {
     rpc: Option<Rpc<ProxyStream>>,
     reader: Option<JoinHandle<()>>,
     expiry: Option<ProxyExpiry>,
+    finished: bool,
 }
 // 전체 기한은 읽기뿐 아니라 포화된 stdin 쓰기도 해제해야 한다. 외부 daemon이
 // 아닌 이 연결의 proxy Job만 종료하며, 정상 Drop은 감시자를 즉시 깨워 회수한다.
@@ -557,6 +558,7 @@ impl Drop for ProxyExpiry {
 }
 impl Drop for Proxy {
     fn drop(&mut self) {
+        if self.finished { return; }
         self.rpc.take(); // Drop stdin/receiver, unblocking a reader waiting to send.
         self.expiry.take();
         if let Some(job) = self.job.take() { let _ = job.terminate(); }
@@ -566,6 +568,48 @@ impl Drop for Proxy {
     }
 }
 impl Proxy {
+    /// Consumes only this proxy and confirms its own job/child/reader teardown.
+    /// It never sends a daemon stop request or uses global process counts.
+    fn finish(mut self) -> Result<(),String> {
+        self.finished=true;
+        let deadline=Instant::now()+Duration::from_secs(3);
+        let mut errors=Vec::new();
+        self.rpc.take(); // stdin/receiver must close before joining the bounded pipe reader.
+        let job=self.job.take();
+        if let Some(job)=job.as_ref() {if let Err(error)=job.terminate(){errors.push(format!("공유 proxy Job 종료 실패: {error}"));}}
+        else {errors.push("공유 proxy의 소유 Job 종료를 확인할 수 없습니다.".into());}
+        match self.child.try_wait() {
+            Ok(Some(_))=>{},
+            Ok(None)=>if let Err(error)=self.child.kill(){if !matches!(self.child.try_wait(),Ok(Some(_))) {errors.push(format!("공유 proxy 직접 자식 종료 실패: {error}"));}},
+            Err(error)=>errors.push(format!("공유 proxy 직접 자식 상태 확인 실패: {error}")),
+        }
+        let mut child_done=false;
+        #[cfg(windows)] let mut job_empty=false;
+        loop {
+            if !child_done {match self.child.try_wait(){Ok(Some(_))=>child_done=true,Ok(None)=>{},Err(error)=>{errors.push(format!("공유 proxy 직접 자식 정산 실패: {error}"));break;}}}
+            #[cfg(windows)] if !job_empty {match job.as_ref().map(|job|job.active_processes()).transpose(){Ok(Some(0))=>job_empty=true,Ok(_)=>{},Err(error)=>{errors.push(error);break;}}}
+            #[cfg(windows)] let complete=child_done&&job_empty;
+            #[cfg(not(windows))] let complete=child_done;
+            if complete || Instant::now()>=deadline {break;}
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !child_done {errors.push("공유 proxy 직접 자식의 3초 내 정산을 확인하지 못했습니다.".into());}
+        #[cfg(windows)] if !job_empty {errors.push("공유 proxy의 자기 Job ActiveProcesses=0을 3초 내 확인하지 못했습니다.".into());}
+        if let Some(reader)=self.reader.take() {
+            while !reader.is_finished()&&Instant::now()<deadline {thread::sleep(Duration::from_millis(10));}
+            if reader.is_finished() {if reader.join().is_err(){errors.push("공유 proxy pipe reader가 비정상 종료했습니다.".into());}}
+            else {errors.push("공유 proxy pipe reader의 기한 내 종료를 확인하지 못했습니다.".into());}
+        }
+        if let Some(mut expiry)=self.expiry.take() {
+            let _=expiry.cancel.send(());
+            if let Some(worker)=expiry.worker.take() {
+                while !worker.is_finished()&&Instant::now()<deadline {thread::sleep(Duration::from_millis(10));}
+                if worker.is_finished() {if worker.join().is_err(){errors.push("공유 proxy 기한 감시자가 비정상 종료했습니다.".into());}}
+                else {errors.push("공유 proxy 기한 감시자의 종료를 확인하지 못했습니다.".into());}
+            }
+        }
+        if errors.is_empty(){Ok(())}else{Err(errors.join("; "))}
+    }
     fn open(exe: &OsString) -> Result<Self, String> {
         Self::open_until(exe, None, None)
     }
@@ -577,7 +621,8 @@ impl Proxy {
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         hidden(&mut command);
         let child = command.spawn().map_err(|e| format!("Cannot open existing Codex daemon proxy: {e}"))?;
-        let mut proxy = Self {child,job:None,_launch_gate:launch_gate,rpc:None,reader:None,expiry:None};
+        let mut proxy = Self {child,job:None,_launch_gate:launch_gate,rpc:None,reader:None,expiry:None,finished:false};
+        let result=(|| {
         proxy.job = Some(Arc::new(ProcessJob::assign_std(&proxy.child)?));
         if overall.is_some() || cancelled.is_some() { proxy.expiry = Some(ProxyExpiry::new(proxy.job.as_ref().unwrap(), overall, cancelled.clone())?); }
         proxy._launch_gate.release()?;
@@ -608,7 +653,7 @@ impl Proxy {
             Ok((mut ws, _)) => {
                 ws.get_mut().timeout = Duration::from_millis(500);
                 proxy.rpc = Some(Rpc {ws,next_id:0,cancelled,deadline:overall});
-                return Ok(proxy);
+                return Ok(());
             }
             Err(tungstenite::HandshakeError::Interrupted(pending)) => {
                 check_cancelled(cancelled.as_ref())?;
@@ -621,6 +666,8 @@ impl Proxy {
                 return Err("Existing Codex daemon WebSocket handshake failed; no daemon was started".into());
             }
         }}
+        })();
+        match result {Ok(())=>Ok(proxy),Err(error)=>match proxy.finish(){Ok(())=>Err(error),Err(cleanup)=>Err(format!("{error}; 소유 proxy 정리 실패: {cleanup}"))}}
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.rpc.as_mut().unwrap().call(method, params)

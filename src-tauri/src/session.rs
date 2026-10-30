@@ -671,6 +671,7 @@ impl Engine {
             let info = session.info()?;
             let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone();
             let connection = process.as_ref().map(|process|process.adapter.lock().map_err(|_| "session adapter lock poisoned").map(|adapter|adapter.as_ref().and_then(CodexSession::conversation_connection))).transpose()?.flatten();
+            if connection.as_ref().is_some_and(|connection|connection.is_deleted()) { continue; }
             let (owned,connected,pending) = connection.as_ref().map(|connection|connection.pending_snapshot()).transpose()?.unwrap_or((false,false,Vec::new()));
             for request in &pending {
                 let method = request["method"].as_str().unwrap_or("");

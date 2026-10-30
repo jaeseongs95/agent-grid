@@ -169,9 +169,9 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
                     "initialize" => json!({}),
                     "initialized" => continue,
                     "thread/start" => json!({"thread":{"id":id,"cwd":server_cwd,"status":{"type":"idle"}}}),
-                    "thread/resume" => {
-                        assert_eq!(methods.iter().filter(|method|method.as_str()=="thread/resume").count(),1,"관측 구독은 한 번만 허용한다");
-                        assert_eq!(request["params"],json!({"threadId":id,"excludeTurns":true}),"원래 대화의 이력 제외 구독 외 변경은 허용하지 않는다");
+                    "thread/subscribePassive" => {
+                        assert_eq!(methods.iter().filter(|method|method.as_str()=="thread/subscribePassive").count(),1,"수동 관측 구독은 한 번만 허용한다");
+                        assert_eq!(request["params"],json!({"threadId":id}),"원래 대화의 수동 구독 외 변경은 허용하지 않는다");
                         json!({"thread":{"id":id,"cwd":server_cwd,"turns":[],"status":{"type":"active"}}})
                     },
                     "thread/read" => json!({"thread":{"id":id,"cwd":server_cwd,"status":{"type":"active"}}}),
@@ -247,7 +247,7 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
         assert!(engine.shutdown().is_err());
         assert!(!engine.inner.exiting.load(Ordering::Acquire));
         stage("재시도 반환");
-        assert_eq!(server.join().unwrap(), ["initialize", "initialized", "thread/start", "thread/resume", "thread/read"]);
+        assert_eq!(server.join().unwrap(), ["initialize", "initialized", "thread/start", "thread/subscribePassive", "thread/read"]);
         stage("server 회수");
         no_more_connections.set_nonblocking(true).unwrap();
         assert!(matches!(no_more_connections.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock), "불명 요청을 다시 연결·전송하면 안 된다");

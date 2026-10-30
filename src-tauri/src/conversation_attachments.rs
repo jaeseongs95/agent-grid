@@ -1,6 +1,6 @@
 //! Native attachment selection and app-owned clipboard image lifetimes.
 use serde::Serialize;
-use std::{collections::BTreeMap, fs, io::Write, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
+use std::{collections::{BTreeMap, BTreeSet}, fs, io::Write, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
 
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
@@ -26,7 +26,9 @@ impl Default for Staging {
     fn default() -> Self { Self { root: std::env::temp_dir().join("opendiy-conversation-attachments-v1"), sessions: BTreeMap::new() } }
 }
 struct StagedSession { directory: PathBuf, files: BTreeMap<String, StagedFile> }
-struct StagedFile { bytes: usize, retained: bool }
+struct StagedFile { bytes: usize, retained: Option<uuid::Uuid> }
+#[derive(Debug)]
+pub struct RetentionReceipt { session_id: String, claims: Vec<(String, uuid::Uuid)> }
 struct BusyPicker(Arc<AtomicBool>);
 impl Drop for BusyPicker { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
 
@@ -77,7 +79,7 @@ impl ConversationAttachments {
         let path_text = path.to_str().ok_or("임시 이미지 경로가 올바른 유니코드가 아닙니다.")?.to_owned();
         let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| format!("임시 이미지 생성 실패: {e}"))?;
         // Record ownership before writing so a partial write is still reclaimed.
-        session.files.insert(path_text.clone(), StagedFile { bytes: bytes.len(), retained: false });
+        session.files.insert(path_text.clone(), StagedFile { bytes: bytes.len(), retained: None });
         if let Err(error) = file.write_all(&bytes) {
             drop(file);
             match fs::remove_file(&path) {
@@ -90,8 +92,8 @@ impl ConversationAttachments {
     }
 
     /// Call after generation/admission checks, before submitting paths to the runtime.
-    /// A submitted file survives every turn, including failed or cancelled turns.
-    pub fn retain_for_send(&self, session_id: &str, paths: &[String]) -> Result<(), String> {
+    /// Dropping the receipt preserves files, including ambiguous failures/cancellation.
+    pub fn retain_for_send(&self, session_id: &str, paths: &[String]) -> Result<RetentionReceipt, String> {
         let mut staged = self.staged.lock().map_err(|_| "임시 첨부 파일 상태 잠금 실패")?;
         // A staged file from another session must never be borrowed by this one.
         for (owner, session) in &staged.sessions {
@@ -99,8 +101,31 @@ impl ConversationAttachments {
                 return Err("다른 세션의 임시 첨부 파일을 전송할 수 없습니다.".into());
             }
         }
+        let mut receipt = RetentionReceipt { session_id: session_id.to_owned(), claims: Vec::new() };
         if let Some(session) = staged.sessions.get_mut(session_id) {
-            for path in paths { if let Some(file) = session.files.get_mut(path) { file.retained = true; } }
+            for path in paths.iter().collect::<BTreeSet<_>>() {
+                if let Some(file) = session.files.get_mut(path) {
+                    let token = uuid::Uuid::new_v4();
+                    if file.retained.is_none() { receipt.claims.push((path.clone(), token)); }
+                    // Even an already-retained reference fences older rollback receipts.
+                    file.retained = Some(token);
+                }
+            }
+        }
+        Ok(receipt)
+    }
+
+    /// Backend only: use exclusively for an authoritative no-side-effect rejection.
+    /// Does not delete files and cannot undo prior or subsequent send retention.
+    pub fn rollback_known_rejection(&self, session_id: &str, receipt: RetentionReceipt) -> Result<(), String> {
+        if receipt.session_id != session_id { return Err("첨부 파일 보존 영수증의 세션이 일치하지 않습니다.".into()); }
+        let mut staged = self.staged.lock().map_err(|_| "임시 첨부 파일 상태 잠금 실패")?;
+        if let Some(session) = staged.sessions.get_mut(session_id) {
+            for (path, token) in receipt.claims {
+                if let Some(file) = session.files.get_mut(&path) {
+                    if file.retained == Some(token) { file.retained = None; }
+                }
+            }
         }
         Ok(())
     }
@@ -110,7 +135,7 @@ impl ConversationAttachments {
         let mut staged = self.staged.lock().map_err(|_| "임시 첨부 파일 상태 잠금 실패")?;
         let session = staged.sessions.get_mut(session_id).ok_or("해당 세션이 소유한 임시 첨부 파일이 없습니다.")?;
         let file = session.files.get(path).ok_or("앱이 소유한 임시 첨부 파일이 아닙니다.")?;
-        if file.retained { return Err("전송에 사용된 이미지는 대화 이력 보존을 위해 자동 삭제되지 않습니다.".into()); }
+        if file.retained.is_some() { return Err("전송에 사용된 이미지는 대화 이력 보존을 위해 자동 삭제되지 않습니다.".into()); }
         remove_owned_file(path)?;
         session.files.remove(path);
         Ok(())
@@ -137,7 +162,7 @@ impl ConversationAttachments {
 impl StagedSession {
     fn cleanup(&mut self) -> Result<(), String> {
         let mut errors = Vec::new();
-        self.files.retain(|path, file| file.retained || match remove_owned_file(path) { Ok(()) => false, Err(error) => { errors.push(error); true } });
+        self.files.retain(|path, file| file.retained.is_some() || match remove_owned_file(path) { Ok(()) => false, Err(error) => { errors.push(error); true } });
         if self.files.is_empty() {
             if let Err(error) = fs::remove_dir(&self.directory) {
                 if error.kind() != std::io::ErrorKind::NotFound { errors.push(format!("임시 이미지 폴더 정리 실패: {error}")); }
@@ -458,6 +483,49 @@ mod tests {
         drop(guard);
         worker.join().unwrap();
         assert!(matches!(observed, Ok(Err(error)) if error.contains("다른 이미지 저장 작업")));
+    }
+
+    #[test]
+    fn known_rejection_rolls_back_only_new_unchanged_retention_claims() {
+        let root = std::env::temp_dir().join(format!("opendiy-attachment-receipt-test-{}", uuid::Uuid::new_v4()));
+        let directory = root.join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&directory).unwrap();
+        let manager = ConversationAttachments::test_store(root.clone());
+        let id = uuid::Uuid::new_v4().to_string();
+        let other = uuid::Uuid::new_v4().to_string();
+        let paths: Vec<String> = ["new.png", "previous.png", "racing.png", "mismatch.png"].iter().map(|name| {
+            let path = directory.join(name);
+            fs::write(&path, [1]).unwrap();
+            path.to_str().unwrap().to_owned()
+        }).collect();
+        manager.staged.lock().unwrap().sessions.insert(id.clone(), StagedSession {
+            directory: directory.clone(),
+            files: paths.iter().map(|path| (path.clone(), StagedFile { bytes: 1, retained: None })).collect(),
+        });
+        // Dropping an ambiguous/started receipt never releases its retention.
+        drop(manager.retain_for_send(&id, &[paths[1].clone()]).unwrap());
+        let rejected = manager.retain_for_send(&id, &[paths[0].clone(), paths[0].clone(), paths[1].clone()]).unwrap();
+        manager.rollback_known_rejection(&id, rejected).unwrap();
+        manager.cleanup_staged(&id, &paths[0]).unwrap();
+        assert!(manager.cleanup_staged(&id, &paths[1]).is_err());
+        assert!(manager.retain_for_send(&other, &[paths[1].clone()]).is_err());
+        // A later send from another worker fences the older request's receipt.
+        let first = manager.retain_for_send(&id, &[paths[2].clone()]).unwrap();
+        let concurrent = manager.clone();
+        let concurrent_id = id.clone();
+        let concurrent_path = paths[2].clone();
+        std::thread::spawn(move || drop(concurrent.retain_for_send(&concurrent_id, &[concurrent_path]).unwrap())).join().unwrap();
+        manager.rollback_known_rejection(&id, first).unwrap();
+        assert!(manager.cleanup_staged(&id, &paths[2]).is_err());
+        let mismatched = manager.retain_for_send(&id, &[paths[3].clone()]).unwrap();
+        assert!(manager.rollback_known_rejection(&other, mismatched).is_err());
+        assert!(manager.cleanup_staged(&id, &paths[3]).is_err());
+        manager.cleanup_all().unwrap();
+        drop(manager);
+        for path in &paths[1..] { assert!(Path::new(path).is_file()); fs::remove_file(path).unwrap(); }
+        fs::remove_dir(directory).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

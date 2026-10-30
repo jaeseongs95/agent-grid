@@ -81,7 +81,7 @@ mod platform {
             Ok(())
         }
 
-        fn active_processes(&self) -> Result<u32, String> {
+        pub(crate) fn active_processes(&self) -> Result<u32, String> {
             let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
             if unsafe { QueryInformationJobObject(self.0, JobObjectBasicAccountingInformation, &mut info as *mut _ as _, std::mem::size_of_val(&info) as u32, std::ptr::null_mut()) } == 0 {
                 Err(format!("inspect owned process job: {}", std::io::Error::last_os_error()))

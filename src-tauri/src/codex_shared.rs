@@ -51,7 +51,7 @@ impl SharedEndpoint {
         // 무인자 default proxy 분기의 private 디렉터리/비상승 상대 검사를 사용한다.
         // TUI는 같은 CLI의 daemon/version이 반환한 기본 소켓을 명시한다.
         let proxy = Proxy::open_until(&self.exe, cancelled, deadline)?;
-        self.verify()?;
+        if let Err(error)=self.verify() {return match proxy.finish(){Ok(())=>Err(error),Err(cleanup)=>Err(format!("{error}; 소유 proxy 정리 실패: {cleanup}"))};}
         Ok(proxy)
     }
     fn verify(&self) -> Result<(), String> {
