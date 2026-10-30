@@ -93,7 +93,7 @@ $('#app').innerHTML = `
     <div id="restore-banner" class="restore-banner" hidden><span>자동으로 연결하지 못한 저장 세션이 있습니다. 목록에서 다시 연결하거나 제거할 수 있습니다.</span><button id="restore-open" class="quiet-button">저장 세션 보기 →</button></div>
     <section id="search-bar" class="search-bar" hidden><label for="terminal-search">활성 터미널 검색</label><input id="terminal-search" placeholder="검색어 입력"/><button id="search-prev" class="quiet-button" aria-label="이전 검색 결과">↑</button><button id="search-next" class="quiet-button" aria-label="다음 검색 결과">↓</button><span id="search-result" role="status"></span><button id="search-close" class="icon-button" aria-label="검색 닫기">×</button></section>
     <section id="grid-area" class="grid-area" role="tabpanel"><div id="grid" class="terminal-grid"></div><div id="grid-handles"></div><div id="empty" class="empty"><div class="empty-grid">▦</div><h2>다음 작업을 펼쳐 보세요</h2><p>프로젝트 경로를 선택해 첫 세션을 시작하세요.<br>각 세션은 독립된 터미널에서 실행됩니다.</p><button id="empty-add" class="primary-button">+ 첫 세션 만들기</button><small>Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션</small></div></section>
-    <footer><span><span class="connection-dot"></span> <span id="footer-state">로컬 세션만 제어합니다</span></span><span>드래그로 순서 변경 <i>·</i> 경계선으로 크기 조절 <i>·</i> Alt + 1–9</span><span id="save-status">레이아웃 자동 저장</span></footer>
+    <footer><span class="footer-hints">드래그로 순서 변경 <i>·</i> 경계선으로 크기 조절 <i>·</i> Alt + 1–9</span><span id="save-status">레이아웃 자동 저장</span></footer>
   </main>
   <div id="toast-area" class="toast-area" role="status" aria-live="polite"></div>
   <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">설정</h2><button id="settings-close" class="icon-button" data-close aria-label="설정 닫기" autofocus>×</button></div><div class="settings-options"><button id="codex-settings-open" class="side-link" aria-haspopup="dialog" aria-controls="codex-settings-dialog"><span>⚙</span> 실행 파일 설정</button><button id="extensions-open" class="side-link" aria-haspopup="dialog" aria-controls="extensions-dialog"><span>◇</span> <span id="extensions-open-label">플러그인·스킬</span></button><button id="external-toggle" class="side-link" aria-haspopup="dialog" aria-controls="external-dialog"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button></div><div class="language-setting"><label for="language-select">언어</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div></dialog>
@@ -148,7 +148,6 @@ const markupLabels: Record<string, [string, string]> = {
   "각 세션은 독립된 터미널에서 실행됩니다.": ["각 세션은 독립된 터미널에서 실행됩니다.", "Each session runs in its own terminal."],
   "+ 첫 세션 만들기": ["+ 첫 세션 만들기", "+ Create first session"],
   "Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션": ["Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션", "Alt + 1–9 switch sessions · Ctrl + Tab next session"],
-  "로컬 세션만 제어합니다": ["로컬 세션만 제어합니다", "Controlling local sessions only"],
   "드래그로 순서 변경": ["드래그로 순서 변경", "Drag to reorder"],
   "경계선으로 크기 조절": ["경계선으로 크기 조절", "Drag borders to resize"],
   "레이아웃 자동 저장": ["레이아웃 자동 저장", "Layout autosave"],

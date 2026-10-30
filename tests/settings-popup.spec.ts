@@ -84,7 +84,7 @@ test('설정 안의 언어 선택과 닫기 버튼을 키보드로 사용한다'
 test('최소 창에서 목록과 하단 사용량을 유지하고 외부 세션은 설정에서 연다', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 800, height: 540 });
   await workspace(page);
-  await expect(page.locator('.workspace-label, .workspace-choice, .sidebar-bottom, #connection, .workspace-title')).toHaveCount(0);
+  await expect(page.locator('.workspace-label, .workspace-choice, .sidebar-bottom, #connection, #footer-state, .workspace-title')).toHaveCount(0);
   await expect(page.locator('.sidebar .brand + .sidebar-lists')).toBeVisible();
   await expect(page.locator('#projects .project-row')).toHaveCount(20);
   await expect(page.locator('#session-list .session-link')).toHaveCount(12);

@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { test, expect, type Page } from '@playwright/test';
 
 const projects = [
@@ -604,4 +605,30 @@ test('세션 상단은 확인된 압축 진행 상태만 표시하고 완료·�
   await expect(badge).toBeHidden();
   await expect(state).toHaveText('Ready');
   expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((c: any) => c.command === 'conversation_request' && c.args.request.type !== 'contextStatus'))).toEqual([]);
+});
+
+
+test('Windows 창은 내부 드래그를 허용하고 점 손잡이 이동이 프로젝트 범위·저장·터미널을 보존한다', async ({ page }) => {
+  await workspace(page);
+  await tab(page, 'Alpha').click();
+  await page.evaluate(() => { (window as any).tabsFixture.nodes = [...document.querySelectorAll('.terminal-card')].map(node => [node, node.querySelector('.xterm')]); });
+  await card(page, 'a1').locator('.drag-handle').dragTo(card(page, 'a2').locator('.terminal-header'));
+  await expect.poll(() => visibleIds(page)).toEqual(['a2', 'a1']);
+  await expect(page.locator('#session-list .session-link > span:nth-child(2)')).toHaveText(['Alpha second', 'Alpha first']);
+  await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.savedLayout?.sessions.map((item: any) => item.sessionId))).toEqual(['a2', 'b1', 'a1', 'parent', 'child', 'sibling']);
+  expect(await page.evaluate(() => (window as any).tabsFixture.nodes.every(([node, terminal]: HTMLElement[]) => node.isConnected && node.querySelector('.xterm') === terminal))).toBe(true);
+  await card(page, 'a2').locator('.drag-handle').dragTo(card(page, 'a1').locator('.terminal-header'));
+  await expect.poll(() => visibleIds(page)).toEqual(['a1', 'a2']);
+  const source = (await card(page, 'a1').locator('.drag-handle').boundingBox())!;
+  const target = (await card(page, 'a2').locator('.terminal-header').boundingBox())!;
+  await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 8 });
+  await page.keyboard.press('Escape');
+  await page.mouse.up();
+  await expect(page.locator('.terminal-card.dragging')).toHaveCount(0);
+  await expect.poll(() => visibleIds(page)).toEqual(['a1', 'a2']);
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => ['start_session', 'session_stop', 'session_write'].includes(call.command)))).toEqual([]);
+  const config = JSON.parse(await readFile(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+  expect(config.app.windows.find((window: any) => window.label === 'main').dragDropEnabled, 'Windows에서는 기본 파일 드래그 처리가 화면 내부 드래그를 가로채면 안 됩니다.').toBe(false);
 });

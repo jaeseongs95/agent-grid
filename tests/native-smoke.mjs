@@ -603,15 +603,15 @@ try {
     await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + 60); await page.mouse.down();
     await page.mouse.move(bounds.x + bounds.width / 2 + 65, bounds.y + 60, { steps: 6 }); await page.mouse.up();
     const width = await until(async () => (await first.boundingBox())?.width ?? 0, value => value > before.width + 30, 'native tile resize');
-    await first.locator('.move-right').click();
-    assert.equal((await tileTitles())[0], secondTitle, 'Tile reorder failed');
+    await first.locator('.drag-handle').dragTo(tile(secondTitle).locator('.terminal-header'));
+    await until(async () => (await tileTitles())[0], value => value === secondTitle, '점 손잡이로 실제 세션 순서 변경');
     await page.keyboard.press('Alt+1');
     assert((await tile(secondTitle).getAttribute('class')).includes('focused'), 'Keyboard focus did not move to first tile');
     await tile(secondTitle).locator('.maximize').click();
     assert.equal(await first.isVisible(), false, 'Maximize did not hide other tile');
     await page.keyboard.press('Escape');
     assert.equal(await first.isVisible(), true, 'Escape did not restore grid');
-    return { beforeWidth: before.width, afterWidth: width, orderChanged: true, keyboardFocus: true, maximizeRestored: true };
+    return { beforeWidth: before.width, afterWidth: width, orderChanged: true, reorderInput: '실제 점 손잡이 드래그', keyboardFocus: true, maximizeRestored: true };
   });
   await check('terminal search UI', async () => {
     await page.locator('#search-toggle').click();
