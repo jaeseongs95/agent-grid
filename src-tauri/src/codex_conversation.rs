@@ -441,11 +441,15 @@ fn call_observed<S: Read+Write>(control: &Control,rpc: &mut Rpc<S>,thread_id: &s
                 if method==PASSIVE_SUBSCRIBE && message["error"]["code"].as_i64()==Some(-32600) && message["error"]["data"].is_null() {
                     return Err(format!("현재 서버의 안전한 수동 구독을 확인할 수 없습니다. 호환되는 서버가 필요합니다. 재시도하거나 기존 재개 방식으로 대체하지 않았습니다. {}",result.as_ref().err().map(String::as_str).unwrap_or("응답 오류")));
                 }
-                if message["error"]["data"]["kind"] == "historyProjectionUnavailable" {
+                if message["error"]["code"].as_i64()==Some(-32600) && message["error"]["data"]["kind"].as_str()==Some("historyProjectionUnavailable")
+                    && message["error"]["data"]["reason"].as_str()==Some("unmaterialized") {
                     if matches!(method,"thread/turns/list" | "thread/items/list" | "thread/items/read") {
                         return Ok(json!({"historyUnavailable":true,"reason":message["error"]["data"]["reason"]}));
                     }
                     return Err(HISTORY_UNAVAILABLE.into());
+                }
+                if matches!(method,"thread/turns/list" | "thread/items/list" | "thread/items/read") && message["result"].get("historyUnavailable").is_some() {
+                    return Err("서버 성공 응답의 이력 대기 표식을 거부했습니다.".into());
                 }
                 return result;
             }
@@ -562,7 +566,11 @@ fn execute<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str
 }
 fn execute_context<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, request: ConversationRequest, cancelled: &AtomicBool,send_context: Option<&SendContext>) -> Result<Value, String> {
     match request {
-        ConversationRequest::Page {cursor: page_cursor} => { cursor(&page_cursor)?; bounded_page(call(control,rpc,thread_id,"thread/turns/list",json!({"threadId":thread_id,"cursor":page_cursor,"limit":20,"sortDirection":"desc","itemsView":"summary"}),cancelled)?,20) },
+        ConversationRequest::Page {cursor: page_cursor} => {
+            cursor(&page_cursor)?;
+            let value=call(control,rpc,thread_id,"thread/turns/list",json!({"threadId":thread_id,"cursor":page_cursor,"limit":20,"sortDirection":"desc","itemsView":"summary"}),cancelled)?;
+            if page_cursor.is_none() && value["historyUnavailable"]==true && value["reason"]=="unmaterialized" {Ok(value)} else {bounded_page(value,20)}
+        },
         ConversationRequest::Items {turn_id,cursor: page_cursor} => { valid_id(&turn_id)?; cursor(&page_cursor)?; bounded_page(call(control,rpc,thread_id,"thread/items/list",json!({"threadId":thread_id,"turnId":turn_id,"cursor":page_cursor,"limit":20,"sortDirection":"desc"}),cancelled)?,20) },
         ConversationRequest::Detail {turn_id,item_id,offset,snapshot_id} => {
             valid_id(&turn_id)?; valid_id(&item_id)?;
@@ -1039,12 +1047,36 @@ mod tests {
     }
     #[test]
     fn unavailable_history_is_not_an_empty_page_or_detail() {
-        for request in [ConversationRequest::Page{cursor:None},ConversationRequest::Items{turn_id:"turn".into(),cursor:None},ConversationRequest::Detail{turn_id:"turn".into(),item_id:"item".into(),offset:Some(0),snapshot_id:None}] {
+        for request in [ConversationRequest::Page{cursor:Some("older".into())},ConversationRequest::Items{turn_id:"turn".into(),cursor:None},ConversationRequest::Detail{turn_id:"turn".into(),item_id:"item".into(),offset:Some(0),snapshot_id:None}] {
             let (control,mut rpc,listener)=fixture();let server=thread::spawn(move||{
                 let(stream,_)=listener.accept().unwrap();let mut socket=WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);let request=read_request(&mut socket);
                 socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32600,"message":"not materialized","data":{"kind":"historyProjectionUnavailable","reason":"unmaterialized"}}}).to_string().into())).unwrap();
             });
             assert_eq!(execute(&control.0,&mut rpc,"original",request,&AtomicBool::new(false)).unwrap_err(),HISTORY_UNAVAILABLE);assert!(control.0.detail.lock().unwrap().is_none());drop(rpc);server.join().unwrap();
+        }
+    }
+    #[test]
+    fn first_page_waits_only_for_exact_unmaterialized_error_without_inventing_history() {
+        for(case,page_cursor,payload,waiting)in [
+            ("exact",None,json!({"error":{"code":-32600,"data":{"kind":"historyProjectionUnavailable","reason":"unmaterialized"}}}),true),
+            ("older",Some("older"),json!({"error":{"code":-32600,"data":{"kind":"historyProjectionUnavailable","reason":"unmaterialized"}}}),false),
+            ("emptyCursor",Some(""),json!({"error":{"code":-32600,"data":{"kind":"historyProjectionUnavailable","reason":"unmaterialized"}}}),false),
+            ("internal",None,json!({"error":{"code":-32603,"data":{"kind":"historyProjectionUnavailable","reason":"unmaterialized"}}}),false),
+            ("stringCode",None,json!({"error":{"code":"-32600","data":{"kind":"historyProjectionUnavailable","reason":"unmaterialized"}}}),false),
+            ("otherKind",None,json!({"error":{"code":-32600,"data":{"kind":"other","reason":"unmaterialized"}}}),false),
+            ("otherReason",None,json!({"error":{"code":-32600,"data":{"kind":"historyProjectionUnavailable","reason":"other"}}}),false),
+            ("missingReason",None,json!({"error":{"code":-32600,"data":{"kind":"historyProjectionUnavailable"}}}),false),
+            ("forgedSuccess",None,json!({"result":{"historyUnavailable":true,"reason":"unmaterialized"}}),false),
+            ("forgedEmptySuccess",None,json!({"result":{"historyUnavailable":true,"reason":"unmaterialized","data":[]}}),false),
+        ] {
+            let(control,mut rpc,listener)=fixture();let server=thread::spawn(move||{
+                let(stream,_)=listener.accept().unwrap();stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();let mut socket=WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);
+                let request=read_request(&mut socket);assert_eq!(request["method"],"thread/turns/list");assert_eq!(request["params"]["threadId"],"original");assert_eq!(request["params"]["cursor"],json!(page_cursor));
+                let mut response=payload;response["id"]=request["id"].clone();socket.send(Message::Text(response.to_string().into())).unwrap();assert_closed_without_input(&mut socket);
+            });
+            let result=execute(&control.0,&mut rpc,"original",ConversationRequest::Page{cursor:page_cursor.map(str::to_owned)},&AtomicBool::new(false));assert_eq!(result.is_ok(),waiting,"{case}");
+            if waiting {let value=result.unwrap();assert_eq!(value,json!({"historyUnavailable":true,"reason":"unmaterialized"}));assert!(value.get("data").is_none());assert!(value.get("activeTurnId").is_none());}
+            assert!(!control.0.unknown.load(Ordering::Acquire));assert!(control.0.detail.lock().unwrap().is_none());drop(rpc);server.join().unwrap();
         }
     }
     #[test]

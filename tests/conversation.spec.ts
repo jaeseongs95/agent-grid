@@ -7,7 +7,7 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
     const { createConversation } = await import('/src/conversation.ts');
     const host = document.createElement('section'); host.id = 'conversation-fixture';
     host.style.cssText = 'position:fixed;inset:20px;z-index:9999;background:#141820;'; document.body.append(host);
-    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rawFailure: '', failAt: '', pollError: '', rejectSend: false, rejectDetach: false, rejectHandoff: false, holdHandoff: false, releaseHandoff: () => {}, holdItems: false, releaseItems: () => {}, heldItems: [] as any[], historyTag: '', holdPage: false, releasePage: () => {}, holdStart: false, releaseStart: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
+    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rawFailure: '', failAt: '', pollError: '', rejectSend: false, rejectDetach: false, rejectHandoff: false, holdHandoff: false, releaseHandoff: () => {}, holdItems: false, releaseItems: () => {}, heldItems: [] as any[], historyTag: '', pageResult: undefined as any, holdPage: false, releasePage: () => {}, holdStart: false, releaseStart: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
     state.conversation = createConversation({
       sessionId: 'conversation-owned', generation: 7, host,
       ownerChanged: (owned: boolean) => fixture.owners.push(owned),
@@ -23,7 +23,7 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
         if (request.type === 'attach') return { threadId: 'thread-a', owner: 'gui', model: 'runtime-model', reasoningEffort: 'medium', historyUnavailable: fixture.historyUnavailable, activeTurnKnown: !fixture.historyUnavailable, activeTurnId: null };
         if (request.type === 'handoffToTerminal') { if (fixture.holdHandoff) await new Promise<void>(resolve => { fixture.releaseHandoff = resolve; }); if (fixture.rejectHandoff) throw Error('인계할 수 없는 요청 또는 전송 결과 미확인이 남아 있습니다'); return {}; }
         if (request.type === 'detach') { if (fixture.rejectDetach) throw Error(fixture.rawFailure || '승인 대기 중에는 전환할 수 없습니다'); return {}; }
-        if (request.type === 'page') { if (fixture.historyUnavailable) throw Error('대화 이력을 아직 조회할 수 없습니다.'); const snapshot = { data: [{ id: request.cursor ? 'older-turn' : 'recent-turn', status: 'completed' }], nextCursor: request.cursor ? null : 'turn-page-2' }; if (fixture.holdPage) await new Promise<void>(resolve => { fixture.releasePage = resolve; }); return snapshot; }
+        if (request.type === 'page') { if (fixture.historyUnavailable && !fixture.pageResult) throw Error('대화 이력을 아직 조회할 수 없습니다.'); const snapshot = fixture.pageResult ?? { data: [{ id: request.cursor ? 'older-turn' : 'recent-turn', status: 'completed' }], nextCursor: request.cursor ? null : 'turn-page-2' }; if (fixture.holdPage) await new Promise<void>(resolve => { fixture.releasePage = resolve; }); return snapshot; }
         if (request.type === 'items') {
           const turnId = request.turnId === 'older-turn' ? 'older-turn' : 'recent-turn';
           const data = request.cursor ? [{ turnId, item: { id: 'earlier-message', type: 'agentMessage', text: '이전 페이지 원문' } }] : [
@@ -584,6 +584,97 @@ test('미물질화 이력과 실행 상태 미확인은 빈 대화·유휴로 �
   await view(page).locator('.conversation-refresh').click();
   await expect(view(page).locator('.conversation-message')).toHaveCount(3);
   await expect(view(page).locator('.conversation-input')).toHaveValue('아직 보내지 않은 작업');
+});
+
+test('정확한 첫 페이지 저장 준비 대기는 미확인을 보존하고 수동 재조회로 복구한다', async ({ page }) => {
+  await conversation(page, { historyUnavailable: true });
+  await view(page).locator('.conversation-input').fill('저장 준비 중 보존할 초안');
+  await view(page).locator('.conversation-attach').click();
+  await page.evaluate(() => { (window as any).conversationFixture.pageResult = { historyUnavailable: true, reason: 'unmaterialized' }; });
+  await view(page).locator('.conversation-refresh').click();
+  await expect(view(page).locator('.conversation-status')).toContainText('이력을 저장할 준비를 기다리고 있습니다');
+  await expect(view(page).locator('.conversation-placeholder')).toContainText('비어 있거나 실행 중인 작업이 없다고 확인된 상태가 아닙니다');
+  await expect(view(page).locator('.conversation-input')).toHaveValue('저장 준비 중 보존할 초안');
+  await expect(view(page).locator('.conversation-attachment')).toHaveCount(2);
+  await expect(view(page).locator('.conversation-send')).toBeEnabled();
+  await expect(view(page).locator('.conversation-stop')).toBeDisabled();
+  await page.evaluate(async () => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage('en'); });
+  await expect(view(page).locator('.conversation-status')).toContainText('Waiting for conversation history to be ready for storage');
+  await page.evaluate(async () => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage('ko'); });
+  const polls = await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'poll').length);
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'poll').length)).toBeGreaterThan(polls + 1);
+  const before = await page.evaluate(() => ({ owners: (window as any).conversationFixture.owners, types: (window as any).conversationFixture.calls.map((value: any) => value.args.request?.type) }));
+  expect(before.owners).toEqual([true]); expect(before.types.filter((value: string) => value === 'page')).toHaveLength(1); expect(before.types).not.toContain('items'); expect(before.types).not.toContain('send');
+  await page.evaluate(() => { const fixture = (window as any).conversationFixture; fixture.pageResult = undefined; fixture.historyUnavailable = false; });
+  await view(page).locator('.conversation-refresh').click();
+  await expect(view(page).locator('.conversation-message')).toHaveCount(3);
+  await expect(view(page).locator('.conversation-status')).toContainText('대화 이력과 실행 상태를 확인했습니다');
+  await expect(view(page).locator('.conversation-input')).toHaveValue('저장 준비 중 보존할 초안');
+  await expect(view(page).locator('.conversation-attachment')).toHaveCount(2);
+});
+
+test('저장 준비 대기는 기존 구간·항목·커서·초안·첨부·실행 소유권을 보존한다', async ({ page }) => {
+  await conversation(page);
+  await view(page).locator('.conversation-input').fill('첫 작업'); await view(page).locator('.conversation-send').click();
+  await expect(view(page).locator('.conversation-stop')).toBeEnabled();
+  await view(page).locator('.conversation-input').fill('다음 작업 초안'); await view(page).locator('.conversation-attach').click();
+  const before = await view(page).locator('.conversation-messages').innerHTML();
+  await page.evaluate(() => { (window as any).conversationFixture.pageResult = { historyUnavailable: true, reason: 'unmaterialized' }; });
+  await view(page).locator('.conversation-refresh').click();
+  await expect(view(page).locator('.conversation-status')).toContainText('이력을 저장할 준비를 기다리고 있습니다');
+  expect(await view(page).locator('.conversation-messages').innerHTML()).toBe(before);
+  await expect(view(page).locator('.conversation-turns')).toHaveValue('recent-turn');
+  await expect(view(page).locator('.conversation-older')).toBeVisible(); await expect(view(page).locator('.conversation-more')).toBeVisible();
+  await expect(view(page).locator('.conversation-input')).toHaveValue('다음 작업 초안'); await expect(view(page).locator('.conversation-attachment')).toHaveCount(2);
+  await expect(view(page).locator('.conversation-stop')).toBeEnabled(); await expect(view(page).locator('.conversation-send')).toBeDisabled();
+  await view(page).locator('.conversation-more').click();
+  await expect(view(page).locator('[data-item-id="earlier-message"]')).toHaveCount(1);
+  const calls = await page.evaluate(() => (window as any).conversationFixture.calls);
+  expect(calls.filter((value: any) => value.args.request?.type === 'items').at(-1).args.request.cursor).toBe('items-page-2');
+  expect(calls.filter((value: any) => value.args.request?.type === 'send')).toHaveLength(1);
+  expect(await page.evaluate(() => (window as any).conversationFixture.owners)).toEqual([true]);
+});
+
+test('다른 대기 형태와 커서가 있는 페이지는 준비 안내로 위장하지 않는다', async ({ page }) => {
+  for (const entry of [
+    { value: { historyUnavailable: true, reason: 'other' }, older: false },
+    { value: { historyUnavailable: true }, older: false },
+    { value: { historyUnavailable: true, reason: 'unmaterialized', data: [] }, older: false },
+    { value: { historyUnavailable: true, reason: 'unmaterialized' }, older: true },
+  ]) {
+    await conversation(page); await view(page).locator('.conversation-input').fill('실패 뒤 보존할 초안');
+    await page.evaluate(value => { (window as any).conversationFixture.pageResult = value; }, entry.value);
+    await view(page).locator(entry.older ? '.conversation-older' : '.conversation-refresh').click();
+    await expect(view(page).locator('.conversation-status')).toContainText('요청을 완료하지 못했습니다');
+    await expect(view(page).locator('.conversation-message')).toHaveCount(3); await expect(view(page).locator('.conversation-turns')).toHaveValue('recent-turn');
+    await expect(view(page).locator('.conversation-input')).toHaveValue('실패 뒤 보존할 초안');
+    if (entry.older) expect(await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'page').at(-1).args.request.cursor)).toBe('turn-page-2');
+  }
+});
+
+test('지연 저장 준비 응답은 먼저 받은 실시간 실행과 항목을 덮지 않는다', async ({ page }) => {
+  await conversation(page);
+  await page.evaluate(() => { const state = window as any; state.conversationFixture.pageResult = { historyUnavailable: true, reason: 'unmaterialized' }; state.conversationFixture.holdPage = true; state.waitingPage = state.conversation.refresh(); });
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'page').length)).toBe(2);
+  await page.evaluate(() => { const fixture = (window as any).conversationFixture; fixture.queue.push({ seq: fixture.nextSeq++, method: 'turn/started', params: { turn: { id: 'live-turn' } } }, { seq: fixture.nextSeq++, method: 'item/completed', params: { turnId: 'live-turn', item: { id: 'live-waiting-item', type: 'agentMessage', text: '대기 응답보다 새로운 원문' } } }); });
+  await expect(view(page).locator('[data-item-id="live-waiting-item"]')).toHaveCount(1);
+  await page.evaluate(async () => { const state = window as any; state.conversationFixture.releasePage(); await state.waitingPage; });
+  await expect(view(page).locator('.conversation-status')).toContainText('이전 이력 응답을 적용하지 않았습니다');
+  await expect(view(page).locator('[data-item-id="live-waiting-item"]')).toHaveCount(1); await expect(view(page).locator('.conversation-stop')).toBeEnabled();
+});
+
+test('지연 저장 준비 응답은 앞선 started 응답의 새 실행 상태를 덮지 않는다', async ({ page }) => {
+  await conversation(page); await view(page).locator('.conversation-input').fill('새 실행');
+  await page.evaluate(() => { (window as any).conversationFixture.holdStart = true; });
+  await view(page).locator('.conversation-send').click();
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'send').length)).toBe(1);
+  await page.evaluate(() => { const state = window as any; state.conversationFixture.pageResult = { historyUnavailable: true, reason: 'unmaterialized' }; state.conversationFixture.holdPage = true; state.waitingPage = state.conversation.refresh(); });
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'page').length)).toBe(2);
+  await page.evaluate(() => { (window as any).conversationFixture.releaseStart(); });
+  await expect(view(page).locator('.conversation-input')).toHaveValue('');
+  await page.evaluate(async () => { const state = window as any; state.conversationFixture.releasePage(); await state.waitingPage; });
+  await expect(view(page).locator('.conversation-status')).toContainText('이전 이력 응답을 적용하지 않았습니다');
+  await expect(view(page).locator('.conversation-stop')).toBeEnabled(); await view(page).locator('.conversation-input').fill('새 실행 뒤 초안'); await expect(view(page).locator('.conversation-send')).toBeDisabled();
 });
 
 test('자기 스레드 삭제는 표시 참조와 늦은 조회를 정리하고 세션·첨부 원본과 초안을 보존한다', async ({ page }) => {

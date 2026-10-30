@@ -257,11 +257,17 @@ export function createConversation(options: ConversationOptions) {
   }
   async function loadPage(cursor = '') {
     if (deleted) return;
-    const version = epoch; const content = contentVersion; const live = liveRevision; const query = ++historyQuery; loading = true; updateControls();
+    const version = epoch; const content = contentVersion; const live = liveRevision; const activity = activityRevision; const query = ++historyQuery; loading = true; updateControls();
     try {
       const value = await rpc({ type: 'page', ...(cursor ? { cursor } : {}) });
       if (!alive(version) || !foreground || content !== contentVersion || query !== historyQuery) return;
-      if (live !== liveRevision) { staleHistory(); return; }
+      if (live !== liveRevision || activity !== activityRevision) { staleHistory(); return; }
+      if (!cursor && value.historyUnavailable === true && value.reason === 'unmaterialized' && Object.keys(value).length === 2) {
+        historyUnavailable = true; activeTurnKnown = false;
+        status('대화 이력을 저장할 준비를 기다리고 있습니다. 기존 내용과 초안을 보존합니다. 최근 대화를 다시 조회해 주세요.', 'Waiting for conversation history to be ready for storage. Existing content and your draft are preserved. Reload Recent conversation.');
+        renderItems(); return;
+      }
+      if ('historyUnavailable' in value) throw new Error(t('이력 대기 응답 형식이 올바르지 않습니다.', 'Invalid history waiting response.'));
       if (!Array.isArray(value.data)) throw new Error(t('대화 구간 목록 형식이 올바르지 않습니다.', 'Invalid conversation turn list.'));
       const wasUnknown = historyUnavailable || !activeTurnKnown; historyUnavailable = false;
       turnPage = value.data; nextTurns = string(value.nextCursor);
@@ -399,7 +405,7 @@ export function createConversation(options: ConversationOptions) {
     const id = string(turn?.id);
     if (!id) return false;
     // 시작 응답보다 완료 알림이 먼저 올 수 있으므로 더 최근 실행 상태를 보존한다.
-    if (!disposed && !deleted && version === epoch && activity === activityRevision) { activeTurn = id; activeTurnKnown = true; }
+    if (!disposed && !deleted && version === epoch && activity === activityRevision) { activityRevision++; activeTurn = id; activeTurnKnown = true; }
     return true;
   }
   async function send() {
