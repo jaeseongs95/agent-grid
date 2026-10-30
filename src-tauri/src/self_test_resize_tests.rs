@@ -20,16 +20,38 @@ fn exited_with_pending_completion() -> (Engine, SessionInfo, ReleaseCompletion) 
     let completion = ReleaseCompletion(Some(release));
     let cwd = std::env::current_dir().unwrap().to_string_lossy().into_owned();
     let request = StartRequest { cwd, title: "완료 통지 보류 fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 80, rows: 24 };
-    let session = engine.start_fixture(request, shell("[Console]::WriteLine('resize-exit-ready')").unwrap()).unwrap();
+    // 이 시험은 셸 초기화가 아니라 실제 소유 PTY의 출력·종료·완료 경계를 검증한다.
+    let root = std::env::var_os("SystemRoot").expect("SystemRoot is not defined");
+    let mut command = CommandBuilder::new(PathBuf::from(root).join("System32/cmd.exe"));
+    command.args(["/d", "/q", "/c", "echo resize-exit-ready"]);
+    let session = engine.start_fixture(request, command).unwrap();
     let mut output = String::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut frames = 0;
+    let mut cursor_reply_errors = 0;
+    let mut last_state = (session.state.clone(), session.active);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
     loop {
-        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap() {
+        let event = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())).unwrap_or_else(|error| {
+            // 출력 원문·경로·환경은 기록하지 않고 이 전용 fixture의 진행 단계만 남긴다.
+            let marker = output.contains("resize-exit-ready");
+            let stage = if marker { "표식 수신 뒤 종료·정리 대기" } else if frames > 0 { "출력 수신 뒤 표식 대기" } else { "첫 출력 대기" };
+            let current = engine.list().map(|infos| infos.into_iter()
+                .find(|info| info.id == session.id && info.generation == session.generation)
+                .map(|info| (info.state, info.active)));
+            let completion_state = engine.wait_for_exit(&session.id, session.generation, Duration::ZERO)
+                .map(|info| (info.state, info.active));
+            panic!("종료 준비 실패: 단계={stage}, 수신오류={error:?}, 경과={:?}, 표식={marker}, 출력프레임={frames}, 출력바이트={}, 직전상태={last_state:?}, 엔진상태={current:?}, 완료확인={completion_state:?}, 커서질의={}, 커서응답실패={cursor_reply_errors}", started.elapsed(), output.len(), output.matches("\x1b[6n").count());
+        });
+        match event {
             BackendEvent::Output(chunk) => {
+                frames += 1;
                 engine.acknowledge(&chunk.id, chunk.generation, chunk.seq).unwrap();
                 let previous = output.matches("\x1b[6n").count();
                 output.push_str(&chunk.data);
-                for _ in previous..output.matches("\x1b[6n").count() { let _ = engine.write(&chunk.id, chunk.generation, "\x1b[1;1R"); }
+                for _ in previous..output.matches("\x1b[6n").count() {
+                    if engine.write(&chunk.id, chunk.generation, "\x1b[1;1R").is_err() { cursor_reply_errors += 1; }
+                }
             }
             BackendEvent::Changed(info) if !info.active => {
                 assert_eq!(info.state, "exited");
@@ -37,7 +59,7 @@ fn exited_with_pending_completion() -> (Engine, SessionInfo, ReleaseCompletion) 
                 eprintln!("판별 fixture: state={}, active={}, 완료 이벤트 전달 보류 중", info.state, info.active);
                 return (engine, session, completion);
             }
-            _ => {}
+            BackendEvent::Changed(info) => { last_state = (info.state, info.active); }
         }
     }
 }
