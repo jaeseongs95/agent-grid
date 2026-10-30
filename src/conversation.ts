@@ -16,7 +16,6 @@ interface QuestionDraft { value: string; other?: string }
 const MAX_VISIBLE_ITEMS = 100;
 const MAX_ATTACHMENTS = 12;
 const PREVIEW_CHARACTERS = 16 * 1024;
-const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const string = (value: unknown) => typeof value === 'string' ? value : '';
 
 /** One controller owns one session's draft, bounded visible page and GUI input lease. */
@@ -50,7 +49,7 @@ export function createConversation(options: ConversationOptions) {
   let polling: ReturnType<typeof setTimeout> | undefined;
   let sending = false; let interrupting = false; let uncertain = false; let composing = false; let loading = false; let staging = false;
   let modelsLoading = false;
-  let lastSendError = '';
+  let sendFailed = false;
   let activeTurn = ''; let selectedTurn = ''; let nextTurns = ''; let nextItems = ''; let nextModels = '';
   let activeTurnKnown = false; let historyUnavailable = false; let deleted = false;
   let items: Entry[] = []; let turnPage: Json[] = []; let models: Json[] = [];
@@ -66,7 +65,7 @@ export function createConversation(options: ConversationOptions) {
   const rpc = <T = Json>(request: Json) => options.call<T>('conversation_request', { id: options.sessionId, generation: options.generation, request });
   const alive = (version: number) => !disposed && visible && version === epoch;
   function status(ko: string, en = ko) { if (!disposed) bindText($('.conversation-status'), ko, en); }
-  function failure(error: unknown) { status(`오류: ${errorText(error)}`, `Error: ${errorText(error)}`); }
+  function failure(_error: unknown) { status('요청을 완료하지 못했습니다. 연결과 진행 중인 요청을 확인해 주세요. 초안은 보존됩니다.', 'Could not complete the request. Check the connection and any pending requests. Your draft is preserved.'); }
   function button(selector: string) { return $<HTMLButtonElement>(selector); }
   function updateControls() {
     const ready = visible && attached && connected && !loading && !deleted;
@@ -347,7 +346,7 @@ export function createConversation(options: ConversationOptions) {
         changing = changing.catch(failure).then(async () => {
           if (!attached || disposed) return;
           try { await rpc({ type: 'detach' }); if (disposed) return; attached = false; options.ownerChanged?.(false); status('원래 대화가 삭제되어 연결을 해제했습니다. 초안은 보존했습니다.', 'The deleted thread connection was released. Your draft is preserved.'); }
-          catch (error) { if (!disposed) status(`원래 대화가 삭제되었습니다. 연결 해제 확인 실패: ${errorText(error)}`, `The original thread was deleted. Could not confirm connection release: ${errorText(error)}`); }
+          catch { if (!disposed) status('원래 대화가 삭제되었습니다. 연결 해제를 확인하지 못해 입력을 제한합니다. 초안은 보존됩니다.', 'The original thread was deleted. Input remains blocked until connection release is confirmed. Your draft is preserved.'); }
         });
       }
       return;
@@ -357,8 +356,8 @@ export function createConversation(options: ConversationOptions) {
       if (threadId && value.threadId === threadId && value.threadSettings && typeof value.threadSettings === 'object' && !Array.isArray(value.threadSettings)) confirmedSettings(value.threadSettings.model, value.threadSettings.effort);
     }
     else if (event.method === 'turn/started') { liveRevision++; activeTurn = string(value.turn?.id ?? value.turnId); activeTurnKnown = true; selectedTurn = activeTurn; items = []; nextItems = ''; itemsDirty = true; }
-    else if (event.method === 'turn/completed') { liveRevision++; if (activeTurn === string(value.turn?.id ?? value.turnId)) { activeTurn = ''; activeTurnKnown = true; } if (value.turn?.error) upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.turn.error.message) || JSON.stringify(value.turn.error) }); }
-    else if (event.method === 'error') upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.error?.message ?? value.message) || JSON.stringify(value) });
+    else if (event.method === 'turn/completed') { liveRevision++; if (activeTurn === string(value.turn?.id ?? value.turnId)) { activeTurn = ''; activeTurnKnown = true; } if (value.turn?.error) upsert({ id: `error-${event.seq}`, role: 'error', text: t('작업을 완료하지 못했습니다. 연결과 진행 중인 요청을 확인해 주세요.', 'The task could not finish. Check the connection and any pending requests.') }); }
+    else if (event.method === 'error') upsert({ id: `error-${event.seq}`, role: 'error', text: t('작업을 완료하지 못했습니다. 연결과 진행 중인 요청을 확인해 주세요.', 'The task could not finish. Check the connection and any pending requests.') });
     else if (!value.turnId || value.turnId === selectedTurn) {
       if (event.method === 'item/started' || event.method === 'item/completed') { if (value.item) upsert(itemEntry(value.item)); }
       else if (event.method === 'item/agentMessage/delta') upsert({ id: string(value.itemId), role: 'assistant', text: string(value.delta), detail: value.delta?.__detail === true }, true);
@@ -375,14 +374,14 @@ export function createConversation(options: ConversationOptions) {
       connected = value.connected === true;
       if (typeof value.unknownResult === 'boolean') {
         const wasUncertain = uncertain; uncertain = value.unknownResult;
-        if (wasUncertain && !uncertain && lastSendError) { status(`전송이 거절되었습니다. 초안을 보존했습니다. ${lastSendError}`, `Send was rejected. Your draft is preserved. ${lastSendError}`); lastSendError = ''; }
+        if (wasUncertain && !uncertain && sendFailed) { status('전송이 거절되었습니다. 초안을 보존했습니다. 입력 내용을 확인한 뒤 다시 전송할 수 있습니다.', 'Send was rejected. Your draft is preserved. Review it before sending again.'); sendFailed = false; }
       }
       if (value.gap) { confirmedSettings(undefined, undefined); status('실시간 수신 구간이 누락되었습니다. 최근 대화를 다시 불러오세요.', 'Some live events were missed. Reload Recent conversation.'); button('.conversation-refresh').classList.add('needs-refresh'); }
       for (const event of value.events ?? []) { receive(event); if (deleted) return; }
       if (itemsDirty) { itemsDirty = false; renderItems(); }
       pendingRequests = value.pendingRequests ?? pendingRequests; renderRequests();
       const knownRequests = new Set(pendingRequests.map(event => event.requestId)); for (const id of questionDrafts.keys()) if (!knownRequests.has(id)) questionDrafts.delete(id);
-      if (value.error) status(`연결 오류: ${value.error}`, `Connection error: ${value.error}`);
+      if (value.error) status('연결을 확인하지 못했습니다. 연결이 복구될 때까지 기다려 주세요. 초안은 보존됩니다.', 'Could not confirm the connection. Wait for it to recover. Your draft is preserved.');
       updateControls();
     } catch (error) { if (alive(version) && foreground && revision === pollVersion) { connected = false; failure(error); updateControls(); } }
     finally { if (alive(version) && foreground && attached && revision === pollVersion) polling = setTimeout(() => void poll(version, revision), 400); }
@@ -398,8 +397,8 @@ export function createConversation(options: ConversationOptions) {
       modelDraft = false; effortDraft = false; renderModels();
       if (input.value === draft) input.value = ''; attachments = []; for (const value of sentAttachments) stagedPaths.delete(value.path); renderAttachments();
       if (alive(version)) status('전송했습니다.', 'Sent.');
-    } catch (error) {
-      if (!disposed && !deleted) { uncertain = true; lastSendError = errorText(error); status(`전송 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 초안을 보존했습니다. ${lastSendError}`, `Send result is unknown. It will not be resent automatically. Your draft is preserved. ${lastSendError}`); }
+    } catch {
+      if (!disposed && !deleted) { uncertain = true; sendFailed = true; status('전송 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 초안을 보존했습니다. 연결과 진행 중인 요청을 확인해 주세요.', 'Send result is unknown. It will not be resent automatically. Your draft is preserved. Check the connection and any pending requests.'); }
     } finally { sending = false; if (!disposed) { renderAttachments(); updateControls(); } }
   }
   async function interrupt() {
@@ -460,7 +459,7 @@ export function createConversation(options: ConversationOptions) {
           catch (error) { if (!disposed) { visible = true; host.hidden = false; connected = false; failure(error); updateControls(); startPolling(); } throw error; }
           attached = false; options.ownerChanged?.(false); return;
         }
-        connected = true; uncertain = false; lastSeq = 0; threadId = string(value.threadId ?? value.thread?.id); confirmedSettings(value.model, value.reasoningEffort);
+        connected = true; uncertain = false; sendFailed = false; lastSeq = 0; threadId = string(value.threadId ?? value.thread?.id); confirmedSettings(value.model, value.reasoningEffort);
         historyUnavailable = value.historyUnavailable === true; activeTurnKnown = value.activeTurnKnown === true;
         activeTurn = activeTurnKnown ? string(value.activeTurnId) : ''; pendingRequests = []; renderRequests(); renderModels(); renderItems();
         if (historyUnavailable || !activeTurnKnown) status('연결됨 · 이력 또는 실행 상태 미확인. 전송 시 실행 환경이 입력 가능 여부를 확인합니다.', 'Connected · History or activity state is unknown. The runtime checks whether a new message can start.');

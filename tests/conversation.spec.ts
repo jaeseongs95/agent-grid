@@ -7,20 +7,22 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
     const { createConversation } = await import('/src/conversation.ts');
     const host = document.createElement('section'); host.id = 'conversation-fixture';
     host.style.cssText = 'position:fixed;inset:20px;z-index:9999;background:#141820;'; document.body.append(host);
-    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, rejectHandoff: false, holdHandoff: false, releaseHandoff: () => {}, holdItems: false, releaseItems: () => {}, heldItems: [] as any[], historyTag: '', holdPage: false, releasePage: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
+    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rawFailure: '', failAt: '', pollError: '', rejectSend: false, rejectDetach: false, rejectHandoff: false, holdHandoff: false, releaseHandoff: () => {}, holdItems: false, releaseItems: () => {}, heldItems: [] as any[], historyTag: '', holdPage: false, releasePage: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
     state.conversation = createConversation({
       sessionId: 'conversation-owned', generation: 7, host,
       ownerChanged: (owned: boolean) => fixture.owners.push(owned),
       async call(command: string, args: any = {}) {
         fixture.calls.push({ command, args });
+        if (fixture.failAt === command) throw Error(fixture.rawFailure);
         if (command === 'choose_conversation_attachments') return [{ type: 'file', path: 'D:\\work\\notes.txt', name: 'notes.txt' }, { type: 'localImage', path: 'D:\\work\\image.png', name: 'image.png' }];
         if (command === 'stage_conversation_image') return { type: 'localImage', path: 'D:\\stage\\pasted.png', name: 'pasted.png' };
         if (command === 'cleanup_conversation_attachment') return null;
         if (command !== 'conversation_request') throw Error(`알 수 없는 명령 ${command}`);
         const request = args.request;
+        if (fixture.failAt === request.type) throw Error(fixture.rawFailure);
         if (request.type === 'attach') return { threadId: 'thread-a', owner: 'gui', model: 'runtime-model', reasoningEffort: 'medium', historyUnavailable: fixture.historyUnavailable, activeTurnKnown: !fixture.historyUnavailable, activeTurnId: null };
         if (request.type === 'handoffToTerminal') { if (fixture.holdHandoff) await new Promise<void>(resolve => { fixture.releaseHandoff = resolve; }); if (fixture.rejectHandoff) throw Error('인계할 수 없는 요청 또는 전송 결과 미확인이 남아 있습니다'); return {}; }
-        if (request.type === 'detach') { if (fixture.rejectDetach) throw Error('승인 대기 중에는 전환할 수 없습니다'); return {}; }
+        if (request.type === 'detach') { if (fixture.rejectDetach) throw Error(fixture.rawFailure || '승인 대기 중에는 전환할 수 없습니다'); return {}; }
         if (request.type === 'page') { if (fixture.historyUnavailable) throw Error('대화 이력을 아직 조회할 수 없습니다.'); const snapshot = { data: [{ id: request.cursor ? 'older-turn' : 'recent-turn', status: 'completed' }], nextCursor: request.cursor ? null : 'turn-page-2' }; if (fixture.holdPage) await new Promise<void>(resolve => { fixture.releasePage = resolve; }); return snapshot; }
         if (request.type === 'items') {
           const turnId = request.turnId === 'older-turn' ? 'older-turn' : 'recent-turn';
@@ -41,8 +43,8 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
           { id: 'runtime-model-id', model: 'runtime-model', displayName: '실제 런타임 모델', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }] },
           { id: 'server-model-2', model: 'server-model-2', displayName: '서버의 두 번째 모델', supportedReasoningEfforts: [{ reasoningEffort: 'high' }, { reasoningEffort: 'medium' }] },
         ], nextCursor: null };
-        if (request.type === 'poll') return { events: fixture.queue.splice(0), pendingRequests: fixture.pending, connected: fixture.connected, gap: false, unknownResult: fixture.unknownResult };
-        if (request.type === 'send') { if (fixture.rejectSend) throw Error('응답 시간 초과'); return { turn: { id: 'sent-turn', status: 'inProgress' } }; }
+        if (request.type === 'poll') return { events: fixture.queue.splice(0), pendingRequests: fixture.pending, connected: fixture.connected, gap: false, unknownResult: fixture.unknownResult, error: fixture.pollError || undefined };
+        if (request.type === 'send') { if (fixture.rejectSend) throw Error(fixture.rawFailure || '응답 시간 초과'); return { turn: { id: 'sent-turn', status: 'inProgress' } }; }
         if (request.type === 'interrupt') { fixture.queue.push({ seq: fixture.nextSeq++, method: 'turn/completed', params: { turn: { id: request.turnId, status: 'interrupted' } } }); return {}; }
         if (request.type === 'respond') { fixture.pending = fixture.pending.map((entry: any) => entry.requestId === request.requestId ? { ...entry, responded: true } : entry); return {}; }
         if (request.type === 'detail') {
@@ -59,6 +61,91 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
   await expect(page.locator('#conversation-fixture .conversation-input')).toBeEnabled();
 }
 const view = (page: Page) => page.locator('#conversation-fixture');
+const privateFailure = 'PRIVATE_INTERNAL_FAILURE C:\\private-cli\\codex.exe token=FAKE_AUTH_TOKEN_DO_NOT_DISPLAY';
+async function expectPrivateFailureHidden(page: Page) {
+  const html = await view(page).evaluate(node => node.outerHTML);
+  for (const marker of ['PRIVATE_INTERNAL_FAILURE', 'private-cli', 'FAKE_AUTH_TOKEN_DO_NOT_DISPLAY']) expect(html).not.toContain(marker);
+}
+
+test('모델·첨부·승인·상세·인계 오류는 원문과 경로 대신 행동 안내만 표시한다', async ({ page }) => {
+  for (const operation of ['models', 'choose_conversation_attachments', 'stage_conversation_image', 'respond', 'detail', 'handoffToTerminal']) {
+    await test.step(operation, async () => {
+      await conversation(page);
+      await view(page).locator('.conversation-input').fill('오류 뒤 보존할 초안');
+      await page.evaluate(({ operation, privateFailure }) => {
+        const fixture = (window as any).conversationFixture; fixture.failAt = operation; fixture.rawFailure = privateFailure;
+        if (operation === 'respond') fixture.pending = [{ seq: 1, requestId: 'approval-private', method: 'item/commandExecution/requestApproval', params: { command: '검사 명령' } }];
+        if (operation === 'detail') fixture.largeHistory = true;
+      }, { operation, privateFailure });
+      if (operation === 'models') await page.evaluate(async () => { const state = window as any; await state.conversation.setVisible(false); await state.conversation.setVisible(true); });
+      else if (operation === 'choose_conversation_attachments') await view(page).locator('.conversation-attach').click();
+      else if (operation === 'stage_conversation_image') await view(page).locator('.conversation-input').evaluate(node => {
+        const data = new DataTransfer(); data.items.add(new File(['image'], 'pasted.png', { type: 'image/png' }));
+        node.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+      });
+      else if (operation === 'respond') await view(page).getByRole('button', { name: '이번만 승인', exact: true }).click();
+      else if (operation === 'detail') {
+        await view(page).locator('.conversation-refresh').click();
+        await view(page).locator('[data-item-id="large-item"]').getByRole('button', { name: '전체 내용 보기', exact: true }).click();
+      } else await page.evaluate(async () => { try { await (window as any).conversation.handoffToTerminal(); } catch {} });
+      await expect(view(page).locator('.conversation-status')).toContainText('연결과 진행 중인 요청을 확인해 주세요');
+      await expect(view(page).locator('.conversation-input')).toHaveValue('오류 뒤 보존할 초안');
+      await expectPrivateFailureHidden(page);
+      if (operation === 'models') await expect(view(page).locator('.conversation-model')).toBeDisabled();
+      if (operation === 'respond') await expect(view(page).getByRole('button', { name: '이번만 승인', exact: true })).toBeDisabled();
+      if (operation === 'handoffToTerminal') expect(await page.evaluate(() => (window as any).conversationFixture.owners)).toEqual([true]);
+      await page.evaluate(async () => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage('en'); });
+      await expect(view(page).locator('.conversation-status')).toContainText('Check the connection and any pending requests');
+      await expectPrivateFailureHidden(page);
+      await page.evaluate(async () => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage('ko'); });
+    });
+  }
+});
+
+test('전송 원문 오류는 숨기면서 결과 미확인 차단과 확정 거절의 초안 보존을 구분한다', async ({ page }) => {
+  await conversation(page);
+  await view(page).locator('.conversation-input').fill('중복 전송하면 안 되는 초안');
+  await page.evaluate(privateFailure => { const fixture = (window as any).conversationFixture; fixture.rejectSend = true; fixture.rawFailure = privateFailure; }, privateFailure);
+  await view(page).locator('.conversation-send').click();
+  await expect(view(page).locator('.conversation-status')).toContainText('자동으로 다시 보내지 않습니다');
+  await expect(view(page).locator('.conversation-send')).toBeDisabled();
+  await expectPrivateFailureHidden(page);
+  await page.waitForTimeout(850);
+  expect(await page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args.request?.type === 'send').length)).toBe(1);
+  await page.evaluate(() => { (window as any).conversationFixture.unknownResult = false; });
+  await expect(view(page).locator('.conversation-status')).toContainText('입력 내용을 확인한 뒤 다시 전송할 수 있습니다');
+  await expect(view(page).locator('.conversation-input')).toBeEnabled();
+  await expect(view(page).locator('.conversation-input')).toHaveValue('중복 전송하면 안 되는 초안');
+  await expectPrivateFailureHidden(page);
+});
+
+test('작업·연결·삭제 해제 오류는 원문을 숨기고 도구 본문과 입력 차단을 보존한다', async ({ page }) => {
+  await conversation(page);
+  await view(page).locator('.conversation-input').fill('삭제 뒤 보존할 초안');
+  await page.evaluate(privateFailure => {
+    const fixture = (window as any).conversationFixture; fixture.rawFailure = privateFailure;
+    fixture.queue.push(
+      { seq: fixture.nextSeq++, method: 'turn/completed', params: { turn: { id: 'recent-turn', status: 'failed', error: { message: privateFailure, additionalDetails: privateFailure } } } },
+      { seq: fixture.nextSeq++, method: 'error', params: { error: { message: privateFailure }, privateDetails: privateFailure } },
+      { seq: fixture.nextSeq++, method: 'item/completed', params: { turnId: 'recent-turn', item: { id: 'tool-public', type: 'commandExecution', command: '검사 명령', aggregatedOutput: '도구 본문 PUBLIC_TOOL_OUTPUT 유지', status: 'completed' } } },
+    );
+  }, privateFailure);
+  await expect(view(page).locator('.conversation-error')).toHaveCount(2);
+  await expect(view(page).locator('.conversation-error').first()).toContainText('연결과 진행 중인 요청을 확인해 주세요');
+  await view(page).locator('[data-item-id="tool-public"] summary').click();
+  await expect(view(page).locator('[data-item-id="tool-public"]')).toContainText('도구 본문 PUBLIC_TOOL_OUTPUT 유지');
+  await expectPrivateFailureHidden(page);
+  await page.evaluate(privateFailure => { const fixture = (window as any).conversationFixture; fixture.pollError = privateFailure; fixture.connected = false; }, privateFailure);
+  await expect(view(page).locator('.conversation-status')).toContainText('연결이 복구될 때까지 기다려 주세요');
+  await expect(view(page).locator('.conversation-send')).toBeDisabled();
+  await expectPrivateFailureHidden(page);
+  await page.evaluate(() => { const fixture = (window as any).conversationFixture; fixture.pollError = ''; fixture.rejectDetach = true; fixture.queue.push({ seq: fixture.nextSeq++, method: 'thread/deleted', params: { threadId: 'thread-a' } }); });
+  await expect(view(page).locator('.conversation-status')).toContainText('연결 해제를 확인하지 못해 입력을 제한합니다');
+  await expect(view(page).locator('.conversation-input')).toHaveValue('삭제 뒤 보존할 초안');
+  await expect(view(page).locator('.conversation-input')).toBeDisabled();
+  expect(await page.evaluate(() => (window as any).conversationFixture.owners)).toEqual([true]);
+  await expectPrivateFailureHidden(page);
+});
 
 test('명시 인계만 전용 요청을 보내고 성공 확인 뒤 화면과 입력 소유권을 해제한다', async ({ page }) => {
   await conversation(page);
@@ -242,7 +329,7 @@ test('전환은 세션별 초안을 보존하며 detach 거절 때 소유권과 
   expect(rejected).toBe(true);
   await expect(view(page)).toBeVisible();
   expect(await page.evaluate(() => (window as any).conversationFixture.owners.at(-1))).toBe(true);
-  await expect(view(page).locator('.conversation-status')).toContainText('승인 대기');
+  await expect(view(page).locator('.conversation-status')).toContainText('진행 중인 요청을 확인해 주세요');
 });
 
 test('승인·선택 질문은 명시 응답만 보내고 poll 동안 선택을 보존한다', async ({ page }) => {
@@ -346,13 +433,13 @@ test('명시 거절은 초안을 편집할 수 있고 늦은 조회는 숨긴 �
   expect(await page.evaluate(() => (window as any).conversationFixture.calls.length)).toBe(count);
 });
 
-for (const [mode, expectedError] of [['other-turn', '다른 대화 구간'], ['missing-id', '항목 식별자']] as const) {
+for (const mode of ['other-turn', 'missing-id'] as const) {
   test(`실제 이력 항목 구조의 ${mode} 응답은 거부하고 기존 표시를 보존한다`, async ({ page }) => {
     await conversation(page);
     const previous = await view(page).locator('.conversation-message').evaluateAll(rows => rows.map(row => ({ id: row.getAttribute('data-item-id'), text: row.textContent })));
     await page.evaluate(mode => { (window as any).conversationFixture.invalidHistory = mode; }, mode);
     await view(page).locator('.conversation-refresh').click();
-    await expect(view(page).locator('.conversation-status')).toContainText(expectedError);
+    await expect(view(page).locator('.conversation-status')).toContainText('연결과 진행 중인 요청을 확인해 주세요');
     expect(await view(page).locator('.conversation-message').evaluateAll(rows => rows.map(row => ({ id: row.getAttribute('data-item-id'), text: row.textContent })))).toEqual(previous);
     const details = await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'detail'));
     expect(details).toEqual([]);

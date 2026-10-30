@@ -61,7 +61,8 @@ test('failed attach keeps the owned conversation visible and terminal input bloc
   await expect(card.locator('.terminal-host')).toBeHidden();
   await expect(card.locator('.conversation-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(card.locator('.conversation-input')).toBeDisabled();
-  await expect(card.locator('.conversation-status')).toContainText('fixture attach failure');
+  await expect(card.locator('.conversation-status')).not.toContainText('fixture attach failure');
+  await expect(card.locator('.conversation-status')).not.toBeEmpty();
   const calls = await page.evaluate(() => (window as any).chatCalls);
   expect(calls.some((entry: any) => entry.command === 'session_write')).toBe(false);
 });
@@ -79,7 +80,8 @@ test('명시 터미널 인계가 거절되면 대화 화면과 초안을 유지�
   await expect(card.locator('.terminal-host')).toBeHidden();
   await expect(card.locator('.conversation-toggle')).toHaveAttribute('aria-pressed', 'true');
   await expect(card.locator('.conversation-input')).toHaveValue('보존해야 하는 인계 초안');
-  await expect(card.locator('.conversation-status')).toContainText('fixture handoff failure');
+  await expect(card.locator('.conversation-status')).not.toContainText('fixture handoff failure');
+  await expect(card.locator('.conversation-status')).not.toBeEmpty();
   expect(await page.evaluate(() => (window as any).chatCalls.some((entry: any) => entry.command === 'session_write'))).toBe(false);
   await page.evaluate(() => { (window as any).handoffFailure = false; });
   await card.locator('.conversation-toggle').click();
