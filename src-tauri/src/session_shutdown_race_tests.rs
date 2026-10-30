@@ -118,7 +118,8 @@ class Fixture {
    }
   }
   if (args.Length > 0 && args[0] == "resume") {
-   File.WriteAllText(Path.Combine(root,"tui.pid"),System.Diagnostics.Process.GetCurrentProcess().Id.ToString());
+   File.WriteAllText(Path.Combine(root,"tui.pid.pending"),System.Diagnostics.Process.GetCurrentProcess().Id.ToString());
+   File.Move(Path.Combine(root,"tui.pid.pending"),Path.Combine(root,"tui.pid"));
    DateTime deadline=DateTime.UtcNow.AddSeconds(15);
    while (!File.Exists(Path.Combine(root,"tui.exit")) && DateTime.UtcNow < deadline) Thread.Sleep(10);
    return 0;
@@ -219,6 +220,9 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
             }
             root.join("tui.pid").exists()
         });
+        // WriteAllText의 생성과 내용 기록 사이를 준비 완료로 오인하지 않는다.
+        // 닫힌 임시 파일의 rename 게시 뒤에만 원래 TUI PID를 읽는다.
+        assert!(!root.join("tui.pid.pending").exists(), "PID 원문이 완전히 기록된 뒤 게시되어야 한다");
         let pid: u32 = fs::read_to_string(root.join("tui.pid")).unwrap().parse().unwrap();
         let handle = unsafe { OpenProcess(0x00100000, 0, pid) };
         assert!(!handle.is_null());
