@@ -34,7 +34,10 @@ async function conversation(page: Page) {
           if (fixture.invalidHistory === 'missing-id') delete (data[0].item as any).id;
           return { data, nextCursor: request.cursor ? null : 'items-page-2', backwardsCursor: null };
         }
-        if (request.type === 'models') return { data: [{ id: 'runtime-model-id', model: 'runtime-model', displayName: '실제 런타임 모델', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }] }], nextCursor: null };
+        if (request.type === 'models') return { data: [
+          { id: 'runtime-model-id', model: 'runtime-model', displayName: '실제 런타임 모델', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }] },
+          { id: 'server-model-2', model: 'server-model-2', displayName: '서버의 두 번째 모델', supportedReasoningEfforts: [{ reasoningEffort: 'high' }, { reasoningEffort: 'medium' }] },
+        ], nextCursor: null };
         if (request.type === 'poll') return { events: fixture.queue.splice(0), pendingRequests: fixture.pending, connected: true, gap: false, unknownResult: fixture.unknownResult };
         if (request.type === 'send') { if (fixture.rejectSend) throw Error('응답 시간 초과'); return { turn: { id: 'sent-turn', status: 'inProgress' } }; }
         if (request.type === 'interrupt') { fixture.queue.push({ seq: fixture.nextSeq++, method: 'turn/completed', params: { turn: { id: request.turnId, status: 'interrupted' } } }); return {}; }
@@ -280,4 +283,42 @@ test('승인 선택지는 필드 부재와 명시적인 빈 값·미지원 값�
     { type: 'respond', requestId: 'approval-필드 없음', result: { decision: 'decline' } },
     { type: 'respond', requestId: 'approval-혼합 목록', result: { decision: 'decline' } },
   ]);
+});
+
+test('같은 스레드의 확정 설정 알림은 현재값을 갱신하고 미전송 모델·추론 선택과 구분한다', async ({ page }) => {
+  await conversation(page);
+  async function settings(threadId: string, values: Record<string, unknown>) {
+    await page.evaluate(({ threadId, values }) => {
+      const fixture = (window as any).conversationFixture;
+      fixture.queue.push({ seq: fixture.nextSeq++, method: 'thread/settings/updated', params: { threadId, threadSettings: {
+        approvalPolicy: 'on-request', approvalsReviewer: 'user', cwd: 'D:\\fixture', modelProvider: 'fixture-provider',
+        sandboxPolicy: { type: 'workspaceWrite', writableRoots: ['D:\\fixture'], networkAccess: false, excludeSlashTmp: false, excludeTmpdirEnvVar: false },
+        collaborationMode: { mode: 'default', settings: { model: values.model ?? 'runtime-model', reasoning_effort: 'high', developer_instructions: null } },
+        ...values,
+      } } });
+    }, { threadId, values });
+  }
+  const model = view(page).locator('.conversation-model'); const effort = view(page).locator('.conversation-effort');
+  await settings('thread-a', { model: 'server-model-2', effort: 'high' });
+  await expect(model).toHaveValue('server-model-2'); await expect(effort).toHaveValue('high');
+  const confirmed = view(page).locator('.conversation-current-settings');
+  await expect(confirmed).toContainText('server-model-2'); await expect(confirmed).toContainText('high');
+  await settings('foreign-thread', { model: 'unrelated-model', effort: 'unrelated-effort' });
+  await page.waitForTimeout(500); await expect(model).toHaveValue('server-model-2'); await expect(confirmed).not.toContainText('unrelated');
+  await effort.selectOption('medium');
+  await settings('thread-a', { model: 'runtime-model', effort: 'low' });
+  await expect(confirmed).toContainText('runtime-model'); await expect(model).toHaveValue('server-model-2'); await expect(effort).toHaveValue('medium');
+  await settings('thread-a', { model: 'server-model-2', effort: 'high' }); await expect(confirmed).toContainText('high');
+  await view(page).locator('.conversation-input').fill('아직 보내지 않은 초안');
+  await model.selectOption('runtime-model'); await effort.selectOption('low');
+  await expect(confirmed).toContainText('server-model-2'); await expect(confirmed).not.toContainText('low');
+  await settings('thread-a', { model: 'server-model-2', effort: 'medium' });
+  await expect(confirmed).toContainText('medium'); await expect(model).toHaveValue('runtime-model'); await expect(effort).toHaveValue('low');
+  await settings('thread-a', { model: 'server-model-2' });
+  await expect(confirmed).toContainText('추론: 미확인'); await expect(confirmed).not.toContainText('high');
+  await expect(model).toHaveValue('runtime-model'); await expect(effort).toHaveValue('low');
+  await settings('thread-a', { model: 'server-model-2', effort: null });
+  await expect(confirmed).toContainText('추론: 미확인');
+  await expect(view(page).locator('.conversation-input')).toHaveValue('아직 보내지 않은 초안');
+  expect(await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'send').length)).toBe(0);
 });

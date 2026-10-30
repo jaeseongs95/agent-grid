@@ -25,7 +25,7 @@ export function createConversation(options: ConversationOptions) {
   host.classList.add('conversation-host');
   host.hidden = true;
   host.innerHTML = `<div class="conversation-navigation"><button class="quiet-button conversation-refresh" type="button">최근 대화</button><select class="conversation-turns" aria-label="대화 구간"></select><button class="quiet-button conversation-older" type="button" hidden>이전 구간</button></div>
-    <div class="conversation-status" role="status" aria-live="polite"></div>
+    <div class="conversation-status" role="status" aria-live="polite"></div><small class="conversation-current-settings" aria-live="polite"></small>
     <div class="conversation-messages" role="log" aria-label="대화 내용" tabindex="0"></div>
     <button class="quiet-button conversation-more" type="button" hidden>이전 항목</button>
     <div class="conversation-requests"></div>
@@ -59,6 +59,7 @@ export function createConversation(options: ConversationOptions) {
   const responding = new Set<string>();
   const questionDrafts = new Map<string, Map<string, QuestionDraft>>();
   let lastSeq = 0; let modelKnown = false; let currentModel = ''; let currentEffort = '';
+  let threadId = ''; let modelDraft = false; let effortDraft = false;
   let requestSignature = '';
   const rpc = <T = Json>(request: Json) => options.call<T>('conversation_request', { id: options.sessionId, generation: options.generation, request });
   const alive = (version: number) => !disposed && visible && version === epoch;
@@ -80,17 +81,24 @@ export function createConversation(options: ConversationOptions) {
     button('.conversation-refresh').disabled = !ready || sending;
   }
   function option(select: HTMLSelectElement, value: string, label: string) { select.add(new Option(label, value)); }
+  function renderCurrentSettings() {
+    bindText($('.conversation-current-settings'), `서버 확인 모델: ${currentModel || '미확인'} · 추론: ${currentEffort || '미확인'}`, `Server-confirmed model: ${currentModel || 'unknown'} · reasoning: ${currentEffort || 'unknown'}`);
+  }
+  function confirmedSettings(model: unknown, effort: unknown) {
+    currentModel = string(model); currentEffort = string(effort); modelKnown = !!currentModel; renderCurrentSettings(); renderModels();
+  }
   function renderEfforts() {
     const chosen = models.find(value => value.model === model.value || value.id === model.value);
+    const selected = effortDraft ? effort.value : model.value === currentModel ? currentEffort : '';
     effort.replaceChildren();
     const values: Json[] = Array.isArray(chosen?.supportedReasoningEfforts) ? chosen.supportedReasoningEfforts : [];
     option(effort, '', t('현재 설정 미확인', 'Current setting unknown'));
     for (const value of values) { const id = string(value.reasoningEffort ?? value.effort); if (id) option(effort, id, id); }
-    effort.value = [...effort.options].some(value => value.value === currentEffort) ? currentEffort : '';
+    effort.value = [...effort.options].some(value => value.value === selected) ? selected : '';
     updateControls();
   }
   function renderModels() {
-    const value = model.value || currentModel;
+    const value = modelDraft ? model.value : currentModel;
     model.replaceChildren();
     option(model, '', modelKnown ? t('실행 환경 기본값', 'Runtime default') : t('현재 모델 미확인', 'Current model unknown'));
     for (const entry of models) { const id = string(entry.model ?? entry.id); if (id) option(model, id, string(entry.displayName) || id); }
@@ -300,11 +308,14 @@ export function createConversation(options: ConversationOptions) {
   }
   function receive(event: RuntimeEvent) {
     if (event.seq <= lastSeq) return;
-    if (lastSeq && event.seq > lastSeq + 1) { status('실시간 이벤트 순번이 누락되었습니다. 최근 대화를 다시 불러오세요.', 'Live event sequence has a gap. Reload Recent conversation.'); button('.conversation-refresh').classList.add('needs-refresh'); }
+    if (lastSeq && event.seq > lastSeq + 1) { confirmedSettings(undefined, undefined); status('실시간 이벤트 순번이 누락되었습니다. 최근 대화를 다시 불러오세요.', 'Live event sequence has a gap. Reload Recent conversation.'); button('.conversation-refresh').classList.add('needs-refresh'); }
     lastSeq = event.seq;
     const value = event.params;
     if (event.requestId) { if (!pendingRequests.some(entry => entry.requestId === event.requestId)) pendingRequests.push(event); renderRequests(); return; }
-    if (event.method === 'turn/started') { activeTurn = string(value.turn?.id ?? value.turnId); selectedTurn = activeTurn; items = []; nextItems = ''; itemsDirty = true; }
+    if (event.method === 'thread/settings/updated') {
+      if (threadId && value.threadId === threadId && value.threadSettings && typeof value.threadSettings === 'object' && !Array.isArray(value.threadSettings)) confirmedSettings(value.threadSettings.model, value.threadSettings.effort);
+    }
+    else if (event.method === 'turn/started') { activeTurn = string(value.turn?.id ?? value.turnId); selectedTurn = activeTurn; items = []; nextItems = ''; itemsDirty = true; }
     else if (event.method === 'turn/completed') { if (activeTurn === string(value.turn?.id ?? value.turnId)) activeTurn = ''; if (value.turn?.error) upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.turn.error.message) || JSON.stringify(value.turn.error) }); }
     else if (event.method === 'error') upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.error?.message ?? value.message) || JSON.stringify(value) });
     else if (!value.turnId || value.turnId === selectedTurn) {
@@ -325,7 +336,7 @@ export function createConversation(options: ConversationOptions) {
         const wasUncertain = uncertain; uncertain = value.unknownResult;
         if (wasUncertain && !uncertain && lastSendError) { status(`전송이 거절되었습니다. 초안을 보존했습니다. ${lastSendError}`, `Send was rejected. Your draft is preserved. ${lastSendError}`); lastSendError = ''; }
       }
-      if (value.gap) { status('실시간 수신 구간이 누락되었습니다. 최근 대화를 다시 불러오세요.', 'Some live events were missed. Reload Recent conversation.'); button('.conversation-refresh').classList.add('needs-refresh'); }
+      if (value.gap) { confirmedSettings(undefined, undefined); status('실시간 수신 구간이 누락되었습니다. 최근 대화를 다시 불러오세요.', 'Some live events were missed. Reload Recent conversation.'); button('.conversation-refresh').classList.add('needs-refresh'); }
       for (const event of value.events ?? []) receive(event);
       if (itemsDirty) { itemsDirty = false; renderItems(); }
       pendingRequests = value.pendingRequests ?? pendingRequests; renderRequests();
@@ -343,6 +354,7 @@ export function createConversation(options: ConversationOptions) {
       const value = await rpc({ type: 'send', requestId: crypto.randomUUID(), text: draft, attachments: sentAttachments.map(({ type, path }) => ({ type, path })), ...(model.value ? { model: model.value } : {}), ...(effort.value ? { effort: effort.value } : {}) });
       if (disposed) return;
       if (value.turn?.id) activeTurn = string(value.turn.id);
+      modelDraft = false; effortDraft = false; renderModels();
       if (input.value === draft) input.value = ''; attachments = []; for (const value of sentAttachments) stagedPaths.delete(value.path); renderAttachments();
       if (alive(version)) status('전송했습니다.', 'Sent.');
     } catch (error) {
@@ -399,9 +411,9 @@ export function createConversation(options: ConversationOptions) {
           catch (error) { if (!disposed) { visible = true; host.hidden = false; connected = true; failure(error); updateControls(); startPolling(); } throw error; }
           attached = false; options.ownerChanged?.(false); return;
         }
-        connected = true; uncertain = false; lastSeq = 0; currentModel = string(value.model); currentEffort = string(value.reasoningEffort); modelKnown = !!currentModel;
+        connected = true; uncertain = false; lastSeq = 0; threadId = string(value.threadId ?? value.thread?.id); confirmedSettings(value.model, value.reasoningEffort);
         activeTurn = string(value.activeTurnId); pendingRequests = []; renderRequests(); renderModels();
-        status(modelKnown ? `연결됨 · ${currentModel}${currentEffort ? ` · ${currentEffort}` : ''}` : '연결됨 · 현재 모델과 추론 설정 미확인', modelKnown ? `Connected · ${currentModel}${currentEffort ? ` · ${currentEffort}` : ''}` : 'Connected · Current model and reasoning settings unknown');
+        status('연결됨', 'Connected');
         await Promise.all([foreground ? loadPage() : Promise.resolve(), loadModels()]); if (alive(version)) startPolling();
       } catch (error) { if (alive(version)) { connected = false; failure(error); } throw error; }
       finally { if (alive(version)) updateControls(); }
@@ -434,15 +446,16 @@ export function createConversation(options: ConversationOptions) {
   button('.conversation-more').addEventListener('click', () => void loadItems(selectedTurn, nextItems), events);
   button('.conversation-models-more').addEventListener('click', () => void loadModels(nextModels), events);
   turns.addEventListener('change', () => void loadItems(turns.value), events);
-  model.addEventListener('change', () => { currentEffort = ''; renderEfforts(); }, events);
+  model.addEventListener('change', () => { modelDraft = true; effortDraft = false; renderEfforts(); }, events);
+  effort.addEventListener('change', () => { modelDraft = true; effortDraft = true; }, events);
   const labels: [string, string, string][] = [
-    ['.conversation-refresh', '최근 대화', 'Recent conversation'], ['.conversation-older', '이전 구간', 'Earlier turns'], ['.conversation-more', '이전 항목', 'Earlier items'], ['.conversation-attach', '+ 첨부', '+ Attach'], ['.conversation-model-label', '모델', 'Model'], ['.conversation-effort-label', '추론', 'Reasoning'], ['.conversation-models-more', '모델 더 보기', 'More models'], ['.conversation-stop', '중단', 'Stop'], ['.conversation-send', '전송', 'Send'], ['.conversation-hint', 'Enter 전송 · Shift+Enter 줄바꿈 · 초안은 이 세션에만 유지됩니다.', 'Enter to send · Shift+Enter for a new line · Draft stays in this session.'],
+    ['.conversation-refresh', '최근 대화', 'Recent conversation'], ['.conversation-older', '이전 구간', 'Earlier turns'], ['.conversation-more', '이전 항목', 'Earlier items'], ['.conversation-attach', '+ 첨부', '+ Attach'], ['.conversation-model-label', '다음 전송 모델', 'Next message model'], ['.conversation-effort-label', '다음 전송 추론', 'Next message reasoning'], ['.conversation-models-more', '모델 더 보기', 'More models'], ['.conversation-stop', '중단', 'Stop'], ['.conversation-send', '전송', 'Send'], ['.conversation-hint', 'Enter 전송 · Shift+Enter 줄바꿈 · 초안은 이 세션에만 유지됩니다.', 'Enter to send · Shift+Enter for a new line · Draft stays in this session.'],
   ];
   for (const [selector, ko, en] of labels) bindText($(selector), ko, en);
   bindAttribute(input, 'aria-label', '메시지', 'Message'); bindAttribute(input, 'placeholder', '메시지 입력 · Shift+Enter 줄바꿈', 'Message · Shift+Enter for a new line');
   for (const [element, ko, en] of [[model, '모델', 'Model'], [effort, '추론 수준', 'Reasoning effort'], [turns, '대화 구간', 'Conversation turns'], [messages, '대화 내용', 'Conversation'], [$('.conversation-attachments'), '첨부 파일', 'Attachments']] as const) bindAttribute(element, 'aria-label', ko, en);
   const unlanguage = onLanguageChange(() => { requestSignature = ''; renderedItems.clear(); messages.replaceChildren(); renderModels(); renderTurns(); renderItems(); renderRequests(); renderAttachments(); });
-  renderModels(); renderItems(); updateControls();
+  renderCurrentSettings(); renderModels(); renderItems(); updateControls();
   return {
     setVisible,
     setForeground,
