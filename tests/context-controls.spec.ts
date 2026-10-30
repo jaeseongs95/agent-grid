@@ -7,13 +7,14 @@ async function fixture(page: Page) {
     const { createContextControls } = await import('/src/context-controls.ts');
     const host = document.createElement('div'); host.id = 'context-fixture'; host.className = 'context-controls card-actions';
     host.style.cssText = 'position:fixed;top:20px;right:20px;z-index:9999;background:#141820'; document.body.append(host);
+    const statusHost = document.createElement('span'); statusHost.hidden = true; document.body.append(statusHost);
     const data = state.contextFixture = {
       reads: 0, preparations: 0, mutations: 0, notices: [] as any[], failure: false, hold: false,
       release: () => {}, holdRead: false, releaseRead: () => {}, result: 'started',
       snapshot: { revision: 1, connected: true, guiConnected: true, tokenUsage: { total: { totalTokens: 900000 }, last: { totalTokens: 40000 }, modelContextWindow: 100000 }, tokenUsageFresh: true, compacting: false, active: false, canCompact: true } as any,
     };
     state.contextControls = createContextControls({
-      host, sessionId: 'context-session', generation: 9,
+      host, statusHost, sessionId: 'context-session', generation: 9,
       async call(command: string, args: any) {
         if (command !== 'conversation_request' || args.id !== 'context-session' || args.generation !== 9 || args.request.type !== 'contextStatus') throw Error('관측 이외의 호출');
         data.reads++; const snapshot = structuredClone(data.snapshot);

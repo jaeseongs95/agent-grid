@@ -47,6 +47,10 @@ async function workspace(page: Page, options: { capacity?: boolean } = {}) {
         state.tabsFixture.calls.push({ command, args });
         if (command === 'plugin:event|listen') { listeners.set(args.event, callbacks.get(args.handler)!); return callback; }
         if (command.startsWith('plugin:event|')) return callback;
+        if (command === 'conversation_request' && args.request.type === 'contextStatus') {
+          if (state.tabsFixture.contextFailure) throw new Error('PRIVATE_CONTEXT_ERROR');
+          return state.tabsFixture.contextSnapshots?.[args.id] ?? { revision: 0, connected: true, guiConnected: false, tokenUsageFresh: false, compacting: false, active: false, canCompact: false };
+        }
         if (command === 'get_ui_language') return 'ko';
         if (command === 'set_ui_language') return { show: args.language === 'en' ? 'Open OpenDIY Desktop' : 'OpenDIY Desktop 열기', exit: args.language === 'en' ? 'Exit…' : '종료…' };
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: options.capacity ? [{ title: 'Pending slot 32', cwd: projects[0].cwd, threadId: 'pending-slot32' }] : [] };
@@ -554,4 +558,50 @@ test('session ID copy uses the latest full thread ID with availability and clipb
   await expect(page.locator('#toast-area')).not.toContainText('PRIVATE_CLIPBOARD_FAILURE');
   await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(fullId);
   await page.screenshot({ path: testInfo.outputPath('session-id-copy.png') });
+});
+
+
+test('세션 상단은 확인된 압축 진행 상태만 표시하고 완료·단절·새 세대에서 기존 상태로 돌아온다', async ({ page }, testInfo) => {
+  await workspace(page);
+  const a = card(page, 'a1');
+  const badge = a.locator('.session-compaction');
+  const state = a.locator('.session-state');
+  const refresh = () => a.locator('.context-usage').click();
+  await expect(state).toHaveText('입력 가능');
+  await page.evaluate(() => { (window as any).tabsFixture.contextSnapshots = { a1: { revision: 10, connected: true, guiConnected: true, tokenUsageFresh: false, compacting: true, active: true, canCompact: false } }; });
+  await refresh();
+  await expect(badge).toBeVisible();
+  await expect(badge).toHaveText('압축 중');
+  await expect(badge).toHaveAttribute('role', 'status');
+  await expect(state).toBeHidden();
+  await expect(card(page, 'b1').locator('.session-compaction')).toBeHidden();
+  await expect(card(page, 'b1').locator('.session-state')).toHaveText('입력 가능');
+  await page.evaluate(session => (window as any).tabsFixture.emit('session-changed', { ...session, state: 'waiting' }), owned[0]);
+  await expect(state).toBeHidden();
+  await expect(badge).toHaveText('압축 중');
+  await page.screenshot({ path: testInfo.outputPath('session-compacting.png') });
+  await page.evaluate(async () => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage('en'); });
+  await expect(badge).toHaveText('Compacting');
+  await page.evaluate(() => { const s = (window as any).tabsFixture.contextSnapshots.a1; s.revision++; s.compacting = false; });
+  await refresh();
+  await expect(badge).toBeHidden();
+  await expect(state).toBeVisible();
+  await expect(state).toHaveText('Waiting for response');
+  await page.evaluate(() => { const s = (window as any).tabsFixture.contextSnapshots.a1; s.revision++; s.compacting = true; });
+  await refresh();
+  await expect(badge).toBeVisible();
+  await page.evaluate(() => { (window as any).tabsFixture.contextFailure = true; });
+  await refresh();
+  await expect(badge).toBeHidden();
+  await expect(state).toBeVisible();
+  await page.evaluate(() => { const f = (window as any).tabsFixture; f.contextFailure = false; const s = f.contextSnapshots.a1; s.revision++; s.connected = false; });
+  await refresh();
+  await expect(badge).toBeHidden();
+  await page.evaluate(() => { const s = (window as any).tabsFixture.contextSnapshots.a1; s.revision++; s.connected = true; });
+  await refresh();
+  await expect(badge).toBeVisible();
+  await page.evaluate(session => { const f = (window as any).tabsFixture; delete f.contextSnapshots.a1; f.emit('session-changed', { ...session, generation: 8 }); }, owned[0]);
+  await expect(badge).toBeHidden();
+  await expect(state).toHaveText('Ready');
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((c: any) => c.command === 'conversation_request' && c.args.request.type !== 'contextStatus'))).toEqual([]);
 });

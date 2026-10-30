@@ -14,6 +14,7 @@ interface ContextStatus {
 }
 interface Options {
   host: HTMLElement;
+  statusHost: HTMLElement;
   sessionId: string;
   generation: number;
   call<T>(command: string, args: Record<string, unknown>): Promise<T>;
@@ -61,6 +62,9 @@ export function createContextControls(options: Options) {
     }
   }
   function render() {
+    options.statusHost.hidden = snapshot?.connected !== true || snapshot.compacting !== true;
+    const status = t('압축 중', 'Compacting');
+    if (options.statusHost.textContent !== status) options.statusHost.textContent = status;
     const used = snapshot?.tokenUsage?.last?.totalTokens;
     const capacity = snapshot?.tokenUsage?.modelContextWindow;
     const valid = typeof used === 'number' && Number.isSafeInteger(used) && used >= 0 && typeof capacity === 'number' && Number.isSafeInteger(capacity) && capacity > 0;
@@ -129,6 +133,6 @@ export function createContextControls(options: Options) {
       visible = value; epoch++; clearTimeout(timer); render();
       if (visible) void refresh();
     },
-    dispose() { if (disposed) return; disposed = true; epoch++; visible = false; clearTimeout(timer); abort.abort(); unlanguage(); snapshot = undefined; host.replaceChildren(); },
+    dispose() { if (disposed) return; disposed = true; epoch++; visible = false; clearTimeout(timer); abort.abort(); unlanguage(); snapshot = undefined; options.statusHost.hidden = true; options.statusHost.textContent = ''; host.replaceChildren(); },
   };
 }
