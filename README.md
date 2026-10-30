@@ -1,5 +1,18 @@
 # OpenDIY Desktop
 
+**Fast loading, shown in real use**
+
+A real-world recording showing the faster loading experienced compared with the ChatGPT desktop app.
+This approximately 6.5-second recording shows project switching and multiple running sessions.
+
+![Fast project and session loading in real use, at the original playback speed](docs/loading-demo.gif)
+
+*Recorded during real use on 2026-10-30 · original playback speed · no speed-up*
+
+![Windows Task Manager during real use](docs/real-world-task-manager.png)
+
+*Task Manager from the same real-world setup, with OpenDIY Desktop, CLI and WebView2 processes running together.*
+
 **English** | [한국어](README.ko.md)
 
 A Windows desktop grid for running coding-agent CLI sessions side by side.
