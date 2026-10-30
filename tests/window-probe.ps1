@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding=$OutputEncoding=[Text.UTF8Encoding]::new($false)
 $expectedPath = [IO.Path]::GetFullPath($ExpectedExecutable)
 if (-not [IO.Path]::IsPathRooted($ExpectedExecutable) -or -not (Test-Path -LiteralPath $expectedPath -PathType Leaf)) {
     throw 'Expected executable must be an existing absolute file'
