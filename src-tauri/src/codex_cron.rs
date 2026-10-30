@@ -4,7 +4,7 @@ use super::*;
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum CronRequest {
     List {},
@@ -14,7 +14,7 @@ pub enum CronRequest {
     Remove { request_id: String, job_id: String },
     Cancel { request_id: String, job_id: String },
 }
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase", deny_unknown_fields)]
 pub enum CronSchedule { Every { seconds: u64 }, At { at_unix_ms: u64 } }
 
@@ -33,6 +33,12 @@ struct CronSnapshot {
     reconciled_request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "optional_exact_bool")]
+    supports_expected_turn_interrupt: Option<bool>,
+}
+
+fn optional_exact_bool<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 #[derive(Deserialize, Serialize)]
 enum CronScope { #[serde(rename = "cliLifetime")] CliLifetime }
@@ -110,7 +116,7 @@ impl CronRequest {
             },
             Self::Pause{request_id,job_id}|Self::Resume{request_id,job_id}|Self::Remove{request_id,job_id}|Self::Cancel{request_id,job_id}=>(request_id,Some(job_id)),
         };
-        if request_id.len()!=36 || Uuid::parse_str(request_id).is_err() {return Err("예약 변경 요청 식별자는 UUID여야 합니다.".into());}
+        if request_id.len()!=36 || !Uuid::parse_str(request_id).is_ok_and(|id|id.to_string()==*request_id) {return Err("예약 변경 요청 식별자는 표준 소문자 UUID여야 합니다.".into());}
         if let Some(job_id)=job_id {
             if job_id.len()>20 {return Err("예약 식별자가 허용 크기를 넘었습니다.".into());}
             if !canonical_job_id(job_id) {return Err("예약 식별자는 양의 64비트 정수의 십진 문자열이어야 합니다.".into());}
@@ -126,11 +132,15 @@ impl CronRequest {
 }
 
 impl CodexSession {
-    pub(crate) fn cron_request(&self,thread_id: &str,request: CronRequest) -> Result<Value,String> {
-        request.validate()?;
+    pub(crate) fn cron_target_ready(&self,thread_id: &str) -> Result<(),String> {
         Uuid::parse_str(thread_id).map_err(|_| "예약 대상 대화 식별자가 올바르지 않습니다.")?;
         if self.stopped.load(Ordering::Acquire) {return Err("종료된 세션의 예약을 조회하거나 변경하지 않았습니다.".into());}
         if self.conversation.as_ref().is_some_and(ConversationConnection::is_deleted) {return Err("원래 대화가 삭제되어 예약을 조회하거나 변경하지 않았습니다.".into());}
+        Ok(())
+    }
+    pub(crate) fn cron_request(&self,thread_id: &str,request: CronRequest) -> Result<Value,String> {
+        request.validate()?;
+        self.cron_target_ready(thread_id)?;
         // 예약은 TUI 프로세스가 소유한다. 구조화 제어 계약이 확인되기 전에는
         // app-server 메서드·PTY 입력·별도 실행기로 대체하지 않는다.
         let reply=request.unsupported();
@@ -176,6 +186,18 @@ mod tests {
         value["jobs"][0]["promptPreview"]=json!("🐈".repeat(513));
         assert!(bounded_cron_snapshot(value).is_err());
         assert!(bounded_cron_snapshot(snapshot()).is_ok(),"과거 단발 예약은 목록 조회 대상이다");
+    }
+    #[test]
+    fn cron_snapshot_interrupt_support_requires_an_exact_present_bool() {
+        assert!(bounded_cron_snapshot(snapshot()).is_ok());
+        for support in [json!(true),json!(false)] {
+            let mut value=snapshot();value["supportsExpectedTurnInterrupt"]=support;
+            assert!(bounded_cron_snapshot(value).is_ok());
+        }
+        for invalid in [Value::Null,json!("true"),json!(1),json!({}),json!([])] {
+            let mut value=snapshot();value["supportsExpectedTurnInterrupt"]=invalid;
+            assert!(bounded_cron_snapshot(value).is_err());
+        }
     }
     #[test]
     fn cron_snapshot_rejects_oversized_hidden_duplicate_and_incoherent_peer_data() {

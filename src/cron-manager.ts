@@ -5,7 +5,7 @@ import { MAX_WORKSPACE_SESSIONS } from './model';
 interface Session { id: string; generation: number; title: string; active: boolean; threadId?: string | null }
 type Schedule = { type: 'every'; seconds: number } | { type: 'at'; atUnixMs: number };
 interface Job { id: string; promptPreview: string; schedule: Schedule; state: string; paused: boolean; removed: boolean; nextRunAt?: number | null; skipped?: number }
-interface List { supported: boolean; connected: boolean; scope: 'cliLifetime'; jobs: Job[]; hasMore?: boolean; mutationState?: 'clear' | 'unknown'; reconciledRequestId?: string }
+interface List { supported: boolean; connected: boolean; scope: 'cliLifetime'; jobs: Job[]; hasMore?: boolean; mutationState?: 'clear' | 'unknown'; reconciledRequestId?: string; supportsExpectedTurnInterrupt?: boolean }
 interface Reply { status: 'applied' | 'notApplied' | 'unknown' | 'unsupported' }
 interface Host { call<T>(command: string, args: Record<string, unknown>): Promise<T>; notify(ko: string, error?: boolean, en?: string): void }
 const LIMIT = 100;
@@ -39,6 +39,7 @@ export function createCronManager(host: Host) {
   let selected: Session | undefined; let available = false; let visible = true; let exiting = false;
   let epoch = 0; let request: Promise<void> | undefined; let timer: ReturnType<typeof setTimeout> | undefined;
   let jobs: Job[] = []; let supported = false; let connected = false; let fresh = false; let hasMore = false;
+  let canCancel = false;
   let knownList = false; let readingRequest = false;
   const rows = new Map<string, { signature: string; row: HTMLElement }>();
   const empty = document.createElement('p');
@@ -73,7 +74,7 @@ export function createCronManager(host: Host) {
     const settled = !['unknown', 'blockedUnsupported', 'blockedConnection', 'pending'].includes(job.state);
     action(job.paused ? 'resume' : 'pause', job.paused ? '재개' : '일시정지', job.paused ? 'Resume' : 'Pause', !job.removed && settled && (job.paused ? job.state !== 'finished' || job.schedule.type === 'every' : job.state !== 'finished'));
     action('remove', '예약 삭제', 'Remove schedule', !job.removed);
-    action('cancel', '현재 회차 중단', 'Cancel current run', job.state === 'running');
+    action('cancel', '현재 회차 중단', 'Cancel current run', canCancel && job.state === 'running');
     row.append(title, text, detail, actions); return row;
   }
   function render() {
@@ -83,7 +84,7 @@ export function createCronManager(host: Host) {
     const ids = new Set(jobs.map(job => job.id));
     for (const id of rows.keys()) if (!ids.has(id)) rows.delete(id);
     const desired = jobs.map(job => {
-      const signature = JSON.stringify([getLanguage(), job]);
+      const signature = JSON.stringify([getLanguage(), canCancel, job]);
       let entry = rows.get(job.id);
       if (!entry || entry.signature !== signature) { entry = { signature, row: createRow(job) }; rows.set(job.id, entry); }
       return entry.row;
@@ -104,6 +105,7 @@ export function createCronManager(host: Host) {
   }
   function validate(value: List) {
     if (!value || typeof value.supported !== 'boolean' || typeof value.connected !== 'boolean' || value.scope !== 'cliLifetime' || !Array.isArray(value.jobs)) throw Error('예약 응답 형식 불일치');
+    if (Object.hasOwn(value, 'supportsExpectedTurnInterrupt') && typeof value.supportsExpectedTurnInterrupt !== 'boolean') throw Error('예약 중단 지원 정보 형식 불일치');
     const ids = new Set<string>();
     for (const job of value.jobs.slice(0, LIMIT)) { if (ids.has(job?.id)) throw Error('중복 예약 식별자'); ids.add(job?.id); }
     if (value.jobs.slice(0, LIMIT).some(job => !job || typeof job.id !== 'string' || !/^[1-9][0-9]{0,19}$/.test(job.id) || BigInt(job.id) > 18446744073709551615n || typeof job.promptPreview !== 'string' || typeof job.state !== 'string' || !Object.hasOwn(states, job.state) || typeof job.paused !== 'boolean' || typeof job.removed !== 'boolean' || (job.nextRunAt != null && (!Number.isSafeInteger(job.nextRunAt) || job.nextRunAt <= 0)) || (job.skipped != null && (!Number.isSafeInteger(job.skipped) || job.skipped < 0)) || !job.schedule || (job.schedule.type === 'every' ? !Number.isSafeInteger(job.schedule.seconds) || job.schedule.seconds <= 0 : job.schedule.type !== 'at' || !Number.isSafeInteger(job.schedule.atUnixMs) || job.schedule.atUnixMs <= 0))) throw Error('예약 목록 형식 불일치');
@@ -133,6 +135,7 @@ export function createCronManager(host: Host) {
         const value = await rpc<List>(session, { type: 'list' });
         if (!live(version)) return;
         validate(value); supported = value.supported; connected = value.connected; fresh = supported && connected;
+        canCancel = fresh && value.supportsExpectedTurnInterrupt === true;
         if (fresh) { jobs = value.jobs.slice(0, LIMIT).map(job => ({ id: job.id, promptPreview: preview(job.promptPreview), state: job.state, paused: job.paused, removed: job.removed, nextRunAt: job.nextRunAt, skipped: job.skipped, schedule: job.schedule.type === 'every' ? { type: 'every', seconds: job.schedule.seconds } : { type: 'at', atUnixMs: job.schedule.atUnixMs } })); hasMore = value.hasMore === true || value.jobs.length > LIMIT; knownList = true; }
         if (fresh && value.mutationState === 'clear' && value.reconciledRequestId === unresolved.get(key(session))) unresolved.delete(key(session));
         $('.cron-error').hidden = true;
@@ -141,13 +144,14 @@ export function createCronManager(host: Host) {
         else status('예약 목록을 확인했습니다.', 'Job list confirmed.');
         render();
       } catch {
-        if (live(version)) { fresh = false; error('예약 목록을 불러오지 못했습니다. 연결을 확인하고 새로고침하세요. 마지막 목록은 보존합니다.', 'Could not load scheduled jobs. Check the connection and refresh. The last list is preserved.'); controls(); }
+        if (live(version)) { fresh = false; canCancel = false; error('예약 목록을 불러오지 못했습니다. 연결을 확인하고 새로고침하세요. 마지막 목록은 보존합니다.', 'Could not load scheduled jobs. Check the connection and refresh. The last list is preserved.'); controls(); }
       }
     }, true);
   }
   function mutate(value: Record<string, unknown>) {
     const session = selected; const version = epoch;
     if (!session || !live(version) || !supported || !connected || !fresh || request || uncertain() || unresolved.size >= MAX_WORKSPACE_SESSIONS) return Promise.resolve();
+    if (value.type === 'cancel' && !canCancel) return Promise.resolve();
     const requestId = crypto.randomUUID();
     return track(async () => {
       if (!live(version)) return;
@@ -184,7 +188,7 @@ export function createCronManager(host: Host) {
     else return;
     void mutate({ type: 'add', schedule, prompt: prompt.value });
   });
-  function clear() { epoch++; selected = undefined; available = false; jobs = []; rows.clear(); supported = false; connected = false; fresh = false; hasMore = false; knownList = false; clearTimeout(timer); prompt.value = ''; time.value = ''; $('.cron-error').textContent = ''; $('.cron-error').hidden = true; status('', ''); render(); }
+  function clear() { epoch++; selected = undefined; available = false; jobs = []; rows.clear(); supported = false; connected = false; fresh = false; canCancel = false; hasMore = false; knownList = false; clearTimeout(timer); prompt.value = ''; time.value = ''; $('.cron-error').textContent = ''; $('.cron-error').hidden = true; status('', ''); render(); }
   $('.cron-close').onclick = () => dialog.close(); dialog.addEventListener('close', clear);
   $('.cron-refresh').onclick = () => void refresh(); kind.onchange = mode;
   document.addEventListener('visibilitychange', () => { clearTimeout(timer); if (!document.hidden && dialog.open && visible) void refresh(); });

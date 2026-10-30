@@ -27,6 +27,7 @@ async function fixture(page: Page, options: { unsupported?: boolean; jobs?: numb
       failRead: false, failMutation: false, reply: 'applied',
       snapshot: {
         supported: !unsupported, connected: !unsupported, scope: 'cliLifetime',
+        supportsExpectedTurnInterrupt: true,
         jobs: Array.from({ length: jobs ?? 0 }, (_, index) => ({
           id: String(index + 1), promptPreview: '저장된 작업',
           schedule: { type: 'every', seconds: 120 }, state: 'running',
@@ -96,6 +97,26 @@ test('예약 미리보기는 유니코드 512문자를 보존하고 서로게이
   await refresh(page);
   await expect(page.locator('.cron-preview')).toHaveText(expected);
   expect(await page.locator('.cron-preview').evaluate(node => Array.from(node.textContent ?? '').length)).toBe(512);
+});
+
+test('현재 연결에서 안전한 중단 지원이 확인돼야 현재 회차 중단을 허용한다', async ({ page }) => {
+  await fixture(page, { jobs: 1 });
+  const cancel = page.getByRole('button', { name: '현재 회차 중단', exact: true });
+  await expect(cancel).toBeEnabled();
+  for (const cap of ['missing', false, null, 'true', 1, true] as const) {
+    await page.evaluate(cap => {
+      const snapshot = (window as any).cronFixture.snapshot;
+      if (cap === 'missing') delete snapshot.supportsExpectedTurnInterrupt;
+      else snapshot.supportsExpectedTurnInterrupt = cap;
+    }, cap);
+    await refresh(page);
+    if (cap === true) await expect(cancel).toBeEnabled();
+    else {
+      await expect(cancel).toBeDisabled();
+      await cancel.evaluate((button: HTMLButtonElement) => button.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+      expect(await mutations(page)).toEqual([]);
+    }
+  }
 });
 
 test('반복은 초 단위로, 단발 현지 시각은 정확한 epoch로 원래 세션에 전송한다', async ({ page }) => {
