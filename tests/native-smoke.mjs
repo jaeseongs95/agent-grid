@@ -648,8 +648,12 @@ try {
     assert(events.every(event => event.trusted === false));
     const dispatchedAt = Date.now();
     const echoed = await until(() => rows.innerText(), text => text.includes(marker), 'actual Korean marker echo after composition end', 15_000);
-    for (const title of [...ownedTitles].slice(1)) {
-      assert(!(await tile(title).locator('.xterm-rows').innerText()).includes(marker), '직접 입력이 다른 터미널에 전달되면 안 됩니다');
+    // 정리용 ownedTitles에는 이미 닫은 실패 재개 카드도 남아 있다.
+    // 실제 생성한 다른 실행 세션의 고정 ID로 입력 격리를 검사한다.
+    for (const session of report.sessions.slice(1)) {
+      const peer = page.locator(`.terminal-card[data-id="${session.id}"]`);
+      assert.equal(await peer.count(), 1, '입력 격리를 검사할 다른 실행 세션이 있어야 합니다');
+      assert(!(await peer.locator('.xterm-rows').innerText()).includes(marker), '직접 입력이 다른 터미널에 전달되면 안 됩니다');
     }
     return { events, marker, markerInitiallyAbsent: true, echoObservedIn: 'VT-rendered xterm rows (composition overlay excluded)', echoWaitMs: Date.now() - dispatchedAt, beforeOutputLength: before.length, afterOutputLength: echoed.length, beforeOutputSha256: hash(before), afterOutputSha256: hash(echoed), enterSent: false, physicalImeVerified: false, koreanPtyRoundTripVerified: true, unsubmittedTextCleared: false, disposition: 'Left unsubmitted until the owned session is stopped; no Ctrl+U sent to a potentially waiting session.' };
   });
