@@ -408,6 +408,22 @@ export function createConversation(options: ConversationOptions) {
     catch (error) { if (!disposed && !deleted) failure(error); }
     finally { interrupting = false; if (!disposed) updateControls(); }
   }
+  async function compact(): Promise<{ status?: string }> {
+    if (!visible || !attached || !connected || disposed || deleted || sending || staging || uncertain || activeTurn) return { status: 'notStarted' };
+    sending = true; updateControls(); renderAttachments();
+    try {
+      const value = await rpc({ type: 'compact' });
+      if (!disposed && !deleted && value.status === 'started') {
+        if (typeof value.turn?.id === 'string' && value.turn.id) { activeTurn = value.turn.id; activeTurnKnown = true; }
+        else uncertain = true;
+        status('압축을 요청했습니다. 서버의 완료 확인을 기다립니다.', 'Compaction requested. Waiting for server confirmation.');
+      }
+      return value;
+    } catch (error) {
+      if (!disposed && !deleted) { uncertain = true; status('압축 결과를 확인하지 못했습니다. 자동으로 다시 요청하지 않습니다. 초안은 보존됩니다.', 'The compaction result could not be confirmed. It will not be retried automatically. Your draft is preserved.'); }
+      throw error;
+    } finally { sending = false; if (!disposed) { updateControls(); renderAttachments(); } }
+  }
   async function pickAttachments() {
     const version = epoch; staging = true; updateControls();
     try { const value = await options.call<Attachment[]>('choose_conversation_attachments'); if (alive(version)) addAttachments(value); }
@@ -509,6 +525,7 @@ export function createConversation(options: ConversationOptions) {
   return {
     setVisible,
     handoffToTerminal,
+    compact,
     setForeground,
     refresh: () => visible && foreground && !loading ? loadPage() : Promise.resolve(),
     hasDraft: () => !!input.value || !!attachments.length,

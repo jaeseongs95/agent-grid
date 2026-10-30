@@ -18,6 +18,8 @@ pub enum ConversationRequest {
     Detach,
     HandoffToTerminal,
     Poll,
+    ContextStatus,
+    Compact,
     Page { cursor: Option<String> },
     Items { turn_id: String, cursor: Option<String> },
     Detail { turn_id: String, item_id: String, offset: Option<usize>, snapshot_id: Option<String> },
@@ -102,6 +104,25 @@ impl Drop for DeadlineWatch {
 }
 struct SendContext { session_id: String, store: crate::conversation_attachments::ConversationAttachments }
 struct Work { request: ConversationRequest, reply: mpsc::SyncSender<Result<Value, String>>, deadline: Instant, send_context: Option<SendContext> }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ContextTokenUsage {
+    total: ContextTokenBreakdown,
+    last: ContextTokenBreakdown,
+    model_context_window: Option<i64>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ContextTokenBreakdown {
+    total_tokens: i64, input_tokens: i64, cached_input_tokens: i64,
+    #[serde(default)] cache_write_input_tokens: i64,
+    output_tokens: i64, reasoning_output_tokens: i64,
+}
+impl ContextTokenBreakdown {
+    fn valid(&self) -> bool {
+        [self.total_tokens,self.input_tokens,self.cached_input_tokens,self.cache_write_input_tokens,self.output_tokens,self.reasoning_output_tokens].into_iter().all(|value|value>=0)
+    }
+}
 #[derive(Default)]
 struct Events {
     queue: VecDeque<(Value, usize)>, bytes: usize, seq: u64, gap: bool,
@@ -109,6 +130,8 @@ struct Events {
     answered: HashSet<String>,
     observed_pending: HashMap<String,Value>, observer_connected: bool,
     requests_unavailable: bool,
+    token_usage: Option<ContextTokenUsage>, context_active: Option<bool>, token_usage_fresh: bool,
+    context_compaction: Option<(String,String)>, context_revision: u64,
 }
 impl Events {
     fn blocks_attach(&self,owned: bool,unknown: bool) -> bool {
@@ -164,6 +187,19 @@ impl ConversationConnection {
         for (id,request) in &mut requests {request["metadataAvailable"]=json!(!events.requests_unavailable&&((events.connected&&events.pending.contains_key(id))||(events.observer_connected&&events.observed_pending.contains_key(id))));}
         Ok((owned,events.connected,requests.into_values().collect()))
     }
+    fn context_status(&self, thread_id: &str) -> Result<Value,String> {
+        // 작업자 종료 join을 기다리지 않는 읽기다. 연결·이력·이벤트 큐를 건드리지 않는다.
+        let closing=match self.0.worker.try_lock() {
+            Ok(worker)=>worker.as_ref().is_some_and(|worker|worker.closing.is_some()),
+            Err(std::sync::TryLockError::WouldBlock)=>true,
+            Err(std::sync::TryLockError::Poisoned(_))=>return Err("대화 연결 상태 오류".into()),
+        } || self.0.stopped.load(Ordering::Acquire);
+        let events=self.0.events.lock().map_err(|_| "대화 문맥 상태 오류")?;
+        let reason=context_block_reason(&self.0,&events,closing);
+        Ok(json!({"threadId":thread_id,"connected":events.connected||events.observer_connected,"guiConnected":events.connected,
+            "tokenUsage":events.token_usage,"tokenUsageFresh":events.token_usage_fresh&&(events.connected||events.observer_connected),"compacting":events.context_compaction.is_some(),"active":events.context_active,
+            "canCompact":reason.is_none(),"reason":reason,"revision":events.context_revision}))
+    }
     pub(crate) fn is_deleted(&self) -> bool { self.0.deleted.load(Ordering::Acquire) }
     pub(super) fn observer_message(&self,thread_id: &str,message: Value) -> Result<(),String> {record_message(&self.0,thread_id,message,true)}
     pub(super) fn observer_call<S: Read+Write>(&self,rpc: &mut Rpc<S>,thread_id: &str,method: &str,params: Value) -> Result<Value,String> {
@@ -179,6 +215,8 @@ impl ConversationConnection {
         verify_passive(&result,thread_id,cwd)?;
         let mut events=self.0.events.lock().map_err(|_| "질문 관측 상태 오류")?;
         if events.requests_unavailable {return Err("요청 관측을 중단한 세션의 구독을 복구하지 않았습니다.".into());}
+        if !events.connected {events.context_active=context_active(&result["thread"]["status"]);events.token_usage_fresh=false;}
+        events.context_revision+=1;
         events.observer_connected=true;
         Ok(true)
     }
@@ -225,6 +263,9 @@ impl ConversationConnection {
     }
     fn request_context(&self, thread_id: &str, cwd: &Path, request: ConversationRequest, send_context: Option<SendContext>) -> Result<Value, String> {
         validate_request(&request)?;
+        if matches!(request, ConversationRequest::ContextStatus) {
+            return self.context_status(thread_id);
+        }
         if matches!(request, ConversationRequest::Poll) {
             let mut poll = self.0.events.lock().map_err(|_| "대화 이벤트 상태를 확인할 수 없습니다.")?.poll();
             poll["unknownResult"] = json!(self.0.unknown.load(Ordering::Acquire)); return Ok(poll);
@@ -278,7 +319,7 @@ impl ConversationConnection {
             let join = match thread::Builder::new().name("codex-conversation".into()).spawn(move || {
                 let result = run(control.clone(), &thread_id, &cwd, receiver, worker_cancelled, worker_transport);
                 let mut events = control.events.lock().unwrap_or_else(|e| e.into_inner());
-                events.connected = false;
+                events.connected = false;events.token_usage_fresh=false;
                 if let Err(error) = result { events.error = Some(error); }
             }) { Ok(join) => join, Err(error) => { *self.0.input.lock().unwrap_or_else(|e| e.into_inner()) = false; self.0.owned.store(false,Ordering::Release); return Err(format!("대화 연결 작업자를 시작할 수 없습니다: {error}")); } };
             *worker = Some(Worker {sender,cancelled,transport,join:Some(join),joined:false,closing:None});
@@ -414,6 +455,7 @@ fn serve<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_id: &str, 
     // loaded 동일 runtime의 수동 구독만 허용한다. resume는 idle 작업을 실행할 수 있어 대체 경로로 쓰지 않는다.
     let mut resumed = call(control, rpc, thread_id, PASSIVE_SUBSCRIBE, json!({"threadId":thread_id}), cancelled)?;
     verify_passive(&resumed, thread_id, cwd)?;
+    {let mut events=control.events.lock().map_err(|_| "대화 문맥 상태 오류")?;events.context_active=context_active(&resumed["thread"]["status"]);events.token_usage_fresh=false;events.context_revision+=1;}
     // CLI는 응답 뒤 복사된 pending을 replay한다. 기존 Attach 전체기한 안에서
     // 실제 동일 원문 또는 resolved를 기다리며 별도 큐/재송신은 만들지 않는다.
     let replay_deadline=rpc.deadline.unwrap_or_else(||Instant::now()+RPC_TIMEOUT);
@@ -538,6 +580,14 @@ fn execute_context<S: Read + Write>(control: &Control, rpc: &mut Rpc<S>, thread_
             if page["nextOffset"].is_null() {control.detail.lock().map_err(|_| "대화 상세 스냅샷 상태 오류")?.take();}
             Ok(page)
         },
+        ConversationRequest::Compact => {
+            live(control,cancelled)?;
+            let events=control.events.lock().map_err(|_| "대화 문맥 상태 오류")?;
+            // 기존 thread/compact/start는 실행 중 작업을 취소할 수 있다. 원자적
+            // idle 입장 계약을 서버에서 확인하기 전에는 그 메서드를 보내지 않는다.
+            let reason=context_block_reason(control,&events,false).unwrap_or("unsupported");
+            Ok(json!({"status":if reason=="unsupported" {"unsupported"}else{"notStarted"},"reason":reason}))
+        },
         ConversationRequest::Models {cursor: page_cursor} => { cursor(&page_cursor)?; bounded_page(call(control,rpc,thread_id,"model/list",json!({"cursor":page_cursor,"limit":50,"includeHidden":false}),cancelled)?,50) },
         ConversationRequest::Send {request_id,text,attachments,model,effort} => {
             if control.unknown.load(Ordering::Acquire) { return Err("이전 전송 결과가 불명확하여 새 전송을 차단했습니다. 원래 대화 상태를 먼저 확인하세요.".into()); }
@@ -597,12 +647,27 @@ fn detail_chunk(text: &str, offset: usize) -> Result<Value, String> {
     while !text.is_char_boundary(end) { end -= 1; }
     Ok(json!({"text":&text[offset..end],"nextOffset":if end < text.len() {Some(end)} else {None},"totalBytes":text.len()}))
 }
+fn context_active(status: &Value) -> Option<bool> {
+    match status["type"].as_str() {Some("idle")=>Some(false),Some("active")=>Some(true),_=>None}
+}
+fn context_block_reason(control: &Control, events: &Events, closing: bool) -> Option<&'static str> {
+    if control.deleted.load(Ordering::Acquire) {Some("deleted")}
+    else if closing {Some("closing")}
+    else if control.unknown.load(Ordering::Acquire) {Some("unknownResult")}
+    else if events.requests_unavailable || !events.pending.is_empty() || !events.observed_pending.is_empty() {Some("pendingRequest")}
+    else if events.context_compaction.is_some() {Some("compacting")}
+    else if !events.connected && !events.observer_connected {Some("disconnected")}
+    else if !events.connected {Some("guiDisconnected")}
+    else if events.context_active==Some(true) {Some("active")}
+    else if events.context_active.is_none() {Some("statusUnknown")}
+    else {Some("unsupported")}
+}
 fn observe_message(control: &Control, thread_id: &str, message: Value) -> Result<(), String> {
     record_message(control,thread_id,message,false)
 }
 fn record_message(control: &Control, thread_id: &str, message: Value, metadata_only: bool) -> Result<(), String> {
     let Some(method) = message["method"].as_str() else { return Ok(()); };
-    if metadata_only && message.get("id").is_none() && !matches!(method,"serverRequest/resolved" | "thread/deleted") {return Ok(());}
+    if metadata_only && message.get("id").is_none() && !matches!(method,"serverRequest/resolved" | "thread/deleted" | "thread/tokenUsage/updated" | "thread/status/changed" | "turn/started" | "turn/completed" | "item/started" | "item/completed") {return Ok(());}
     let params = &message["params"];
     let selected = params["threadId"].as_str().or_else(|| params["thread"]["id"].as_str());
     if selected != Some(thread_id) { return Ok(()); }
@@ -610,6 +675,7 @@ fn record_message(control: &Control, thread_id: &str, message: Value, metadata_o
     if method == "thread/deleted" {
         if control.deleted.swap(true,Ordering::AcqRel) { return Err("원래 대화가 이미 삭제되었습니다.".into()); }
         events.pending.clear(); events.observed_pending.clear(); events.connected=false; events.observer_connected=false;
+        events.token_usage=None;events.context_active=None;events.context_compaction=None;events.context_revision+=1;
         events.queue.clear(); events.bytes=0;
         events.error=Some("원래 대화가 삭제되었습니다. 이전 이력과 상세 캐시를 사용하지 않습니다.".into());
         events.push(json!({"method":method,"params":params}));
@@ -618,6 +684,35 @@ fn record_message(control: &Control, thread_id: &str, message: Value, metadata_o
         // 요청 결과 불명은 삭제 알림만으로 해결됐다고 가정하지 않는다. 소유권은 worker join 후 해제한다.
         return Err("원래 대화가 삭제되어 수동 구독을 종료했습니다.".into());
     }
+    // GUI 연결 중에는 같은 서버의 별도 관찰 스트림이 늦게 도착해 최신 상태를
+    // 되돌리지 않도록 GUI 스트림만 사용한다. 터미널에서는 기존 관찰을 재사용한다.
+    if !metadata_only || !events.connected {
+        match method {
+            "thread/tokenUsage/updated" => {
+                if params["turnId"].as_str().is_some_and(|id|valid_id(id).is_ok()) {
+                    let usage=serde_json::from_value::<ContextTokenUsage>(params["tokenUsage"].clone()).ok()
+                        .filter(|usage|usage.total.valid()&&usage.last.valid()&&usage.model_context_window.map_or(true,|window|window>0));
+                    events.token_usage_fresh=usage.is_some()&&events.context_compaction.is_none();events.token_usage=usage;events.context_revision+=1;
+                }
+            },
+            "thread/status/changed" => {events.context_active=context_active(&params["status"]);events.context_revision+=1;},
+            "turn/started" => {events.context_active=Some(true);events.context_revision+=1;},
+            "turn/completed" => {events.context_active=Some(false);if events.context_compaction.is_some() {events.token_usage_fresh=false;}events.context_compaction=None;events.context_revision+=1;},
+            "item/started" | "item/completed" if params["item"]["type"]=="contextCompaction" => {
+                if let (Some(turn),Some(item))=(params["turnId"].as_str(),params["item"]["id"].as_str()) {
+                    if valid_id(turn).is_ok()&&valid_id(item).is_ok() {
+                        let key=(turn.to_owned(),item.to_owned());
+                        events.token_usage_fresh=false;
+                        if method=="item/started" {events.context_compaction=Some(key);}
+                        else if events.context_compaction.as_ref()==Some(&key) {events.context_compaction=None;}
+                        events.context_revision+=1;
+                    }
+                }
+            },
+            _=>{},
+        }
+    }
+    if metadata_only && message.get("id").is_none() && method!="serverRequest/resolved" {return Ok(());}
     if method == "serverRequest/resolved" {
         if let Some(id) = params.get("requestId") {
             let key=id.to_string();
@@ -699,6 +794,58 @@ mod tests {
         let result=socket.get_mut().read(&mut[0u8;1]);
         let closed=match &result {Ok(0)=>true,Err(error)=>matches!(error.kind(),io::ErrorKind::ConnectionAborted|io::ErrorKind::ConnectionReset),_=>false};
         assert!(closed,"추가 송신 없이 실제 연결이 닫혀야 한다. 시간 초과는 종료 근거가 아니다: {result:?}");
+    }
+    #[test]
+    fn context_snapshot_uses_existing_observer_without_draining_or_connecting() {
+        let(control,mut rpc,listener)=fixture();
+        control.0.events.lock().unwrap().observer_connected=true;
+        let usage=json!({"total":{"totalTokens":100,"inputTokens":70,"cachedInputTokens":0,"outputTokens":30,"reasoningOutputTokens":0},"last":{"totalTokens":40,"inputTokens":30,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"modelContextWindow":1000});
+        control.observer_message("original",json!({"method":"thread/tokenUsage/updated","params":{"threadId":"foreign","turnId":"turn","tokenUsage":usage}})).unwrap();
+        assert!(control.context_status("original").unwrap()["tokenUsage"].is_null());
+        control.observer_message("original",json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"turn","tokenUsage":usage}})).unwrap();
+        observe_message(&control.0,"original",json!({"method":"test/event","params":{"threadId":"original"}})).unwrap();
+        for _ in 0..3 {
+            let status=control.request("original",Path::new("."),ConversationRequest::ContextStatus).unwrap();
+            assert_eq!(status["connected"],true);assert_eq!(status["guiConnected"],false);
+            assert_eq!(status["tokenUsage"]["last"]["totalTokens"],40);assert_eq!(status["tokenUsageFresh"],true);
+            assert_eq!(status["reason"],"guiDisconnected");assert_eq!(status["active"],Value::Null);
+        }
+        assert!(control.0.worker.lock().unwrap().is_none());assert_eq!(control.0.events.lock().unwrap().queue.len(),1);
+        {let _worker=control.0.worker.lock().unwrap();assert_eq!(control.context_status("original").unwrap()["reason"],"closing");}
+        assert_eq!(rpc.next_id,0);
+        let(stream,_)=listener.accept().unwrap();let mut socket=WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);
+        drop(rpc);assert_closed_without_input(&mut socket);
+    }
+    #[test]
+    fn context_usage_is_unavailable_after_malformed_update_and_stale_after_compaction() {
+        let(control,_rpc,_listener)=fixture();control.0.events.lock().unwrap().observer_connected=true;
+        let usage=json!({"total":{"totalTokens":100,"inputTokens":70,"cachedInputTokens":0,"outputTokens":30,"reasoningOutputTokens":0},"last":{"totalTokens":40,"inputTokens":30,"cachedInputTokens":0,"outputTokens":10,"reasoningOutputTokens":0},"modelContextWindow":1000});
+        let update=|usage:Value|json!({"method":"thread/tokenUsage/updated","params":{"threadId":"original","turnId":"turn","tokenUsage":usage}});
+        control.observer_message("original",update(usage.clone())).unwrap();
+        control.observer_message("original",json!({"method":"item/started","params":{"threadId":"original","turnId":"compact","item":{"id":"compact-item","type":"contextCompaction"}}})).unwrap();
+        control.observer_message("original",update(usage.clone())).unwrap();
+        let status=control.context_status("original").unwrap();assert_eq!(status["compacting"],true);assert_eq!(status["tokenUsageFresh"],false);
+        control.observer_message("original",json!({"method":"item/completed","params":{"threadId":"original","turnId":"compact","item":{"id":"compact-item","type":"contextCompaction"}}})).unwrap();
+        assert_eq!(control.context_status("original").unwrap()["tokenUsageFresh"],false);
+        control.observer_message("original",update(usage.clone())).unwrap();assert_eq!(control.context_status("original").unwrap()["tokenUsageFresh"],true);
+        let mut invalid=usage;invalid["last"]["totalTokens"]=json!(-1);control.observer_message("original",update(invalid)).unwrap();
+        let status=control.context_status("original").unwrap();assert!(status["tokenUsage"].is_null());assert_eq!(status["tokenUsageFresh"],false);
+    }
+    #[test]
+    fn unsupported_compact_and_native_guards_never_send_legacy_compact() {
+        for state in ["idle","active","statusUnknown","pendingRequest","unknownResult","compacting","deleted","closing"] {
+            let(control,mut rpc,listener)=fixture();
+            {let mut events=control.0.events.lock().unwrap();events.connected=true;events.context_active=Some(false);
+                match state {"active"=>events.context_active=Some(true),"statusUnknown"=>events.context_active=None,
+                    "pendingRequest"=>{events.observed_pending.insert("1".into(),json!({"method":"item/tool/requestUserInput"}));},
+                    "compacting"=>events.context_compaction=Some(("turn".into(),"item".into())),_=>{}}
+            }
+            control.0.unknown.store(state=="unknownResult",Ordering::Release);control.0.deleted.store(state=="deleted",Ordering::Release);control.0.stopped.store(state=="closing",Ordering::Release);
+            let result=execute(&control.0,&mut rpc,"original",ConversationRequest::Compact,&AtomicBool::new(false));
+            if matches!(state,"deleted"|"closing") {assert!(result.is_err());}
+            else {let value=result.unwrap();assert_eq!(value["status"],if state=="idle" {"unsupported"}else{"notStarted"});assert_eq!(value["reason"],if state=="idle" {"unsupported"}else{state});}
+            assert_eq!(rpc.next_id,0);let(stream,_)=listener.accept().unwrap();let mut socket=WebSocket::from_raw_socket(stream,tungstenite::protocol::Role::Server,None);drop(rpc);assert_closed_without_input(&mut socket);
+        }
     }
     #[test]
     fn bounded_events_mark_gaps_and_release_drained_bytes() {

@@ -300,3 +300,17 @@ session and are not counted as confirmed questions.
 Sent pasted images remain in app-owned storage because resumed history can reference them.
 Unsent temporary files are cleaned up; original user files are never deleted. Exceeding the storage
 budget rejects new attachments rather than automatically deleting earlier attachments.
+
+## Session context controls
+
+Each session header has a context meter and a manual compaction button. The meter uses
+the runtime's latest model response token usage divided by its reported context window,
+not cumulative billing usage or the terminal transcript size. Hover for the token counts;
+click to refresh. Missing or stale measurements display an em dash. Visible cards read one
+bounded local snapshot every two seconds; hidden cards stop these reads.
+
+Manual compaction requires an idle, connected original thread with no pending approvals
+or unknown request result. The app must use an atomic idle-only runtime operation; it
+never falls back to the legacy compaction operation that can replace an active task.
+Unsupported runtimes keep the button unavailable. Acceptance is not completion, and an
+unknown result is never automatically retried. Drafts and original conversations are preserved.

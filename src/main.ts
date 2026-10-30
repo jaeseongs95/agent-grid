@@ -15,6 +15,7 @@ import { createMobileControl } from './mobile-control';
 import { createWeeklyUsage } from './weekly-usage';
 import './weekly-usage.css';
 import { createConversation } from './conversation';
+import { createContextControls } from './context-controls';
 import { createQuestionCenter } from './question-center';
 import { InputQueueError, TerminalInputQueue, TerminalResizeQueue, TerminalOutputAcknowledgements } from './terminal-flow';
 import { bindAttribute, bindText, getLanguage, languageStorageError, onLanguageChange, setLanguage, t } from './i18n';
@@ -30,6 +31,7 @@ interface QueuedResize { generation: number; selectionVersion: number; cols: num
 const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; input: TerminalInputQueue<QueuedInput>; resize: TerminalResizeQueue<QueuedResize>; inputWarning: boolean; resizeTimer?: ReturnType<typeof setTimeout> }>();
 const conversations = new Map<string, ReturnType<typeof createConversation>>();
 const conversationOwners = new Set<string>();
+const contextControls = new Map<string, ReturnType<typeof createContextControls>>();
 const pending = new Map<string, Output[]>();
 const resolving = new Set<string>();
 const unlisteners: UnlistenFn[] = [];
@@ -445,19 +447,23 @@ function mountConversation(session: Session) {
   conversationHost.hidden = true;
   let conversation: ReturnType<typeof createConversation> | undefined;
   const toggle = card.querySelector<HTMLButtonElement>('.conversation-toggle')!;
+  function getConversation() {
+    if (!conversation) {
+      conversation = createConversation({ sessionId: session.id, generation: session.generation, host: conversationHost, call,
+        ownerChanged(owned) { if (conversations.get(session.id) !== conversation) return; if (owned) { conversationOwners.add(session.id); input.cancelPending(); } else conversationOwners.delete(session.id); refreshInputState(session.id); },
+      });
+      conversations.set(session.id, conversation);
+    }
+    return conversation!;
+  }
   toggle.onclick = async () => {
     toggle.disabled = true;
     try {
-      if (!conversation) {
-        conversation = createConversation({ sessionId: session.id, generation: session.generation, host: conversationHost, call,
-          ownerChanged(owned) { if (conversations.get(session.id) !== conversation) return; if (owned) { conversationOwners.add(session.id); input.cancelPending(); } else conversationOwners.delete(session.id); refreshInputState(session.id); },
-        });
-        conversations.set(session.id, conversation);
-      }
+      getConversation();
       const show = conversationHost.hidden;
-      if (show) await conversation.setVisible(true);
-      else await conversation.handoffToTerminal();
-      await conversation.setForeground(!card.hidden && !document.hidden && nativeWindowVisible);
+      if (show) await conversation!.setVisible(true);
+      else await conversation!.handoffToTerminal();
+      await conversation!.setForeground(!card.hidden && !document.hidden && nativeWindowVisible);
       card.querySelector<HTMLElement>('.terminal-host')!.hidden = show;
       toggle.setAttribute('aria-pressed', String(show));
       if (!show) { fit.fit(); terminal.focus(); }
@@ -469,11 +475,32 @@ function mountConversation(session: Session) {
     }
     finally { toggle.disabled = false; }
   };
+  contextControls.get(session.id)?.dispose();
+  contextControls.set(session.id, createContextControls({
+    host: card.querySelector<HTMLElement>('.context-controls')!, sessionId: session.id, generation: session.generation, call, notify,
+    async prepare() {
+      if (toggle.disabled) throw new Error('대화 화면 전환 중');
+      toggle.disabled = true;
+      try {
+        const controller = getConversation();
+        await controller.setVisible(true);
+        await controller.setForeground(!card.hidden && !document.hidden && nativeWindowVisible);
+        card.querySelector<HTMLElement>('.terminal-host')!.hidden = true;
+        toggle.setAttribute('aria-pressed', 'true');
+      } catch (error) {
+        const showingConversation = !conversationHost.hidden;
+        card.querySelector<HTMLElement>('.terminal-host')!.hidden = showingConversation;
+        toggle.setAttribute('aria-pressed', String(showingConversation));
+        throw error;
+      } finally { toggle.disabled = false; }
+    },
+    compact: () => getConversation().compact(),
+  }));
 }
 
 function createTerminal(session: Session) {
   const card = document.createElement('article'); card.className = 'terminal-card'; card.dataset.id = session.id;
-  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-state"></span><div class="card-actions"><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="conversation-toggle icon-button" type="button" aria-label="대화 보기" title="대화 / 터미널">☷</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">직접 입력 · IME · 붙여넣기</span></div>`;
+  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-state"></span><div class="card-actions"><span class="context-controls"></span><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="conversation-toggle icon-button" type="button" aria-label="대화 보기" title="대화 / 터미널">☷</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">직접 입력 · IME · 붙여넣기</span></div>`;
   localizeMarkup(card);
   const terminal = new Terminal({ fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.45, cursorBlink: true, scrollback: 10000, disableStdin: !native, allowProposedApi: false, theme: { background: '#141820', foreground: '#ced5e3', cursor: '#a5b4fc', selectionBackground: '#3b4567', black: '#212735', red: '#f78b99', green: '#91d6ad', yellow: '#eac184', blue: '#8eaafb', magenta: '#c4a4f3', cyan: '#87cfd9', white: '#e3e8f0' } });
   const fit = new FitAddon(); const search = new SearchAddon(); terminal.loadAddon(fit); terminal.loadAddon(search);
@@ -549,7 +576,7 @@ function removeSession(id: string, preserveRestore = false) {
     workspaceSlots = workspaceSlots.filter(slot => typeof slot === 'string' || !removed.includes(slot));
     updateRestoreBanner();
   }
-  workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); explicitlyStoppedSessions.delete(id); const view = terminals.get(id); const conversation = conversations.get(id); conversations.delete(id); conversationOwners.delete(id); if (conversation) void conversation.dispose({ sessionEnded: true }).catch(error => notify('대화 연결 정리를 확인하지 못했습니다. 세션 상태를 확인하세요.', true, 'Conversation cleanup could not be confirmed. Check the session status.')); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
+  contextControls.get(id)?.dispose(); contextControls.delete(id); workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); explicitlyStoppedSessions.delete(id); const view = terminals.get(id); const conversation = conversations.get(id); conversations.delete(id); conversationOwners.delete(id); if (conversation) void conversation.dispose({ sessionEnded: true }).catch(error => notify('대화 연결 정리를 확인하지 못했습니다. 세션 상태를 확인하세요.', true, 'Conversation cleanup could not be confirmed. Check the session status.')); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
 
 function receiveSession(info: SessionInfo, persist = true) {
   const previous = sessions.get(info.id); const session = updateSession(previous, info);
@@ -657,6 +684,10 @@ function renderGrid() {
 }
 
 function updateConversationVisibility() {
+  for (const [id, controller] of contextControls) {
+    const view = terminals.get(id); const session = sessions.get(id);
+    controller.setVisible(native && !!session?.active && !!view && !view.card.hidden && !document.hidden && nativeWindowVisible);
+  }
   for (const [id, controller] of conversations) {
     const view = terminals.get(id);
     void controller.setForeground(!!view && !view.card.hidden && !document.hidden && nativeWindowVisible).catch(error => notify('대화 화면을 갱신하지 못했습니다. 해당 세션을 다시 선택하세요.', true, 'Could not refresh the conversation view. Select the session again.'));
