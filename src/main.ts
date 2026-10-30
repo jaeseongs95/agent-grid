@@ -47,6 +47,8 @@ const startOperations = new Set<Promise<SessionInfo>>();
 // Failed shutdown events must not erase the restart intent saved before stopping.
 const exitResumeIntents = new Set<string>();
 const failedRestoreCards = new Set<string>();
+const explicitlyStoppedSessions = new Set<string>();
+const cancelledRestores = new Set<SavedSession>();
 let saveTimer: ReturnType<typeof setTimeout>;
 let saveQueue = Promise.resolve();
 let notificationCount = 0;
@@ -333,7 +335,7 @@ function workspaceLayout(): Layout {
   return { version: 1, columns, columnSizes: [...columnSizes], rowSizes: [...rowSizes], sessions: workspaceSlots.map(slot => {
     if (typeof slot !== 'string') return savedSessionMetadata(slot);
     const info = sessions.get(slot)!;
-    return savedSessionMetadata({ ...info, sessionId: info.id, resumeOnStartup: exitResumeIntents.has(info.id) || (info.active && info.state !== 'stopping') });
+    return savedSessionMetadata({ ...info, sessionId: info.id, resumeOnStartup: !explicitlyStoppedSessions.has(info.id) && (exitResumeIntents.has(info.id) || (info.active && info.state !== 'stopping')) });
   }) };
 }
 
@@ -358,6 +360,8 @@ function updateRestoreBanner() {
   if ($<HTMLDialogElement>('#restore-dialog').open) renderRestoreList();
 }
 function bindRestored(request: SavedSession, info: SessionInfo) {
+  // A delayed success cannot undo a stop confirmed while this restore was pending.
+  if (cancelledRestores.has(request)) explicitlyStoppedSessions.add(info.id);
   workspaceSlots = workspaceSlots.map(slot => slot === request ? info.id : slot);
   // Duplicate saved references to the same conversation share one terminal.
   workspaceSlots = workspaceSlots.filter((slot, index, slots) => typeof slot !== 'string' || slots.indexOf(slot) === index);
@@ -368,6 +372,7 @@ function bindRestored(request: SavedSession, info: SessionInfo) {
 }
 function restoreSaved(request: SavedSession, focus = true): Promise<SessionInfo> {
   const pending = restoringRequests.get(request); if (pending) return pending;
+  cancelledRestores.delete(request);
   for (const id of failedRestoreCards) if (sessions.get(id)?.threadId === request.threadId && sessions.get(id)?.active === false) removeSession(id, true);
   const before = new Set(sessions.keys());
   const operation = start(request, focus).then(info => {
@@ -378,10 +383,11 @@ function restoreSaved(request: SavedSession, focus = true): Promise<SessionInfo>
     // but remove newly reaped error cards so the saved retry does not duplicate them.
     for (const info of [...sessions.values()]) if ((!before.has(info.id) || failedRestoreCards.has(info.id)) && info.threadId === request.threadId) {
       failedRestoreCards.add(info.id);
+      if (info.active) Object.assign(request, { sessionId: info.id, projectId: info.projectId ?? null, projectAssigned: info.projectAssigned ?? false, projectRevision: info.projectRevision ?? 0 });
       if (!info.active) removeSession(info.id, true);
     }
     throw error;
-  }).finally(() => { restoringRequests.delete(request); updateRestoreBanner(); scheduleSave(); });
+  }).finally(() => { restoringRequests.delete(request); cancelledRestores.delete(request); updateRestoreBanner(); scheduleSave(); });
   restoringRequests.set(request, operation); updateRestoreBanner();
   return operation;
 }
@@ -471,7 +477,11 @@ function createTerminal(session: Session) {
     const current = sessions.get(session.id)!;
     if (!current.active) { removeSession(session.id); return; }
     if (confirm(t(`“${current.title}” 세션을 종료할까요? 실행 중인 작업이 중단됩니다.`, `Stop session “${current.title}”? Running work will be interrupted.`))) {
-      exitResumeIntents.delete(current.id);
+      exitResumeIntents.delete(current.id); explicitlyStoppedSessions.add(current.id);
+      for (const request of saved) if (request.threadId && request.threadId === current.threadId) {
+        request.resumeOnStartup = false;
+        if (restoringRequests.has(request)) cancelledRestores.add(request);
+      }
       void call('session_stop', { id: current.id, generation: current.generation }).then(() => {
         // A reaped error may not emit another state event. A live observation error
         // is removed only after the native stop has completed its actual cleanup.
@@ -498,12 +508,16 @@ function removeSession(id: string, preserveRestore = false) {
     workspaceSlots = workspaceSlots.filter(slot => typeof slot === 'string' || !removed.includes(slot));
     updateRestoreBanner();
   }
-  workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); const view = terminals.get(id); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
+  workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); explicitlyStoppedSessions.delete(id); const view = terminals.get(id); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
 
 function receiveSession(info: SessionInfo, persist = true) {
   const previous = sessions.get(info.id); const session = updateSession(previous, info);
   if (session === previous) return;
   sessions.set(session.id, session);
+  // Pending restores retain object identity while current membership advances.
+  for (const request of saved) if (request.threadId && request.threadId === session.threadId && request.sessionId === session.id && typeof session.projectRevision === 'number' && session.projectRevision >= (request.projectRevision ?? 0)) {
+    Object.assign(request, { projectId: session.projectId ?? null, projectAssigned: session.projectAssigned ?? false, projectRevision: session.projectRevision });
+  }
   if (!order.includes(session.id)) order.push(session.id);
   const terminal = terminals.get(session.id)?.terminal ?? createTerminal(session);
   if (previous && previous.generation !== session.generation) { const view = terminals.get(session.id)!; view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); terminal.reset(); }
@@ -662,9 +676,7 @@ const projectManager = createProjectManager({
     if (deletedId) {
       const belongs = (session: SavedSession) => session.projectId === deletedId || (!session.projectAssigned && sessionProjectKey(session, importedProjects) === `id:${deletedId}`);
       const unassign = <T extends SavedSession>(session: T): T => ({ ...session, projectId: null, projectAssigned: true, projectRevision: (session.projectRevision ?? 0) + 1 });
-      const reassigned = new Map(saved.map(session => [session, belongs(session) ? unassign(session) : session]));
-      saved = saved.map(session => reassigned.get(session)!);
-      workspaceSlots = workspaceSlots.map(slot => typeof slot === 'string' ? slot : reassigned.get(slot) ?? slot);
+      for (const session of saved) if (belongs(session)) Object.assign(session, unassign(session));
       for (const session of sessions.values()) if (belongs(session)) receiveSession(unassign(session));
     }
     await sessionBrowser.refreshProjects();
@@ -811,7 +823,7 @@ async function requestExit(allowUnconfirmedRemote = false) {
     await Promise.allSettled([...startOperations, ...restoringRequests.values()]);
     if (native && !workspaceReady) throw new UiError('저장된 작업 공간을 확인하지 못해 종료 정보를 덮어쓰지 않았습니다.', 'Could not load the saved workspace; exit metadata was not overwritten.');
     bindText(button, '종료 중…', 'Exiting…');
-    for (const session of sessions.values()) if (session.active && session.state !== 'stopping') exitResumeIntents.add(session.id);
+    for (const session of sessions.values()) if (session.active && session.state !== 'stopping' && !explicitlyStoppedSessions.has(session.id)) exitResumeIntents.add(session.id);
     await persistLayout();
     if (native) await nativeLanguageQueue;
     await call('complete_exit', { confirmed: true, ...(allowUnconfirmedRemote ? { allowUnconfirmedRemote: true } : {}) }); completed = true;

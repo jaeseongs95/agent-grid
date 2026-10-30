@@ -3,14 +3,15 @@ import { test, expect, type Page } from '@playwright/test';
 const a = { title: '복원 첫째', cwd: 'D:\\work', threadId: 'thread-a', sessionId: 'old-a', resumeOnStartup: true };
 const b = { title: '복원 둘째', cwd: 'D:\\work', threadId: 'thread-b', sessionId: 'old-b', resumeOnStartup: true };
 
-async function workspace(page: Page, options: { sessions?: any[]; holdFirst?: boolean; holdLayout?: boolean; failFirst?: boolean; failActive?: boolean; live?: boolean; failSave?: boolean; failExit?: boolean } = {}) {
+async function workspace(page: Page, options: { sessions?: any[]; holdFirst?: boolean; holdSecond?: boolean; holdLayout?: boolean; holdStop?: boolean; cancelStartOnStop?: boolean; lateSuccess?: boolean; project?: boolean; failFirst?: boolean; failActive?: boolean; live?: boolean; failSave?: boolean; failExit?: boolean } = {}) {
   await page.addInitScript(({ options, a, b }) => {
     const state = window as any; state.isTauri = true;
     let callback = 0;
     const callbacks = new Map<number, (value: any) => void>();
     const listeners = new Map<string, (value: any) => void>();
     const live = options.live ? [{ ...a, id: a.sessionId, generation: 1, state: 'idle', active: true }] : [];
-    const fixture = state.restoreFixture = { calls: [] as any[], live, starts: 0, current: 0, maxCurrent: 0, release: () => {}, releaseLayout: () => {}, failSave: !!options.failSave, failExit: !!options.failExit,
+    const projects = JSON.parse(localStorage.getItem('restore-test-projects') || 'null') || (options.project ? [{ id: 'p', name: '복원 프로젝트', cwd: a.cwd, createdAt: 1, favorite: false }, { id: 'q', name: '다른 프로젝트', cwd: null, createdAt: 2, favorite: false }] : []);
+    const fixture = state.restoreFixture = { calls: [] as any[], live, starts: 0, current: 0, maxCurrent: 0, stoppedIds: [] as string[], release: () => {}, releaseSecond: () => {}, releaseStop: () => {}, releaseLayout: () => {}, failSave: !!options.failSave, failExit: !!options.failExit,
       emit(info: any) { listeners.get('session-changed')?.({ event: 'session-changed', id: 1, payload: info }); },
     };
     state.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
@@ -21,7 +22,7 @@ async function workspace(page: Page, options: { sessions?: any[]; holdFirst?: bo
         if (command === 'plugin:event|listen') { listeners.set(args.event, callbacks.get(args.handler)!); return callback; }
         if (command.startsWith('plugin:event|')) return callback;
         if (command === 'get_ui_language') return 'ko';
-        if (command === 'list_projects') return [];
+        if (command === 'list_projects') return projects;
         if (command === 'list_sessions') return fixture.live;
         if (command === 'load_layout') {
           if (options.holdLayout) await new Promise<void>(resolve => { fixture.releaseLayout = resolve; });
@@ -36,11 +37,25 @@ async function workspace(page: Page, options: { sessions?: any[]; holdFirst?: bo
           const info = { ...args.request, id: `new-${index}`, generation: 1, state: 'starting', active: true };
           fixture.live.push(info); fixture.emit(info);
           if (options.holdFirst && index === 1) await new Promise<void>(resolve => { fixture.release = resolve; });
+          if (options.holdSecond && index === 2) await new Promise<void>(resolve => { fixture.releaseSecond = resolve; });
           fixture.current--;
+          if (options.cancelStartOnStop && fixture.stoppedIds.includes(info.id) && !options.lateSuccess) { Object.assign(info, { state: 'stopped', active: false }); fixture.emit(info); throw new Error('START_CANCELLED'); }
           if (options.failFirst && index === 1) { Object.assign(info, { state: 'error', active: !!options.failActive }); fixture.emit(info); throw new Error('FIRST_RESTORE_FAILED'); }
           Object.assign(info, { state: 'idle' }); fixture.emit(info); return { ...info };
         }
-        if (command === 'session_stop') { const info = fixture.live.find((item: any) => item.id === args.id); Object.assign(info, { state: 'stopped', active: false }); fixture.emit(info); }
+        if (command === 'session_stop') {
+          fixture.stoppedIds.push(args.id);
+          if (options.holdStop) await new Promise<void>(resolve => { fixture.releaseStop = resolve; });
+          const info = fixture.live.find((item: any) => item.id === args.id); Object.assign(info, { state: 'stopped', active: false }); fixture.emit(info);
+        }
+        if (command === 'delete_project') {
+          projects.splice(projects.findIndex((item: any) => item.id === args.id), 1); localStorage.setItem('restore-test-projects', JSON.stringify(projects));
+          for (const info of fixture.live) if (info.projectId === args.id) Object.assign(info, { projectId: null, projectAssigned: true, projectRevision: (info.projectRevision || 0) + 1 });
+          return null;
+        }
+        if (command === 'move_session_to_project') {
+          const info = fixture.live.find((item: any) => item.id === args.id); Object.assign(info, { projectId: args.projectId, projectAssigned: true, projectRevision: (info.projectRevision || 0) + 1 }); return { ...info };
+        }
         if (command === 'complete_exit') {
           for (const info of fixture.live) { Object.assign(info, { state: 'stopped', active: false }); fixture.emit(info); }
           if (fixture.failExit) throw new Error('REMOTE_STOP_UNKNOWN');
@@ -213,4 +228,51 @@ for (const active of [true, false]) test(`실패한 복원 카드를 ${active ? 
   await expect.poll(async () => (await saved(page))?.sessions.map((item: any) => item.threadId)).toEqual(['thread-b']);
   await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
   expect((await calls(page, 'start_session')).map((item: any) => item.args.request.threadId)).toEqual(['thread-b']);
+});
+
+for (const lateSuccess of [false, true]) test(`시작 중 명시 종료는 ${lateSuccess ? '늦은 성공 응답과 종료 저장' : '시작 취소와 자동 회수'} 뒤에도 재시작 의도를 되살리지 않는다`, async ({ page }) => {
+  await workspace(page, { sessions: [a], holdFirst: true, cancelStartOnStop: true, holdStop: lateSuccess, lateSuccess, failExit: true });
+  await expect.poll(async () => (await calls(page, 'start_session')).length).toBe(1);
+  page.on('dialog', dialog => dialog.accept());
+  await page.locator('.terminal-card .stop').click();
+  await expect.poll(async () => (await calls(page, 'session_stop')).length).toBe(1);
+  await page.locator('#exit').click(); await page.locator('#confirm-exit').click();
+  expect(await calls(page, 'complete_exit')).toEqual([]);
+  await page.evaluate(() => (window as any).restoreFixture.release());
+  await expect.poll(async () => (await calls(page, 'complete_exit')).length).toBe(1);
+  expect((await saved(page)).sessions.filter((item: any) => item.threadId === a.threadId && item.resumeOnStartup === true)).toEqual([]);
+  if (lateSuccess) await page.evaluate(() => (window as any).restoreFixture.releaseStop());
+  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  expect(await calls(page, 'start_session')).toEqual([]);
+});
+
+test('수동 복원 중 프로젝트 삭제는 같은 대기 항목을 갱신하고 완료와 닫기 뒤 중복 복원을 남기지 않는다', async ({ page }) => {
+  await workspace(page, { sessions: [{ ...a, projectId: 'p', projectAssigned: true }], project: true, failFirst: true, holdSecond: true });
+  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await page.locator('#restore-open').click(); await page.locator('#restore-list').getByRole('button', { name: '이 대화 재개 →' }).click();
+  await expect.poll(async () => (await calls(page, 'start_session')).length).toBe(2);
+  await page.locator('#restore-dialog [data-close]').click();
+  await page.locator('#projects [data-project-id="p"]').click(); await page.locator('#project-delete').click(); await page.locator('#project-delete-confirm').click();
+  await expect(page.locator('#project-dialog')).toBeHidden();
+  await page.evaluate(() => (window as any).restoreFixture.releaseSecond());
+  await expect.poll(async () => (await saved(page))?.sessions.length).toBe(1);
+  expect((await saved(page)).sessions[0]).toMatchObject({ threadId: a.threadId, projectId: null, projectAssigned: true });
+  await expect(page.locator('#restore-banner')).toBeHidden();
+  page.on('dialog', dialog => dialog.accept());
+  await page.locator('.terminal-card .stop').click(); await expect(page.locator('.session-state')).toHaveText('종료됨');
+  await page.locator('.terminal-card .stop').click();
+  await expect.poll(async () => (await saved(page))?.sessions.length).toBe(0);
+  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨'); expect(await calls(page, 'start_session')).toEqual([]);
+});
+
+for (const projectRevision of [0, 7]) test(`실패 소유권 카드의 프로젝트 이동은 이전 실행revision${projectRevision}과 구분하여 최신 소속을 저장한다`, async ({ page }) => {
+  await workspace(page, { sessions: [{ ...a, projectId: 'p', projectAssigned: true, projectRevision }], project: true, failFirst: true, failActive: true });
+  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await page.locator('.terminal-card .project-move').click(); await page.locator('#project-move-target').selectOption('q'); await page.locator('#project-move-confirm').click();
+  await expect(page.locator('#project-move-dialog')).toBeHidden();
+  await expect.poll(async () => (await saved(page))?.sessions[0]?.projectId).toBe('q');
+  expect((await saved(page)).sessions).toHaveLength(1);
+  expect((await saved(page)).sessions[0]).toMatchObject({ projectAssigned: true, projectRevision: 1 });
+  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  expect((await calls(page, 'start_session'))[0].args.request.projectId).toBe('q');
 });
