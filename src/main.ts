@@ -655,13 +655,16 @@ function renderSide() {
     $('#projects').append(container);
   }
   if (!projects.length) { const p = document.createElement('p'); p.className = 'side-empty'; bindText(p, '프로젝트를 만들거나 폴더를 가져오세요', 'Create a project or import a folder'); $('#projects').append(p); }
+  const activeProjects = new Set([...sessions.values()].filter(session => session.active).map(session => sessionProjectKey(session, importedProjects)));
   const tabs = $('#project-tabs'); const focused = tabs.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.projectKey : undefined; tabs.replaceChildren();
   [{ key: '', name: '', cwd: null, count: sessions.size, favorite: false }, ...projects].forEach(({ key, cwd, name, count, favorite }, index) => {
     const tab = document.createElement('button'); const chosen = key === selectedProject;
     tab.id = `project-tab-${index}`; tab.className = `project-tab${chosen ? ' active' : ''}`; tab.dataset.projectCwd = cwd ?? ''; tab.dataset.projectKey = key; tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(chosen)); tab.setAttribute('aria-controls', 'grid-area'); tab.tabIndex = chosen ? 0 : -1;
     if (cwd) tab.title = cwd; else bindAttribute(tab, 'title', key ? '논리적 세션 묶음 · 실행 폴더와 별개' : '모든 프로젝트의 세션', key ? 'Session group independent of working folders' : 'Sessions from all projects');
     const label = document.createElement('span'); if (key === 'unassigned') bindText(label, '미분류', 'Unassigned'); else if (key) label.textContent = name; else bindText(label, '전체', 'All');
-    const total = document.createElement('small'); total.textContent = String(count); if (favorite) tab.append(document.createTextNode('★ ')); tab.append(label, document.createTextNode(' '), total); tab.onclick = () => { selectProject(key); $('#project-tabs [aria-selected="true"]').focus(); }; tabs.append(tab);
+    const hasActiveSession = key ? activeProjects.has(key) : activeProjects.size > 0;
+    const light = document.createElement('span'); light.className = `project-activity${hasActiveSession ? ' is-active' : ''}`; light.setAttribute('role', 'img'); bindAttribute(light, 'aria-label', hasActiveSession ? '활성 세션 있음' : '활성 세션 없음', hasActiveSession ? 'Active sessions' : 'No active sessions'); bindAttribute(light, 'title', hasActiveSession ? '활성 세션 있음' : '활성 세션 없음', hasActiveSession ? 'Active sessions' : 'No active sessions');
+    const total = document.createElement('small'); total.textContent = String(count); if (favorite) tab.append(document.createTextNode('★ ')); tab.append(label, document.createTextNode(' '), total, light); tab.onclick = () => { selectProject(key); $('#project-tabs [aria-selected="true"]').focus(); }; tabs.append(tab);
     if (chosen) $('#grid-area').setAttribute('aria-labelledby', tab.id);
   });
   if (focused !== undefined) [...tabs.querySelectorAll<HTMLElement>('[role="tab"]')].find(tab => tab.dataset.projectKey === focused)?.focus();

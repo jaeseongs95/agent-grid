@@ -478,3 +478,47 @@ for (const scenario of ['return', 'hidden-output', 'move', 'same-project'] as co
   expect(await page.evaluate(() => (window as any).tabsFixture.latestNode === document.querySelector('.terminal-card[data-id="a1"] .xterm'))).toBe(true);
   expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => ['start_session', 'session_stop', 'session_write', 'catalog_preview'].includes(call.command)))).toEqual([]);
 });
+
+
+test('project activity lights follow live ownership independently of the selected tab and stale events', async ({ page }) => {
+  await workspace(page);
+  const light = (name: string) => tab(page, name).locator('.project-activity');
+  await expect(light('Alpha')).toHaveClass(/is-active/);
+  await expect(light('Beta')).toHaveClass(/is-active/);
+  await expect(light('Empty')).not.toHaveClass(/is-active/);
+  await expect(light('Alpha')).toHaveAttribute('aria-label', '활성 세션 있음');
+  await tab(page, 'Empty').click();
+  await expect(tab(page, 'Empty')).toHaveAttribute('aria-selected', 'true');
+  await expect(light('Empty')).not.toHaveClass(/is-active/);
+  await expect(light('Alpha')).toHaveClass(/is-active/);
+  const change = async (index: number, active: boolean, generation = 7) => page.evaluate(({ session, active, generation }) => (window as any).tabsFixture.emit('session-changed', { ...session, active, generation, state: active ? 'idle' : 'exited' }), { session: owned[index], active, generation });
+  await change(0, false);
+  await expect(light('Alpha')).toHaveClass(/is-active/);
+  await change(2, false);
+  await expect(light('Alpha')).not.toHaveClass(/is-active/);
+  await expect(light('Alpha')).toHaveAttribute('aria-label', '활성 세션 없음');
+  await change(2, true);
+  await expect(light('Alpha')).not.toHaveClass(/is-active/);
+  await change(2, true, 8);
+  await expect(light('Alpha')).toHaveClass(/is-active/);
+  for (let index = 0; index < owned.length; index++) await change(index, false, index === 2 ? 8 : 7);
+  await expect(page.locator('#project-tabs .project-activity.is-active')).toHaveCount(0);
+  await page.locator('#settings-open').click();
+  await page.locator('#language-select').selectOption('en');
+  await expect(light('Alpha')).toHaveAttribute('aria-label', 'No active sessions');
+});
+
+test('moving active sessions updates project activity lights without restarting their processes', async ({ page }) => {
+  await workspace(page);
+  await tab(page, 'Alpha').click();
+  for (const id of ['a1', 'a2']) {
+    if (id === 'a2') await tab(page, 'Alpha').click();
+    await card(page, id).getByLabel('프로젝트로 이동', { exact: true }).click();
+    await page.locator('#project-move-target').selectOption('empty');
+    await page.locator('#project-move-confirm').click();
+  }
+  await expect(tab(page, 'Alpha').locator('.project-activity')).not.toHaveClass(/is-active/);
+  await expect(tab(page, 'Empty').locator('.project-activity')).toHaveClass(/is-active/);
+  await expect(page.locator('#project-tabs [role=tab]').first().locator('.project-activity')).toHaveClass(/is-active/);
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => ['start_session', 'session_stop', 'session_write'].includes(call.command)))).toEqual([]);
+});
