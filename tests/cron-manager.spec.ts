@@ -124,7 +124,7 @@ test('잘못된 간격·지난 시각·빈 작업·UTF-8 상한 초과를 등록
     await submit(page);
   }
   await page.locator('.cron-kind').selectOption('at');
-  await page.locator('.cron-time').fill('2029-01-01T00:00:00');
+  await page.locator('.cron-time').fill('2029-01-01T00:00');
   await submit(page);
   await page.locator('.cron-kind').selectOption('every');
   await page.locator('.cron-amount').fill('1');
@@ -278,5 +278,33 @@ test('숨김·닫힘·종료 뒤 polling을 멈추고 다시 보일 때만 조�
   const exitCount = await page.evaluate(() => (window as any).cronFixture.calls.length);
   await page.clock.fastForward(20001);
   expect(await page.evaluate(() => (window as any).cronFixture.calls.length)).toBe(exitCount);
+  expect(await mutations(page)).toEqual([]);
+});
+
+
+test('형식이 잘못된 예약 목록은 마지막 목록을 덮거나 변경 기능을 열지 않는다', async ({ page }) => {
+  await fixture(page, { jobs: 1 });
+  const validJob = await page.evaluate(() => structuredClone((window as any).cronFixture.snapshot.jobs[0]));
+  for (const jobs of [
+    [{ ...validJob, state: 'toString' }], [{ ...validJob, id: '18446744073709551616' }],
+    [validJob, validJob], [{ ...validJob, skipped: -1 }], [{ ...validJob, nextRunAt: {} }],
+  ]) {
+    await page.evaluate(jobs => { (window as any).cronFixture.snapshot.jobs = jobs; }, jobs);
+    await refresh(page);
+    await expect(page.locator('.cron-error')).toBeVisible();
+    await expect(page.locator('.cron-job')).toHaveCount(1);
+    await expect(page.locator('.cron-add')).toBeDisabled();
+  }
+  expect(await mutations(page)).toEqual([]);
+});
+
+test('같은 이벤트에서 창을 닫으면 대기 중 등록 요청을 보내지 않는다', async ({ page }) => {
+  await fixture(page);
+  await page.locator('.cron-prompt').fill('창을 닫기 전 작성한 작업');
+  await page.evaluate(() => {
+    document.querySelector('.cron-form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    (document.querySelector('#cron-dialog') as HTMLDialogElement).close();
+  });
+  await expect(page.locator('#cron-dialog')).not.toBeVisible();
   expect(await mutations(page)).toEqual([]);
 });
