@@ -274,7 +274,8 @@ Unsupported runtime features are reported explicitly. An uncertain send is never
 and its draft is preserved.
 
 The upper-right **Question inbox** shows the count of confirmed unanswered questions and approvals.
-Opening the inbox does not reset the count; server-confirmed resolution removes an entry. Terminal
+Opening the inbox does not reset the count; server-confirmed resolution removes an entry. Questions
+collected from terminal sessions are answered in the original session. Terminal
 waiting states whose request details are unavailable are listed separately with a link to the original
 session and are not counted as confirmed questions.
 

@@ -157,16 +157,16 @@ export function createConversation(options: ConversationOptions) {
     button('.conversation-more').hidden = !nextItems;
     if (nearEnd) messages.scrollTop = messages.scrollHeight;
   }
-  async function loadDetail(entry: Entry, body: HTMLElement, control: HTMLButtonElement, offset: number) {
+  async function loadDetail(entry: Entry, body: HTMLElement, control: HTMLButtonElement, offset: number, snapshotId?: string) {
     control.disabled = true; const version = epoch;
     try {
-      const value = await rpc({ type: 'detail', turnId: selectedTurn, itemId: entry.id, offset });
+      const value = await rpc({ type: 'detail', turnId: selectedTurn, itemId: entry.id, offset, ...(offset > 0 && snapshotId ? { snapshotId } : {}) });
       if (!alive(version) || !body.isConnected) return;
       body.replaceChildren(); appendFormatted(body, string(value.text));
       const pager = document.createElement('div'); pager.className = 'conversation-detail-pager';
       const position = document.createElement('small'); position.textContent = `${offset}–${value.nextOffset ?? value.totalBytes} / ${value.totalBytes} ${t('바이트', 'bytes')}`; pager.append(position);
       if (offset > 0) { const first = document.createElement('button'); first.type = 'button'; first.className = 'quiet-button'; bindText(first, '처음부터', 'From start'); first.onclick = () => void loadDetail(entry, body, control, 0); pager.append(first); }
-      if (typeof value.nextOffset === 'number') { control.disabled = false; bindText(control, '다음 내용', 'Next part'); control.onclick = () => void loadDetail(entry, body, control, value.nextOffset); }
+      if (typeof value.nextOffset === 'number') { control.disabled = false; bindText(control, '다음 내용', 'Next part'); control.onclick = () => void loadDetail(entry, body, control, value.nextOffset, string(value.snapshotId)); }
       else { control.disabled = false; bindText(control, '처음부터 보기', 'Read from start'); control.onclick = () => void loadDetail(entry, body, control, 0); }
       body.append(pager);
     } catch (error) { if (alive(version)) { failure(error); control.disabled = false; } }

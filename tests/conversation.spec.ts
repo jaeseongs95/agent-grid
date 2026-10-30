@@ -7,7 +7,7 @@ async function conversation(page: Page) {
     const { createConversation } = await import('/src/conversation.ts');
     const host = document.createElement('section'); host.id = 'conversation-fixture';
     host.style.cssText = 'position:fixed;inset:20px;z-index:9999;background:#141820;'; document.body.append(host);
-    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined };
+    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0 };
     state.conversation = createConversation({
       sessionId: 'conversation-owned', generation: 7, host,
       ownerChanged: (owned: boolean) => fixture.owners.push(owned),
@@ -34,7 +34,12 @@ async function conversation(page: Page) {
         if (request.type === 'send') { if (fixture.rejectSend) throw Error('응답 시간 초과'); return { turn: { id: 'sent-turn', status: 'inProgress' } }; }
         if (request.type === 'interrupt') { fixture.queue.push({ seq: fixture.nextSeq++, method: 'turn/completed', params: { turn: { id: request.turnId, status: 'interrupted' } } }); return {}; }
         if (request.type === 'respond') { fixture.pending = fixture.pending.map((entry: any) => entry.requestId === request.requestId ? { ...entry, responded: true } : entry); return {}; }
-        if (request.type === 'detail') return { text: request.offset ? '마지막 원문' : '첫 원문', nextOffset: request.offset ? null : 16, totalBytes: 30 };
+        if (request.type === 'detail') {
+          if (!request.offset) fixture.detailReads++;
+          const snapshotId = `detail-snapshot-${fixture.detailReads}`;
+          if (request.offset && request.snapshotId !== snapshotId) throw Error('같은 원문 스냅샷 식별자가 필요합니다');
+          return { text: request.offset ? '마지막 원문' : '첫 원문', nextOffset: request.offset ? null : 16, totalBytes: 30, snapshotId };
+        }
         throw Error(`지원하지 않는 요청 ${request.type}`);
       },
     });
@@ -142,6 +147,15 @@ test('큰 항목은 상세 구간으로 끝까지 접근하고 dispose 후 조�
   await expect(view(page).locator('[data-item-id="large-item"]')).toContainText('첫 원문');
   await view(page).getByRole('button', { name: '다음 내용' }).click();
   await expect(view(page).locator('[data-item-id="large-item"]')).toContainText('마지막 원문');
+  await view(page).getByRole('button', { name: '처음부터 보기', exact: true }).click();
+  await expect(view(page).locator('[data-item-id="large-item"]')).toContainText('첫 원문');
+  const detailRequests = await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'detail').map((value: any) => value.args.request));
+  expect(detailRequests).toEqual([
+    { type: 'detail', turnId: 'recent-turn', itemId: 'large-item', offset: 0 },
+    { type: 'detail', turnId: 'recent-turn', itemId: 'large-item', offset: 16, snapshotId: 'detail-snapshot-1' },
+    { type: 'detail', turnId: 'recent-turn', itemId: 'large-item', offset: 0 },
+  ]);
+  expect(await page.evaluate(() => (window as any).conversationFixture.detailReads)).toBe(2);
   await page.evaluate(async () => { await (window as any).conversation.dispose(); });
   const calls = await page.evaluate(() => (window as any).conversationFixture.calls.length);
   await page.waitForTimeout(900);

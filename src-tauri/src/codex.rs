@@ -417,7 +417,7 @@ pub(crate) fn prepare_with_cancellation(exe: &OsString, cwd: &Path, thread_id: O
         on_event(CodexEvent::Status(status(&existing["thread"]["status"])));
     }
     // Fresh TUI owns thread/start; an empty pre-created thread may not have a resumable rollout.
-    // The observer uses only read RPCs and never claims the TUI's writer/approval ownership.
+    // The observer subscribes to the existing thread; it never sends input or approval responses.
     session.socket = Some(rpc.ws.get_ref().try_clone().map_err(|e| e.to_string())?);
     let stopped = session.stopped.clone();
     let selected = thread_id.map(str::to_owned);
@@ -464,7 +464,7 @@ fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd:
                     Err(_) => {
                         failures += 1;
                         publish_status(&mut last_state, "unknown".into(), on_event);
-                        // Only bounded read-only retries; never resume/start from the observer.
+                        // Only bounded state-read retries; never repeat the initial subscription.
                         if failures >= 3 { break; }
                     }
                 }
