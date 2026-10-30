@@ -308,3 +308,137 @@ test('같은 이벤트에서 창을 닫으면 대기 중 등록 요청을 보내
   await expect(page.locator('#cron-dialog')).not.toBeVisible();
   expect(await mutations(page)).toEqual([]);
 });
+
+
+test('동일 예약 조회는 행 자식 변경 없이 같은 버튼 초점과 스크롤을 보존한다', async ({ page }) => {
+  await fixture(page, { jobs: 100 });
+  await page.evaluate(() => {
+    const state = window as any;
+    state.cronDom = { rows: Array.from(document.querySelectorAll('.cron-job')), records: 0 };
+    state.cronDom.observer = new MutationObserver(records => { state.cronDom.records += records.filter(record => record.type === 'childList').length; });
+    state.cronDom.observer.observe(document.querySelector('#cron-dialog')!, { childList: true, subtree: true });
+    (document.querySelector('.cron-job[data-job-id="20"] button') as HTMLButtonElement).focus();
+    const dialog = document.querySelector('#cron-dialog')!;
+    dialog.scrollTop = 120;
+    state.cronDom.scroll = dialog.scrollTop;
+  });
+  await page.clock.fastForward(5001);
+  await expect.poll(() => page.evaluate(() => (window as any).cronFixture.calls.length)).toBe(2);
+  await expect(page.locator('#cron-dialog')).toHaveAttribute('aria-busy', 'false');
+  expect(await page.evaluate(() => {
+    const state = window as any;
+    return {
+      records: state.cronDom.records,
+      sameRows: Array.from(document.querySelectorAll('.cron-job')).every((row, index) => row === state.cronDom.rows[index]),
+      sameFocus: document.activeElement === state.cronDom.rows[19].querySelector('button'),
+      sameScroll: document.querySelector('#cron-dialog')!.scrollTop === state.cronDom.scroll,
+    };
+  })).toEqual({ records: 0, sameRows: true, sameFocus: true, sameScroll: true });
+  expect(await mutations(page)).toEqual([]);
+});
+
+test('바뀐 예약 행만 교체하고 삭제·추가·재정렬에서는 나머지 행을 재사용한다', async ({ page }) => {
+  await fixture(page, { jobs: 3 });
+  await page.evaluate(() => {
+    const state = window as any;
+    state.cronRows = Array.from(document.querySelectorAll('.cron-job'));
+    state.cronFixture.snapshot.jobs[1].promptPreview = '두 번째 작업 수정';
+  });
+  await refresh(page);
+  expect(await page.evaluate(() => {
+    const state = window as any;
+    const rows = Array.from(document.querySelectorAll('.cron-job'));
+    return rows.map((row, index) => row === state.cronRows[index]);
+  })).toEqual([true, false, true]);
+  await expect(page.locator('.cron-job[data-job-id="2"] .cron-preview')).toHaveText('두 번째 작업 수정');
+  await page.evaluate(() => {
+    const state = window as any;
+    state.cronRemoved = new WeakRef(document.querySelector('.cron-job[data-job-id="2"]')!);
+    const [one, , three] = state.cronFixture.snapshot.jobs;
+    state.cronFixture.snapshot.jobs = [three, one, { ...one, id: '4', promptPreview: '새 예약' }];
+  });
+  await refresh(page);
+  expect(await page.locator('.cron-job').evaluateAll(rows => rows.map(row => (row as HTMLElement).dataset.jobId))).toEqual(['3', '1', '4']);
+  expect(await page.evaluate(() => {
+    const state = window as any;
+    return {
+      sameOne: document.querySelector('.cron-job[data-job-id="1"]') === state.cronRows[0],
+      sameThree: document.querySelector('.cron-job[data-job-id="3"]') === state.cronRows[2],
+      removed: state.cronRemoved.deref()?.isConnected === false,
+    };
+  })).toEqual({ sameOne: true, sameThree: true, removed: true });
+  await expect(page.locator('.cron-job')).toHaveCount(3);
+});
+
+test('언어 변경은 예약 행 라벨을 갱신하고 같은 언어의 다음 조회는 재생성하지 않는다', async ({ page }) => {
+  await fixture(page, { jobs: 1 });
+  await page.evaluate(async () => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage('en'); });
+  await expect(page.locator('.cron-job strong')).toContainText('Running');
+  await expect(page.locator('.cron-job small')).toContainText('Every 120 seconds');
+  await expect(page.locator('.cron-job button').first()).toHaveText('Pause');
+  await page.evaluate(() => { (window as any).cronEnglishRow = document.querySelector('.cron-job'); });
+  await page.locator('.cron-refresh').click();
+  await expect(page.locator('#cron-dialog')).toHaveAttribute('aria-busy', 'false');
+  expect(await page.evaluate(() => document.querySelector('.cron-job') === (window as any).cronEnglishRow)).toBe(true);
+  await page.evaluate(async () => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage('ko'); });
+  await expect(page.locator('.cron-job strong')).toContainText('실행 중');
+  await expect(page.locator('.cron-job button').first()).toHaveText('일시정지');
+});
+
+test('조회 중 포인터·키보드 조작이 있으면 이전 예약 버튼으로 초점을 되돌리지 않는다', async ({ page }) => {
+  for (const interaction of ['pointer', 'keyboard']) {
+    await fixture(page, { jobs: 1 });
+    await page.evaluate(() => {
+      const state = window as any;
+      state.cronFixture.holdRead = true;
+      state.cronFocused = document.querySelector('.cron-job button');
+      state.cronFocused.focus();
+    });
+    await page.clock.fastForward(5001);
+    await expect.poll(() => page.evaluate(() => (window as any).cronFixture.calls.length)).toBe(2);
+    if (interaction === 'pointer') await page.locator('#cron-title').click();
+    else await page.keyboard.press('Tab');
+    await page.evaluate(() => (window as any).cronFixture.releaseRead());
+    await expect(page.locator('#cron-dialog')).toHaveAttribute('aria-busy', 'false');
+    expect(await page.evaluate(() => document.activeElement === (window as any).cronFocused)).toBe(false);
+  }
+});
+
+test('닫힌 팝업은 예약 행 DOM과 캐시 참조를 해제해 행이 수집될 수 있다', async ({ page }) => {
+  await fixture(page, { jobs: 100 });
+  await page.evaluate(() => { (window as any).cronClosedRow = new WeakRef(document.querySelector('.cron-job[data-job-id="50"]')!); });
+  await page.locator('.cron-close').click();
+  await expect(page.locator('.cron-job')).toHaveCount(0);
+  const gc = await page.context().newCDPSession(page);
+  try {
+    await expect.poll(async () => {
+      await gc.send('HeapProfiler.collectGarbage');
+      return page.evaluate(() => (window as any).cronClosedRow.deref() === undefined);
+    }).toBe(true);
+  } finally { await gc.detach(); }
+  await page.evaluate(async () => { const state = window as any; await state.cronManager.open(state.cronFixture.session); });
+  await expect(page.locator('.cron-job')).toHaveCount(100);
+});
+
+
+test('자동 목록 조회 중에도 예약 초안의 한글 입력과 초점을 유지한다', async ({ page }) => {
+  await fixture(page);
+  const prompt = page.locator('.cron-prompt');
+  await prompt.fill('입력 중인 예약 초안');
+  await prompt.focus();
+  await page.evaluate(() => { (window as any).cronFixture.holdRead = true; });
+  await page.clock.fastForward(5001);
+  await expect.poll(() => page.evaluate(() => (window as any).cronFixture.calls.length)).toBe(2);
+  await expect(prompt).toBeEnabled();
+  await expect(prompt).toBeFocused();
+  await prompt.press('End');
+  await prompt.pressSequentially(' 계속 작성');
+  await expect(prompt).toHaveValue('입력 중인 예약 초안 계속 작성');
+  await expect(page.locator('.cron-add')).toBeDisabled();
+  await page.evaluate(() => (window as any).cronFixture.releaseRead());
+  await expect(page.locator('#cron-dialog')).toHaveAttribute('aria-busy', 'false');
+  await expect(prompt).toBeFocused();
+  await expect(prompt).toHaveValue('입력 중인 예약 초안 계속 작성');
+  await expect(page.locator('.cron-add')).toBeEnabled();
+  expect(await mutations(page)).toEqual([]);
+});

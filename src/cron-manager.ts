@@ -1,4 +1,4 @@
-import { bindAttribute, bindText, onLanguageChange, t } from './i18n';
+import { bindAttribute, bindText, getLanguage, onLanguageChange, t } from './i18n';
 import './cron-manager.css';
 import { MAX_WORKSPACE_SESSIONS } from './model';
 
@@ -34,42 +34,66 @@ export function createCronManager(host: Host) {
   let selected: Session | undefined; let available = false; let visible = true; let exiting = false;
   let epoch = 0; let request: Promise<void> | undefined; let timer: ReturnType<typeof setTimeout> | undefined;
   let jobs: Job[] = []; let supported = false; let connected = false; let fresh = false; let hasMore = false;
-  let knownList = false;
+  let knownList = false; let readingRequest = false;
+  const rows = new Map<string, { signature: string; row: HTMLElement }>();
+  const empty = document.createElement('p');
   const unresolved = new Map<string, string>();
   const key = (session: Session) => `${session.id}:${session.generation}:${session.threadId ?? ''}`;
   const uncertain = () => !!selected && unresolved.has(key(selected));
   const live = (version: number) => dialog.open && selected && version === epoch && available && !exiting && visible && !document.hidden;
   const rpc = <T>(session: Session, value: Record<string, unknown>) => host.call<T>('cron_request', { id: session.id, generation: session.generation, request: value });
   function error(ko: string, en: string) { bindText($('.cron-error'), ko, en); $('.cron-error').hidden = false; }
-  function status(ko: string, en: string) { bindText($('.cron-status'), ko, en); }
+  function status(ko: string, en: string) { if ($('.cron-status').textContent !== t(ko, en)) bindText($('.cron-status'), ko, en); }
   function controls() {
-    const ready = !!selected && available && supported && connected && fresh && !request && !exiting && !uncertain() && unresolved.size < MAX_WORKSPACE_SESSIONS;
-    for (const element of form.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('button,input,select,textarea')) element.disabled = !ready;
+    const eligible = !!selected && available && supported && connected && fresh && !exiting && !uncertain() && unresolved.size < MAX_WORKSPACE_SESSIONS;
+    const ready = eligible && !request;
+    // 목록 읽기는 초안 편집을 중단하지 않는다. 실제 변경 전송만 단일 요청으로 제한한다.
+    for (const element of form.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('input,select,textarea')) element.disabled = !eligible || (!!request && !readingRequest);
+    $<HTMLButtonElement>('.cron-add').disabled = !ready;
     $<HTMLButtonElement>('.cron-refresh').disabled = !selected || !available || !!request || exiting;
     for (const button of dialog.querySelectorAll<HTMLButtonElement>('.cron-job button')) button.disabled = !ready || button.dataset.allowed !== 'true';
     $('.cron-unknown').hidden = !uncertain();
     dialog.setAttribute('aria-busy', String(!!request));
   }
   function formatTime(value: number | null | undefined) { return typeof value === 'number' && Number.isSafeInteger(value) && Number.isFinite(new Date(value).getTime()) ? new Date(value).toLocaleString(document.documentElement.lang === 'en' ? 'en-US' : 'ko-KR') : t('미확인', 'Unknown'); }
+  function createRow(job: Job) {
+    const row = document.createElement('article'); row.className = 'cron-job'; row.dataset.jobId = job.id;
+    const title = document.createElement('strong'); title.textContent = `#${job.id} · ${job.paused ? t('일시정지 · ', 'Paused · ') : ''}${t(...states[job.state])}${job.removed ? t(' · 삭제됨, 실행 종료 확인 중', ' · Removed, waiting for execution to end') : ''}`;
+    const text = document.createElement('p'); text.className = 'cron-preview'; text.textContent = job.promptPreview.slice(0, 512);
+    const detail = document.createElement('small');
+    const schedule = job.schedule.type === 'every' ? t(`${job.schedule.seconds}초 간격`, `Every ${job.schedule.seconds} seconds`) : formatTime(job.schedule.atUnixMs);
+    detail.textContent = `${schedule} · ${t('다음 실행', 'Next run')}: ${formatTime(job.nextRunAt)}${Number.isSafeInteger(job.skipped) && job.skipped! >= 0 ? ` · ${t('건너뜀', 'Skipped')}: ${job.skipped}` : ''}`;
+    const actions = document.createElement('div'); actions.className = 'cron-job-actions';
+    function action(type: string, ko: string, en: string, allowed: boolean) { const button = document.createElement('button'); button.type = 'button'; button.className = 'quiet-button'; bindText(button, ko, en); button.dataset.allowed = String(allowed); button.onclick = () => void mutate({ type, jobId: job.id }); actions.append(button); }
+    const settled = !['unknown', 'blockedUnsupported', 'blockedConnection', 'pending'].includes(job.state);
+    action(job.paused ? 'resume' : 'pause', job.paused ? '재개' : '일시정지', job.paused ? 'Resume' : 'Pause', !job.removed && settled && (job.paused ? job.state !== 'finished' || job.schedule.type === 'every' : job.state !== 'finished'));
+    action('remove', '예약 삭제', 'Remove schedule', !job.removed);
+    action('cancel', '현재 회차 중단', 'Cancel current run', job.state === 'running');
+    row.append(title, text, detail, actions); return row;
+  }
   function render() {
-    bindText($('.cron-session'), selected ? `세션: ${selected.title}` : '', selected ? `Session: ${selected.title}` : '');
-    const list = $('.cron-jobs'); list.replaceChildren();
-    if (!jobs.length) { const empty = document.createElement('p'); bindText(empty, knownList && fresh ? '이 세션에 등록된 예약이 없습니다.' : '예약 목록을 아직 확인하지 못했습니다.', knownList && fresh ? 'This session has no scheduled jobs.' : 'The job list has not been confirmed.'); list.append(empty); }
-    for (const job of jobs) {
-      const row = document.createElement('article'); row.className = 'cron-job'; row.dataset.jobId = job.id;
-      const title = document.createElement('strong'); title.textContent = `#${job.id} · ${job.paused ? t('일시정지 · ', 'Paused · ') : ''}${t(...states[job.state])}${job.removed ? t(' · 삭제됨, 실행 종료 확인 중', ' · Removed, waiting for execution to end') : ''}`;
-      const text = document.createElement('p'); text.className = 'cron-preview'; text.textContent = job.promptPreview.slice(0, 512);
-      const detail = document.createElement('small');
-      const schedule = job.schedule.type === 'every' ? t(`${job.schedule.seconds}초 간격`, `Every ${job.schedule.seconds} seconds`) : formatTime(job.schedule.atUnixMs);
-      detail.textContent = `${schedule} · ${t('다음 실행', 'Next run')}: ${formatTime(job.nextRunAt)}${Number.isSafeInteger(job.skipped) && job.skipped! >= 0 ? ` · ${t('건너뜀', 'Skipped')}: ${job.skipped}` : ''}`;
-      const actions = document.createElement('div'); actions.className = 'cron-job-actions';
-      function action(type: string, ko: string, en: string, allowed: boolean) { const button = document.createElement('button'); button.type = 'button'; button.className = 'quiet-button'; bindText(button, ko, en); button.dataset.allowed = String(allowed); button.onclick = () => void mutate({ type, jobId: job.id }); actions.append(button); }
-      const settled = !['unknown', 'blockedUnsupported', 'blockedConnection', 'pending'].includes(job.state);
-      action(job.paused ? 'resume' : 'pause', job.paused ? '재개' : '일시정지', job.paused ? 'Resume' : 'Pause', !job.removed && settled && (job.paused ? job.state !== 'finished' || job.schedule.type === 'every' : job.state !== 'finished'));
-      action('remove', '예약 삭제', 'Remove schedule', !job.removed);
-      action('cancel', '현재 회차 중단', 'Cancel current run', job.state === 'running');
-      row.append(title, text, detail, actions); list.append(row);
+    const ko = selected ? `세션: ${selected.title}` : ''; const en = selected ? `Session: ${selected.title}` : '';
+    if ($('.cron-session').textContent !== t(ko, en)) bindText($('.cron-session'), ko, en);
+    const list = $('.cron-jobs');
+    const ids = new Set(jobs.map(job => job.id));
+    for (const id of rows.keys()) if (!ids.has(id)) rows.delete(id);
+    const desired = jobs.map(job => {
+      const signature = JSON.stringify([getLanguage(), job]);
+      let entry = rows.get(job.id);
+      if (!entry || entry.signature !== signature) { entry = { signature, row: createRow(job) }; rows.set(job.id, entry); }
+      return entry.row;
+    });
+    if (!desired.length) {
+      const ko = knownList && fresh ? '이 세션에 등록된 예약이 없습니다.' : '예약 목록을 아직 확인하지 못했습니다.';
+      const en = knownList && fresh ? 'This session has no scheduled jobs.' : 'The job list has not been confirmed.';
+      if (empty.textContent !== t(ko, en)) bindText(empty, ko, en);
+      desired.push(empty);
     }
+    const retained = new Set<Node>(desired);
+    for (const child of Array.from(list.childNodes)) if (!retained.has(child)) child.remove();
+    let position = list.firstChild;
+    for (const row of desired) { if (row !== position) list.insertBefore(row, position); position = row.nextSibling; }
+    if (!available) rows.clear();
     $('.cron-limit').hidden = !hasMore;
     controls();
   }
@@ -80,10 +104,21 @@ export function createCronManager(host: Host) {
     if (value.jobs.slice(0, LIMIT).some(job => !job || typeof job.id !== 'string' || !/^[1-9][0-9]{0,19}$/.test(job.id) || BigInt(job.id) > 18446744073709551615n || typeof job.promptPreview !== 'string' || typeof job.state !== 'string' || !Object.hasOwn(states, job.state) || typeof job.paused !== 'boolean' || typeof job.removed !== 'boolean' || (job.nextRunAt != null && (!Number.isSafeInteger(job.nextRunAt) || job.nextRunAt <= 0)) || (job.skipped != null && (!Number.isSafeInteger(job.skipped) || job.skipped < 0)) || !job.schedule || (job.schedule.type === 'every' ? !Number.isSafeInteger(job.schedule.seconds) || job.schedule.seconds <= 0 : job.schedule.type !== 'at' || !Number.isSafeInteger(job.schedule.atUnixMs) || job.schedule.atUnixMs <= 0))) throw Error('예약 목록 형식 불일치');
   }
   function scheduleRefresh() { clearTimeout(timer); if (dialog.open && visible && !document.hidden && !exiting && available) timer = setTimeout(() => void refresh(), 5000); }
-  function track(work: () => Promise<void>) {
+  function track(work: () => Promise<void>, preserveRowFocus = false) {
     if (request || exiting) return Promise.resolve();
     clearTimeout(timer);
-    request = Promise.resolve().then(work).finally(() => { request = undefined; controls(); scheduleRefresh(); }); controls(); return request;
+    const focused = preserveRowFocus && document.activeElement instanceof HTMLButtonElement && dialog.contains(document.activeElement) && document.activeElement.closest('.cron-job') ? new WeakRef(document.activeElement as HTMLButtonElement) : undefined;
+    let interacted = false;
+    const interaction = () => { interacted = true; };
+    if (focused) { document.addEventListener('pointerdown', interaction, true); document.addEventListener('keydown', interaction, true); }
+    readingRequest = preserveRowFocus;
+    request = Promise.resolve().then(work).finally(() => {
+      if (focused) { document.removeEventListener('pointerdown', interaction, true); document.removeEventListener('keydown', interaction, true); }
+      request = undefined; readingRequest = false; controls();
+      const button = focused?.deref();
+      if (button && !interacted && button.isConnected && !button.disabled && dialog.open && visible && !document.hidden && !exiting && (document.activeElement === document.body || document.activeElement === dialog)) button.focus({ preventScroll: true });
+      scheduleRefresh();
+    }); controls(); return request;
   }
   function refresh() {
     const session = selected; const version = epoch; if (!session || !available || !dialog.open || !visible || document.hidden) return Promise.resolve();
@@ -103,7 +138,7 @@ export function createCronManager(host: Host) {
       } catch {
         if (live(version)) { fresh = false; error('예약 목록을 불러오지 못했습니다. 연결을 확인하고 새로고침하세요. 마지막 목록은 보존합니다.', 'Could not load scheduled jobs. Check the connection and refresh. The last list is preserved.'); controls(); }
       }
-    });
+    }, true);
   }
   function mutate(value: Record<string, unknown>) {
     const session = selected; const version = epoch;
@@ -144,7 +179,7 @@ export function createCronManager(host: Host) {
     else return;
     void mutate({ type: 'add', schedule, prompt: prompt.value });
   });
-  function clear() { epoch++; selected = undefined; available = false; jobs = []; supported = false; connected = false; fresh = false; hasMore = false; knownList = false; clearTimeout(timer); prompt.value = ''; time.value = ''; $('.cron-error').textContent = ''; $('.cron-error').hidden = true; status('', ''); render(); }
+  function clear() { epoch++; selected = undefined; available = false; jobs = []; rows.clear(); supported = false; connected = false; fresh = false; hasMore = false; knownList = false; clearTimeout(timer); prompt.value = ''; time.value = ''; $('.cron-error').textContent = ''; $('.cron-error').hidden = true; status('', ''); render(); }
   $('.cron-close').onclick = () => dialog.close(); dialog.addEventListener('close', clear);
   $('.cron-refresh').onclick = () => void refresh(); kind.onchange = mode;
   document.addEventListener('visibilitychange', () => { clearTimeout(timer); if (!document.hidden && dialog.open && visible) void refresh(); });
@@ -159,7 +194,7 @@ export function createCronManager(host: Host) {
   onLanguageChange(render); mode(); controls();
   return {
     async open(session: Session) { if (request || exiting) return; if (dialog.open) dialog.close(); clear(); selected = { ...session }; available = session.active; render(); dialog.showModal(); if (available) await refresh(); else status('실행 중인 세션에서 예약을 관리할 수 있습니다.', 'Start the session to manage its schedules.'); },
-    updateSessions(sessions: Session[]) { const keys = new Set(sessions.filter(s => s.active).map(key)); for (const item of unresolved.keys()) if (!keys.has(item)) unresolved.delete(item); if (selected && !keys.has(key(selected))) { available = false; fresh = false; clearTimeout(timer); status('원래 세션이 종료되거나 바뀌었습니다. 예약 상태는 미확인입니다.', 'The original session ended or changed. Schedule state is unknown.'); controls(); } },
+    updateSessions(sessions: Session[]) { const keys = new Set(sessions.filter(s => s.active).map(key)); for (const item of unresolved.keys()) if (!keys.has(item)) unresolved.delete(item); if (selected && !keys.has(key(selected))) { available = false; fresh = false; rows.clear(); clearTimeout(timer); status('원래 세션이 종료되거나 바뀌었습니다. 예약 상태는 미확인입니다.', 'The original session ended or changed. Schedule state is unknown.'); controls(); } },
     setVisible(value: boolean) { visible = value; clearTimeout(timer); if (visible && dialog.open && !document.hidden) void refresh(); },
     async beginExit() { exiting = true; if (dialog.open) dialog.close(); clearTimeout(timer); await request; controls(); },
     cancelExit() { exiting = false; controls(); },
