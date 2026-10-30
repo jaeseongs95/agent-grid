@@ -149,7 +149,7 @@ export function createConversation(options: ConversationOptions) {
     for (const [id, rendered] of renderedItems) if (!keep.has(id)) { rendered.row.remove(); renderedItems.delete(id); }
     for (const entry of items) {
       const signature = JSON.stringify(entry); const previous = renderedItems.get(entry.id);
-      if (previous?.signature === signature) { messages.append(previous.row); continue; }
+      if (previous?.signature === signature) continue;
       const row = document.createElement('article'); row.className = `conversation-message conversation-${entry.role}`; row.dataset.itemId = entry.id;
       const title = document.createElement('strong');
       const labels: Record<string, [string, string]> = { user: ['나', 'You'], assistant: ['도우미', 'Assistant'], tool: ['도구 실행', 'Tool execution'], error: ['오류', 'Error'], system: ['상태', 'Status'] };
@@ -162,7 +162,15 @@ export function createConversation(options: ConversationOptions) {
       } else row.append(body);
       appendFormatted(body, entry.text);
       if (entry.detail) { const detail = document.createElement('button'); detail.type = 'button'; detail.className = 'quiet-button'; bindText(detail, '전체 내용 보기', 'Read full content'); detail.onclick = () => void loadDetail(entry, body, detail, 0); row.append(detail); }
-      previous?.row.remove(); renderedItems.set(entry.id, { signature, row }); messages.append(row);
+      if (previous) previous.row.replaceWith(row); else messages.append(row);
+      renderedItems.set(entry.id, { signature, row });
+    }
+    // 현재 순서와 다를 때만 이동해 변하지 않은 행의 초점과 읽는 위치를 보존한다.
+    let position = messages.firstElementChild;
+    for (const entry of items) {
+      const row = renderedItems.get(entry.id)!.row;
+      if (row !== position) messages.insertBefore(row, position);
+      position = row.nextElementSibling;
     }
     if (!items.length) {
       const empty = document.createElement('p'); empty.className = 'conversation-placeholder';

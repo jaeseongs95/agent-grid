@@ -654,3 +654,65 @@ for (const operation of ['send', 'compact'] as const) for (const replacement of 
     }
   });
 }
+
+
+test('화면 갱신은 변하지 않은 메시지를 이동하지 않고 중간 행의 순서와 초점을 보존한다', async ({ page }) => {
+  await conversation(page);
+  const tool = view(page).locator('[data-item-id="tool-a"]');
+  await tool.locator('summary').click();
+  await tool.locator('summary').focus();
+  await page.evaluate(() => {
+    const state = window as any; const host = document.querySelector('#conversation-fixture .conversation-messages')!;
+    state.stableRowMutations = []; state.originalTool = host.querySelector('[data-item-id="tool-a"]');
+    state.messageObserver = new MutationObserver(records => {
+      for (const record of records) for (const node of [...record.addedNodes, ...record.removedNodes]) {
+        if (node instanceof HTMLElement && ['user-a', 'tool-a'].includes(node.dataset.itemId ?? '')) state.stableRowMutations.push(node.dataset.itemId);
+      }
+    });
+    state.messageObserver.observe(host, { childList: true });
+  });
+  for (let index = 1; index <= 4; index++) {
+    await page.evaluate(index => { const f = (window as any).conversationFixture; f.queue.push({ seq: f.nextSeq++, method: 'item/agentMessage/delta', params: { turnId: 'recent-turn', itemId: 'assistant-a', delta: ' 변화-' + index } }); }, index);
+    await expect(view(page).locator('[data-item-id="assistant-a"]')).toContainText('변화-' + index);
+    expect(await view(page).locator('.conversation-message').evaluateAll(nodes => nodes.map(node => (node as HTMLElement).dataset.itemId))).toEqual(['user-a', 'assistant-a', 'tool-a']);
+    await expect(tool.locator('details')).toHaveAttribute('open', '');
+    await expect(tool.locator('summary')).toBeFocused();
+  }
+  expect(await page.evaluate(() => (window as any).stableRowMutations)).toEqual([]);
+  expect(await tool.evaluate(node => node === (window as any).originalTool)).toBe(true);
+  await page.evaluate(() => (window as any).messageObserver.disconnect());
+});
+
+test('이력 재조회는 내용이 같을 때 메시지 DOM을 변경하지 않고 확장한 원문을 보존한다', async ({ page }) => {
+  await conversation(page);
+  await page.evaluate(() => { (window as any).conversationFixture.largeHistory = true; });
+  await view(page).locator('.conversation-refresh').click();
+  const detail = view(page).locator('[data-item-id="large-item"]');
+  await detail.getByRole('button', { name: '전체 내용 보기', exact: true }).click();
+  await expect(detail).toContainText('첫 원문');
+  await page.evaluate(() => {
+    const state = window as any; state.historyDomChanges = 0;
+    state.historyObserver = new MutationObserver(records => { state.historyDomChanges += records.length; });
+    state.historyObserver.observe(document.querySelector('#conversation-fixture .conversation-messages')!, { childList: true });
+  });
+  await view(page).locator('.conversation-refresh').click();
+  await expect(view(page).locator('.conversation-refresh')).toBeEnabled();
+  await expect(detail).toContainText('첫 원문');
+  expect(await page.evaluate(() => (window as any).historyDomChanges)).toBe(0);
+  await page.evaluate(() => (window as any).historyObserver.disconnect());
+});
+
+test('스트리밍 동안 위로 읽는 위치를 유지하고 하단에 있으면 최신 출력을 따라간다', async ({ page }) => {
+  await conversation(page);
+  const messages = view(page).locator('.conversation-messages');
+  await page.evaluate(() => { const f = (window as any).conversationFixture; f.queue.push({ seq: f.nextSeq++, method: 'item/agentMessage/delta', params: { turnId: 'recent-turn', itemId: 'assistant-a', delta: '\n' + '기존 대화 내용\n'.repeat(160) } }); });
+  await expect(view(page).locator('[data-item-id="assistant-a"]')).toContainText('기존 대화 내용');
+  await messages.evaluate(node => { node.scrollTop = 0; });
+  await page.evaluate(() => { const f = (window as any).conversationFixture; f.queue.push({ seq: f.nextSeq++, method: 'item/completed', params: { turnId: 'recent-turn', item: { id: 'tail-item', type: 'agentMessage', text: '화면 아래에 추가된 최근 내용' } } }); });
+  await expect(view(page).locator('[data-item-id="tail-item"]')).toContainText('화면 아래에 추가된 최근 내용');
+  expect(await messages.evaluate(node => node.scrollTop)).toBeLessThanOrEqual(1);
+  await messages.evaluate(node => { node.scrollTop = node.scrollHeight; });
+  await page.evaluate(() => { const f = (window as any).conversationFixture; f.queue.push({ seq: f.nextSeq++, method: 'item/agentMessage/delta', params: { turnId: 'recent-turn', itemId: 'tail-item', delta: '\n' + '추가 출력\n'.repeat(30) } }); });
+  await expect(view(page).locator('[data-item-id="tail-item"]')).toContainText('추가 출력');
+  await expect.poll(() => messages.evaluate(node => node.scrollHeight - node.scrollTop - node.clientHeight)).toBeLessThanOrEqual(1);
+});
