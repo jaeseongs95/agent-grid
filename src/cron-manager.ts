@@ -168,7 +168,10 @@ export function createCronManager(host: Host) {
         if (result.status === 'applied') {
           if (value.type === 'add') prompt.value = '';
           status(value.type === 'remove' ? '예약을 삭제했습니다. 이미 실행 중인 회차는 계속됩니다.' : value.type === 'cancel' ? '현재 회차 중단을 요청했습니다. 종료 확인을 기다립니다. 반복 예약은 유지됩니다.' : '예약 요청이 처리되었습니다. 새로고침하여 상태를 확인하세요.', value.type === 'remove' ? 'Schedule removed. An accepted run continues.' : value.type === 'cancel' ? 'Cancellation requested. Waiting for the current run to end. Recurring schedules are preserved.' : 'The schedule request was applied. Refresh to confirm its state.');
-        } else if (result.status === 'unsupported') { supported = false; status('이 실행 환경은 예약 관리를 지원하지 않습니다.', 'This runtime does not support job management.'); }
+        } else if (result.status === 'unsupported') {
+          if (value.type === 'cancel') { canCancel = false; status('현재 연결에서 안전한 작업 중단을 지원하는지 확인되지 않아 요청을 보내지 않았습니다.', 'Safe cancellation is not confirmed for this connection. No request was sent.'); }
+          else { supported = false; status('이 실행 환경은 예약 관리를 지원하지 않습니다.', 'This runtime does not support job management.'); }
+        }
         else error('예약을 변경하지 못했습니다. 새로고침하여 상태를 확인하세요. 작성 중인 내용은 보존합니다.', 'The schedule was not changed. Refresh to check its state. Your draft is preserved.');
       } catch {
         const ko = '예약 요청 결과를 확인하지 못했습니다. 다시 등록하지 말고 목록을 새로고침하여 확인하세요. 자동으로 재전송하지 않습니다.';

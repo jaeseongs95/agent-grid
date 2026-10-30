@@ -49,6 +49,13 @@ pub use conversation::{ConversationConnection, ConversationRequest};
 mod cron;
 pub use cron::CronRequest;
 
+#[cfg(windows)]
+#[path = "codex_cron_wire.rs"]
+pub(crate) mod cron_wire;
+#[cfg(windows)]
+#[path = "codex_cron_control.rs"]
+pub(crate) mod cron_control;
+
 #[path = "codex_usage.rs"]
 mod usage;
 pub use usage::{weekly_usage_with_executable, WeeklyUsageSnapshot};

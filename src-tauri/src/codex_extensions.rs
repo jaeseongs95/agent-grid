@@ -125,6 +125,8 @@ pub(super) fn command_stdout_until(exe: &OsString, cwd: &Path, args: &[String], 
     check_cancelled(cancelled)?;
     if Instant::now() >= deadline { return Err("Codex command timed out; its result is unknown. Refresh before retrying".into()); }
     let (mut command, gate) = LaunchGate::wrap_std(exe.as_os_str())?;
+    // 조회용 CLI에는 TUI의 일회 제어 자격을 상속하지 않는다.
+    command.env_remove("CODEX_DESKTOP_CRON_BOOTSTRAP").env_remove("CODEX_DESKTOP_CRON_TOKEN");
     command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     hidden(&mut command);
     let child = command.spawn().map_err(|e| format!("Start Codex command: {e}"))?;

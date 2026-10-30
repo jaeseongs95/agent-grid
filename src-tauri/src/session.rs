@@ -58,6 +58,8 @@ struct ProcessControl {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     job: Mutex<Option<ProcessJob>>,
     adapter: Mutex<Option<CodexSession>>,
+    #[cfg(windows)]
+    cron: Mutex<Option<codex::cron_control::CronConnection>>,
     termination: Mutex<()>,
     shared_cleanup_failed: AtomicBool,
     shared_stop_attempted: AtomicBool,
@@ -100,6 +102,18 @@ impl Drop for LaunchGuard {
     }
 }
 impl ProcessControl {
+    #[cfg(windows)]
+    fn cancel_cron(&self) {
+        if let Some(connection) = self.cron.lock().unwrap_or_else(|e|e.into_inner()).as_ref() { connection.cancel(); }
+    }
+
+    #[cfg(windows)]
+    fn finish_cron(&self,deadline: Instant) -> Result<(),String> {
+        let connection=self.cron.lock().map_err(|_|"예약 제어 종료 상태 오류")?.take();
+        if let Some(connection)=connection {connection.cancel();connection.wait_until(deadline)?;}
+        Ok(())
+    }
+
     fn close_io(&self) {
         let master = self.master.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(master); // Reader keeps draining during ClosePseudoConsole.
@@ -112,6 +126,7 @@ impl ProcessControl {
     }
     fn terminate_until(&self, deadline: Instant) -> Result<(), String> {
         let _termination = self.termination.lock().map_err(|_| "session termination lock poisoned")?;
+        #[cfg(windows)] self.cancel_cron();
         // adapter를 회수하는 PTY reaper와 경합하므로 먼저 해당 세션의 제어 핸들만
         // 복제한다. 외부 공유 서버의 프로세스 수명은 이 핸들이 소유하지 않는다.
         let shared = self.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().and_then(CodexSession::shared_control);
@@ -132,6 +147,7 @@ impl ProcessControl {
         #[cfg(windows)] let terminated = { let _ = kill_result; job_result };
         #[cfg(not(windows))] let terminated = { let _ = job_result; kill_result };
         terminated?;
+        #[cfg(windows)] self.finish_cron(deadline)?;
         // 원래 turn을 고정한 뒤 자기 TUI를 정리하고 정확한 ID만 중단한다.
         let result = stop.and_then(|stop| stop.map(|stop| stop.finish()).unwrap_or(Ok(())));
         self.shared_cleanup_failed.store(result.is_err(), Ordering::Release);
@@ -354,6 +370,11 @@ impl Engine {
         let mut guard = LaunchGuard { session: session.clone(), armed: true };
         let launch = || -> Result<_, String> {
             if session.stop_requested.load(Ordering::Acquire) { return Err("session was stopped before launch".into()); }
+            #[cfg(windows)]
+            let cron = if adapter.is_some() {
+                let info=session.info()?;
+                codex::cron_control::CronPreparation::prepare(&mut command,&info.id,info.generation,session.stop_requested.clone())?
+            } else {None};
             let pair = native_pty_system().openpty(size(cols, rows)).map_err(|e| format!("open native PTY: {e}"))?;
             let reader = pair.master.try_clone_reader().map_err(|e| format!("open PTY reader: {e}"))?;
             let writer = pair.master.take_writer().map_err(|e| format!("open PTY writer: {e}"))?;
@@ -365,10 +386,25 @@ impl Engine {
                 Ok(job) => job,
                 Err(error) => return Err(error),
             };
-            gate.release()?;
             let killer = child.child.clone_killer();
-            let process = Arc::new(ProcessControl { master: Mutex::new(Some(pair.master)), writer: Mutex::new(Some(writer)), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter), termination:Mutex::new(()),shared_cleanup_failed:AtomicBool::new(false),shared_stop_attempted:AtomicBool::new(false), _gate: gate });
+            let process = Arc::new(ProcessControl { master: Mutex::new(Some(pair.master)), writer: Mutex::new(Some(writer)), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter),
+                #[cfg(windows)] cron:Mutex::new(None),
+                termination:Mutex::new(()),shared_cleanup_failed:AtomicBool::new(false),shared_stop_attempted:AtomicBool::new(false), _gate: gate });
             *session.process.lock().map_err(|_| "session process lock poisoned")? = Some(process.clone());
+            #[cfg(windows)]
+            if let Some(cron)=cron {
+                let weak=Arc::downgrade(&process);
+                let cancelled=session.stop_requested.clone();
+                let verify=Arc::new(move |pipe: &mut crate::owned_tui_control::OwnedTuiPipe| {
+                    if cancelled.load(Ordering::Acquire) {return Err("종료 중인 세션의 제어 연결을 허용하지 않았습니다.".into());}
+                    let process=weak.upgrade().ok_or("예약 대상 소유 프로세스가 종료됐습니다.")?;
+                    let job=process.job.lock().map_err(|_|"예약 대상 소유 Job 상태 오류")?;
+                    pipe.verify_peer(job.as_ref().ok_or("예약 대상 소유 Job이 종료됐습니다.")?).map_err(|_|"예약 제어 상대의 소유 신원을 확인하지 못했습니다.".into())
+                });
+                *process.cron.lock().map_err(|_|"예약 제어 설치 상태 오류")?=Some(cron.start(verify)?);
+            }
+            // 소유 Job·제어 연결·정리 경로를 모두 설치한 뒤 도우미를 실행한다.
+            process._gate.release()?;
             Ok((child, reader, process))
         };
         let (mut child, mut reader, process) = match launch() {
@@ -419,6 +455,9 @@ impl Engine {
             let adapter = process.adapter.lock().unwrap_or_else(|e| e.into_inner()).take();
             let shared = adapter.as_ref().and_then(CodexSession::shared_control).is_some();
             drop(termination);
+            #[cfg(windows)] {
+                if process.finish_cron(Instant::now()+Duration::from_secs(5)).is_err() {waiting.cleanup_failed.store(true,Ordering::Release);}
+            }
             // Kill any descendants retaining the terminal after their leader exits.
             let job = process.job.lock().unwrap_or_else(|e| e.into_inner()).take();
             drop(job);
@@ -655,8 +694,16 @@ impl Engine {
         let thread_id=info.thread_id.ok_or("예약 대상 대화 식별자가 아직 확인되지 않았습니다.")?;
         let process=session.process.lock().map_err(|_| "예약 대상 프로세스 상태 오류")?.clone().ok_or("예약 대상 프로세스를 확인할 수 없습니다.")?;
         let adapter=process.adapter.lock().map_err(|_| "예약 제어 연결 상태 오류")?;
-        // 이 경로는 현재 로컬 검증과 미지원 응답뿐이다. 연결·PTY·이력 I/O를 하지 않는다.
+        adapter.as_ref().ok_or("예약 대상 CLI를 확인할 수 없습니다.")?.cron_target_ready(&thread_id)?;
         if self.inner.exiting.load(Ordering::Acquire) || session.phase.load(Ordering::Acquire)!=1 || session.stop_requested.load(Ordering::Acquire) {return Err("세션이 종료 중이어서 예약 요청을 시작하지 않았습니다.".into());}
+        #[cfg(windows)]
+        let connection=process.cron.lock().map_err(|_|"예약 제어 상태 오류")?.clone();
+        #[cfg(windows)]
+        if let Some(connection)=connection {
+            drop(adapter);
+            drop(process);
+            return connection.request(&thread_id,request);
+        }
         adapter.as_ref().ok_or("예약 대상 CLI를 확인할 수 없습니다.")?.cron_request(&thread_id,request)
     }
 

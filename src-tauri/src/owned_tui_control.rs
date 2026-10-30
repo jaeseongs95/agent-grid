@@ -409,7 +409,8 @@ mod tests {
             let exact = Value::String("x".repeat(MAX_FRAME_BYTES - 2));
             pipe.write_frame(&exact, deadline()).await.unwrap();
             assert_eq!(read_client(&mut client).await, exact);
-            let escaped = Value::String("\u{0001}".repeat(MAX_FRAME_BYTES / 6));
+            let escaped = Value::String("\u{0001}".repeat(MAX_FRAME_BYTES / 6 + 1));
+            assert!(serde_json::to_vec(&escaped).unwrap().len() > MAX_FRAME_BYTES, "시험 입력은 이스케이프 후 실제 상한을 넘어야 합니다.");
             assert_eq!(pipe.write_frame(&escaped, deadline()).await.unwrap_err().kind(), io::ErrorKind::InvalidInput);
             let small = serde_json::json!({"ok":true});
             pipe.write_frame(&small, deadline()).await.unwrap();
@@ -498,10 +499,32 @@ mod tests {
             let name = writing.name().to_owned();
             writing.write_frame(&Value::String("x".repeat(MAX_FRAME_BYTES - 2)), deadline()).await.unwrap();
             assert_eq!(writing.write_frame(&Value::Null, Instant::now() + Duration::from_millis(30)).await.unwrap_err().kind(), io::ErrorKind::TimedOut);
-            // 살아 있던 클라이언트에서도 연결 해제를 직접 관측한다.
-            let mut discarded = [0];
-            let closed = timeout_at(deadline(), client.read(&mut discarded)).await.unwrap();
-            assert!(matches!(closed, Ok(0) | Err(_)), "취소 뒤 잔여 쓰기를 보내면 안 됩니다.");
+            assert_eq!(writing.write_frame(&Value::Bool(true), deadline()).await.unwrap_err().kind(), io::ErrorKind::NotConnected);
+            // 취소 전에 완료된 첫 frame의 일부는 이미 상대/커널 버퍼에 남을 수 있다.
+            // 그 바이트만 한정해서 배출하고, 추가 frame 없이 실제 끊김까지 확인한다.
+            let mut first_frame = (MAX_FRAME_BYTES as u32).to_le_bytes().to_vec();
+            first_frame.push(b'"');
+            first_frame.extend(std::iter::repeat(b'x').take(MAX_FRAME_BYTES - 2));
+            first_frame.push(b'"');
+            let received = timeout_at(deadline(), async {
+                let mut received = 0;
+                let mut buffer = [0; 8192];
+                loop {
+                    match client.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            assert!(count <= first_frame.len() - received, "취소된 쓰기 뒤 새 frame이나 상한 밖 바이트가 전송됐습니다.");
+                            assert_eq!(&buffer[..count], &first_frame[received..received + count], "이미 접수된 첫 frame의 바이트만 남을 수 있습니다.");
+                            received += count;
+                        }
+                        Err(error) if matches!(error.kind(), io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionAborted | io::ErrorKind::ConnectionReset | io::ErrorKind::NotConnected)
+                            || matches!(error.raw_os_error(), Some(109 | 232 | 233)) => break,
+                        Err(error) => panic!("취소 뒤 예상하지 않은 수신 오류: {error}"),
+                    }
+                }
+                received
+            }).await.expect("취소된 쓰기는 이미 전송된 바이트 배출 뒤 기한 안에 끊겨야 합니다.");
+            assert!(received <= MAX_FRAME_BYTES + 4, "총 수신량은 처음 접수한 frame 하나를 넘으면 안 됩니다.");
             drop(client);
             reclaimed(name).await;
 
