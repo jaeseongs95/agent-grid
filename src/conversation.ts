@@ -46,6 +46,7 @@ export function createConversation(options: ConversationOptions) {
   let changing: Promise<void> = Promise.resolve(); let epoch = 0;
   let contentVersion = 0; let pollVersion = 0;
   let historyQuery = 0; let liveRevision = 0;
+  let activityRevision = 0;
   let polling: ReturnType<typeof setTimeout> | undefined;
   let sending = false; let interrupting = false; let uncertain = false; let composing = false; let loading = false; let staging = false;
   let modelsLoading = false;
@@ -355,8 +356,8 @@ export function createConversation(options: ConversationOptions) {
     if (event.method === 'thread/settings/updated') {
       if (threadId && value.threadId === threadId && value.threadSettings && typeof value.threadSettings === 'object' && !Array.isArray(value.threadSettings)) confirmedSettings(value.threadSettings.model, value.threadSettings.effort);
     }
-    else if (event.method === 'turn/started') { liveRevision++; activeTurn = string(value.turn?.id ?? value.turnId); activeTurnKnown = true; selectedTurn = activeTurn; items = []; nextItems = ''; itemsDirty = true; }
-    else if (event.method === 'turn/completed') { liveRevision++; if (activeTurn === string(value.turn?.id ?? value.turnId)) { activeTurn = ''; activeTurnKnown = true; } if (value.turn?.error) upsert({ id: `error-${event.seq}`, role: 'error', text: t('작업을 완료하지 못했습니다. 연결과 진행 중인 요청을 확인해 주세요.', 'The task could not finish. Check the connection and any pending requests.') }); }
+    else if (event.method === 'turn/started') { liveRevision++; activityRevision++; activeTurn = string(value.turn?.id ?? value.turnId); activeTurnKnown = true; selectedTurn = activeTurn; items = []; nextItems = ''; itemsDirty = true; }
+    else if (event.method === 'turn/completed') { liveRevision++; activityRevision++; if (activeTurn === string(value.turn?.id ?? value.turnId)) { activeTurn = ''; activeTurnKnown = true; } if (value.turn?.error) upsert({ id: `error-${event.seq}`, role: 'error', text: t('작업을 완료하지 못했습니다. 연결과 진행 중인 요청을 확인해 주세요.', 'The task could not finish. Check the connection and any pending requests.') }); }
     else if (event.method === 'error') upsert({ id: `error-${event.seq}`, role: 'error', text: t('작업을 완료하지 못했습니다. 연결과 진행 중인 요청을 확인해 주세요.', 'The task could not finish. Check the connection and any pending requests.') });
     else if (!value.turnId || value.turnId === selectedTurn) {
       if (event.method === 'item/started' || event.method === 'item/completed') { if (value.item) upsert(itemEntry(value.item)); }
@@ -386,14 +387,21 @@ export function createConversation(options: ConversationOptions) {
     } catch (error) { if (alive(version) && foreground && revision === pollVersion) { connected = false; failure(error); updateControls(); } }
     finally { if (alive(version) && foreground && attached && revision === pollVersion) polling = setTimeout(() => void poll(version, revision), 400); }
   }
+  function adoptStartedTurn(turn: Json | undefined, version: number, activity: number) {
+    const id = string(turn?.id);
+    if (!id) return false;
+    // 시작 응답보다 완료 알림이 먼저 올 수 있으므로 더 최근 실행 상태를 보존한다.
+    if (!disposed && !deleted && version === epoch && activity === activityRevision) { activeTurn = id; activeTurnKnown = true; }
+    return true;
+  }
   async function send() {
     if (button('.conversation-send').disabled || composing) return;
     if (new TextEncoder().encode(input.value).byteLength > 64 * 1024) { status('메시지는 UTF-8 기준 64 KiB까지 전송할 수 있습니다. 초안을 보존했습니다.', 'Messages are limited to 64 KiB in UTF-8. Your draft is preserved.'); return; }
-    sending = true; const version = epoch; const draft = input.value; const sentAttachments = [...attachments]; updateControls(); renderAttachments();
+    sending = true; const version = epoch; const activity = activityRevision; const draft = input.value; const sentAttachments = [...attachments]; updateControls(); renderAttachments();
     try {
       const value = await rpc({ type: 'send', requestId: crypto.randomUUID(), text: draft, attachments: sentAttachments.map(({ type, path }) => ({ type, path })), ...(model.value ? { model: model.value } : {}), ...(effort.value ? { effort: effort.value } : {}) });
       if (disposed || deleted) return;
-      if (value.turn?.id) activeTurn = string(value.turn.id);
+      adoptStartedTurn(value.turn, version, activity);
       modelDraft = false; effortDraft = false; renderModels();
       if (input.value === draft) input.value = ''; attachments = []; for (const value of sentAttachments) stagedPaths.delete(value.path); renderAttachments();
       if (alive(version)) status('전송했습니다.', 'Sent.');
@@ -410,12 +418,11 @@ export function createConversation(options: ConversationOptions) {
   }
   async function compact(): Promise<{ status?: string }> {
     if (!visible || !attached || !connected || disposed || deleted || sending || staging || uncertain || activeTurn) return { status: 'notStarted' };
-    sending = true; updateControls(); renderAttachments();
+    sending = true; const version = epoch; const activity = activityRevision; updateControls(); renderAttachments();
     try {
       const value = await rpc({ type: 'compact' });
-      if (!disposed && !deleted && value.status === 'started') {
-        if (typeof value.turn?.id === 'string' && value.turn.id) { activeTurn = value.turn.id; activeTurnKnown = true; }
-        else uncertain = true;
+      if (!disposed && !deleted && version === epoch && value.status === 'started') {
+        if (!adoptStartedTurn(value.turn, version, activity)) uncertain = true;
         status('압축을 요청했습니다. 서버의 완료 확인을 기다립니다.', 'Compaction requested. Waiting for server confirmation.');
       }
       return value;

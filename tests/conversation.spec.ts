@@ -7,7 +7,7 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
     const { createConversation } = await import('/src/conversation.ts');
     const host = document.createElement('section'); host.id = 'conversation-fixture';
     host.style.cssText = 'position:fixed;inset:20px;z-index:9999;background:#141820;'; document.body.append(host);
-    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rawFailure: '', failAt: '', pollError: '', rejectSend: false, rejectDetach: false, rejectHandoff: false, holdHandoff: false, releaseHandoff: () => {}, holdItems: false, releaseItems: () => {}, heldItems: [] as any[], historyTag: '', holdPage: false, releasePage: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
+    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rawFailure: '', failAt: '', pollError: '', rejectSend: false, rejectDetach: false, rejectHandoff: false, holdHandoff: false, releaseHandoff: () => {}, holdItems: false, releaseItems: () => {}, heldItems: [] as any[], historyTag: '', holdPage: false, releasePage: () => {}, holdStart: false, releaseStart: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
     state.conversation = createConversation({
       sessionId: 'conversation-owned', generation: 7, host,
       ownerChanged: (owned: boolean) => fixture.owners.push(owned),
@@ -44,7 +44,11 @@ async function conversation(page: Page, options: { historyUnavailable?: boolean 
           { id: 'server-model-2', model: 'server-model-2', displayName: '서버의 두 번째 모델', supportedReasoningEfforts: [{ reasoningEffort: 'high' }, { reasoningEffort: 'medium' }] },
         ], nextCursor: null };
         if (request.type === 'poll') return { events: fixture.queue.splice(0), pendingRequests: fixture.pending, connected: fixture.connected, gap: false, unknownResult: fixture.unknownResult, error: fixture.pollError || undefined };
-        if (request.type === 'send') { if (fixture.rejectSend) throw Error(fixture.rawFailure || '응답 시간 초과'); return { turn: { id: 'sent-turn', status: 'inProgress' } }; }
+        if (request.type === 'send' || request.type === 'compact') {
+          if (fixture.rejectSend) throw Error(fixture.rawFailure || '응답 시간 초과');
+          if (fixture.holdStart) await new Promise<void>(resolve => { fixture.releaseStart = resolve; });
+          return { status: 'started', turn: { id: request.type === 'send' ? 'sent-turn' : 'compacted-turn', status: 'inProgress' } };
+        }
         if (request.type === 'interrupt') { fixture.queue.push({ seq: fixture.nextSeq++, method: 'turn/completed', params: { turn: { id: request.turnId, status: 'interrupted' } } }); return {}; }
         if (request.type === 'respond') { fixture.pending = fixture.pending.map((entry: any) => entry.requestId === request.requestId ? { ...entry, responded: true } : entry); return {}; }
         if (request.type === 'detail') {
@@ -618,3 +622,35 @@ test('자기 스레드 삭제는 표시 참조와 늦은 조회를 정리하고 
   expect(calls.filter((value: any) => ['session_stop', 'complete_exit', 'cleanup_conversation_attachment'].includes(value.command))).toEqual([]);
   const count = calls.length; await page.waitForTimeout(900); expect(await page.evaluate(() => (window as any).conversationFixture.calls.length)).toBe(count);
 });
+
+for (const operation of ['send', 'compact'] as const) for (const replacement of [false, true]) {
+  test(`시작 응답보다 먼저 수신한 완료·후속 실행을 보존한다: ${operation} / 후속 ${replacement}`, async ({ page }) => {
+    await conversation(page);
+    const host = page.locator('#conversation-fixture');
+    await host.locator('.conversation-input').fill('응답 순서 시험 초안');
+    await page.evaluate(() => { (window as any).conversationFixture.holdStart = true; });
+    if (operation === 'send') await host.locator('.conversation-send').click();
+    else await page.evaluate(() => { void (window as any).conversation.compact(); });
+    await expect.poll(() => page.evaluate(type => (window as any).conversationFixture.calls.some((entry: any) => entry.args?.request?.type === type), operation)).toBe(true);
+    await page.evaluate(({ operation, replacement }) => {
+      const f = (window as any).conversationFixture; const id = operation === 'send' ? 'sent-turn' : 'compacted-turn';
+      f.queue.push({ seq: f.nextSeq++, method: 'turn/started', params: { turn: { id, status: 'inProgress' } } });
+      f.queue.push({ seq: f.nextSeq++, method: 'turn/completed', params: { turn: { id, status: 'completed' } } });
+      if (replacement) f.queue.push({ seq: f.nextSeq++, method: 'turn/started', params: { turn: { id: 'newer-turn', status: 'inProgress' } } });
+      f.queue.push({ seq: f.nextSeq++, method: 'item/completed', params: { turnId: replacement ? 'newer-turn' : id, item: { id: 'activity-marker', type: 'agentMessage', text: '시작 응답 전에 처리한 실행 표식' } } });
+    }, { operation, replacement });
+    await expect(host.locator('.conversation-messages')).toContainText('시작 응답 전에 처리한 실행 표식');
+    await page.evaluate(() => (window as any).conversationFixture.releaseStart());
+    await expect(host.locator('.conversation-input')).toBeEnabled();
+    if (operation === 'send') await host.locator('.conversation-input').fill('다음 전송 초안');
+    else await expect(host.locator('.conversation-input')).toHaveValue('응답 순서 시험 초안');
+    if (replacement) {
+      await expect(host.locator('.conversation-send')).toBeDisabled();
+      await host.locator('.conversation-stop').click();
+      await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.calls.filter((entry: any) => entry.args?.request?.type === 'interrupt').at(-1)?.args.request.turnId)).toBe('newer-turn');
+    } else {
+      await expect(host.locator('.conversation-send')).toBeEnabled();
+      await expect(host.locator('.conversation-stop')).toBeDisabled();
+    }
+  });
+}
