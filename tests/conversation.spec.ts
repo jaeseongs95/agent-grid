@@ -1,13 +1,13 @@
 import { expect, test, type Page } from '@playwright/test';
 
-async function conversation(page: Page) {
+async function conversation(page: Page, options: { historyUnavailable?: boolean } = {}) {
   await page.goto('/');
-  await page.evaluate(async () => {
+  await page.evaluate(async options => {
     const state = window as any;
     const { createConversation } = await import('/src/conversation.ts');
     const host = document.createElement('section'); host.id = 'conversation-fixture';
     host.style.cssText = 'position:fixed;inset:20px;z-index:9999;background:#141820;'; document.body.append(host);
-    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '' };
+    const fixture = state.conversationFixture = { calls: [] as any[], queue: [] as any[], pending: [] as any[], owners: [] as boolean[], rejectSend: false, rejectDetach: false, holdItems: false, releaseItems: () => {}, nextSeq: 1, unknownResult: undefined as boolean | undefined, detailReads: 0, largeHistory: false, invalidHistory: '', historyUnavailable: options.historyUnavailable === true, connected: true };
     state.conversation = createConversation({
       sessionId: 'conversation-owned', generation: 7, host,
       ownerChanged: (owned: boolean) => fixture.owners.push(owned),
@@ -18,9 +18,9 @@ async function conversation(page: Page) {
         if (command === 'cleanup_conversation_attachment') return null;
         if (command !== 'conversation_request') throw Error(`알 수 없는 명령 ${command}`);
         const request = args.request;
-        if (request.type === 'attach') return { threadId: 'thread-a', owner: 'gui', model: 'runtime-model', reasoningEffort: 'medium' };
+        if (request.type === 'attach') return { threadId: 'thread-a', owner: 'gui', model: 'runtime-model', reasoningEffort: 'medium', historyUnavailable: fixture.historyUnavailable, activeTurnKnown: !fixture.historyUnavailable, activeTurnId: null };
         if (request.type === 'detach') { if (fixture.rejectDetach) throw Error('승인 대기 중에는 전환할 수 없습니다'); return {}; }
-        if (request.type === 'page') return { data: [{ id: request.cursor ? 'older-turn' : 'recent-turn', status: 'completed' }], nextCursor: request.cursor ? null : 'turn-page-2' };
+        if (request.type === 'page') { if (fixture.historyUnavailable) throw Error('대화 이력을 아직 조회할 수 없습니다.'); return { data: [{ id: request.cursor ? 'older-turn' : 'recent-turn', status: 'completed' }], nextCursor: request.cursor ? null : 'turn-page-2' }; }
         if (request.type === 'items') {
           if (fixture.holdItems) await new Promise<void>(resolve => { fixture.releaseItems = resolve; });
           const turnId = request.turnId === 'older-turn' ? 'older-turn' : 'recent-turn';
@@ -38,7 +38,7 @@ async function conversation(page: Page) {
           { id: 'runtime-model-id', model: 'runtime-model', displayName: '실제 런타임 모델', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'medium' }] },
           { id: 'server-model-2', model: 'server-model-2', displayName: '서버의 두 번째 모델', supportedReasoningEfforts: [{ reasoningEffort: 'high' }, { reasoningEffort: 'medium' }] },
         ], nextCursor: null };
-        if (request.type === 'poll') return { events: fixture.queue.splice(0), pendingRequests: fixture.pending, connected: true, gap: false, unknownResult: fixture.unknownResult };
+        if (request.type === 'poll') return { events: fixture.queue.splice(0), pendingRequests: fixture.pending, connected: fixture.connected, gap: false, unknownResult: fixture.unknownResult };
         if (request.type === 'send') { if (fixture.rejectSend) throw Error('응답 시간 초과'); return { turn: { id: 'sent-turn', status: 'inProgress' } }; }
         if (request.type === 'interrupt') { fixture.queue.push({ seq: fixture.nextSeq++, method: 'turn/completed', params: { turn: { id: request.turnId, status: 'interrupted' } } }); return {}; }
         if (request.type === 'respond') { fixture.pending = fixture.pending.map((entry: any) => entry.requestId === request.requestId ? { ...entry, responded: true } : entry); return {}; }
@@ -52,7 +52,7 @@ async function conversation(page: Page) {
       },
     });
     await state.conversation.setVisible(true);
-  });
+  }, options);
   await expect(page.locator('#conversation-fixture .conversation-input')).toBeEnabled();
 }
 const view = (page: Page) => page.locator('#conversation-fixture');
@@ -321,4 +321,57 @@ test('같은 스레드의 확정 설정 알림은 현재값을 갱신하고 미�
   await expect(confirmed).toContainText('추론: 미확인');
   await expect(view(page).locator('.conversation-input')).toHaveValue('아직 보내지 않은 초안');
   expect(await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'send').length)).toBe(0);
+});
+
+test('미물질화 이력과 실행 상태 미확인은 빈 대화·유휴로 확정하지 않고 초안을 유지한다', async ({ page }) => {
+  await conversation(page, { historyUnavailable: true });
+  await expect(view(page).locator('.conversation-placeholder')).toContainText('이력을 아직 조회할 수 없습니다');
+  await expect(view(page).locator('.conversation-status')).toContainText('실행 상태 미확인');
+  await expect(view(page).locator('.conversation-placeholder')).not.toContainText('표시할 대화가 없습니다');
+  const initialPages = await page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'page').length);
+  expect(initialPages).toBe(0);
+  await view(page).locator('.conversation-input').fill('아직 보내지 않은 작업');
+  await expect(view(page).locator('.conversation-send')).toBeEnabled();
+  await expect(view(page).locator('.conversation-stop')).toBeDisabled();
+  await page.evaluate(() => { (window as any).conversationFixture.historyUnavailable = false; });
+  await view(page).locator('.conversation-refresh').click();
+  await expect(view(page).locator('.conversation-message')).toHaveCount(3);
+  await expect(view(page).locator('.conversation-input')).toHaveValue('아직 보내지 않은 작업');
+});
+
+test('자기 스레드 삭제는 표시 참조와 늦은 조회를 정리하고 세션·첨부 원본과 초안을 보존한다', async ({ page }) => {
+  await conversation(page);
+  await page.evaluate(() => { (window as any).conversationFixture.largeHistory = true; });
+  await view(page).locator('.conversation-refresh').click();
+  await view(page).getByRole('button', { name: '전체 내용 보기' }).click();
+  await expect(view(page).locator('[data-item-id="large-item"]')).toContainText('첫 원문');
+  await view(page).locator('.conversation-input').fill('삭제 뒤에도 보존할 초안');
+  await view(page).locator('.conversation-attach').click();
+  await page.evaluate(() => {
+    const fixture = (window as any).conversationFixture;
+    fixture.queue.push({ seq: fixture.nextSeq++, method: 'thread/deleted', params: { threadId: 'foreign-thread' } });
+  });
+  await page.waitForTimeout(500); await expect(view(page).locator('.conversation-message')).toHaveCount(4);
+  await page.evaluate(() => {
+    const state = window as any; const fixture = state.conversationFixture;
+    fixture.pending = [{ seq: 1, method: 'item/tool/requestUserInput', requestId: 'deleted-question', params: { questions: [{ id: 'scope', header: '범위', question: '삭제 전 질문', options: null, isOther: false, isSecret: false }] } }];
+  });
+  await expect(view(page).locator('.conversation-request')).toHaveCount(1);
+  await page.evaluate(() => { const state = window as any; state.conversationFixture.holdItems = true; state.latePage = state.conversation.refresh(); });
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.calls.filter((value: any) => value.args.request?.type === 'items').length)).toBe(3);
+  await page.evaluate(() => {
+    const fixture = (window as any).conversationFixture; fixture.connected = false; fixture.pending = [];
+    fixture.queue.push({ seq: fixture.nextSeq++, method: 'thread/deleted', params: { threadId: 'thread-a' } });
+  });
+  await expect(view(page).locator('.conversation-status')).toContainText('삭제');
+  await page.evaluate(async () => { const state = window as any; state.conversationFixture.releaseItems(); await state.latePage; });
+  await expect(view(page).locator('.conversation-message')).toHaveCount(0); await expect(view(page).locator('.conversation-turns option')).toHaveCount(0);
+  await expect(view(page).locator('.conversation-request')).toHaveCount(0); await expect(view(page).locator('.conversation-model')).toHaveValue('');
+  await expect(view(page).locator('.conversation-current-settings')).not.toContainText('runtime-model');
+  await expect(view(page).locator('.conversation-send')).toBeDisabled(); await expect(view(page).locator('.conversation-stop')).toBeDisabled();
+  await expect(view(page).locator('.conversation-input')).toHaveValue('삭제 뒤에도 보존할 초안'); await expect(view(page).locator('.conversation-attachment')).toHaveCount(2);
+  await expect.poll(() => page.evaluate(() => (window as any).conversationFixture.owners.at(-1))).toBe(false);
+  const calls = await page.evaluate(() => (window as any).conversationFixture.calls);
+  expect(calls.filter((value: any) => ['session_stop', 'complete_exit', 'cleanup_conversation_attachment'].includes(value.command))).toEqual([]);
+  const count = calls.length; await page.waitForTimeout(900); expect(await page.evaluate(() => (window as any).conversationFixture.calls.length)).toBe(count);
 });

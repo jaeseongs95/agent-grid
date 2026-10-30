@@ -51,6 +51,7 @@ export function createConversation(options: ConversationOptions) {
   let modelsLoading = false;
   let lastSendError = '';
   let activeTurn = ''; let selectedTurn = ''; let nextTurns = ''; let nextItems = ''; let nextModels = '';
+  let activeTurnKnown = false; let historyUnavailable = false; let deleted = false;
   let items: Entry[] = []; let turnPage: Json[] = []; let models: Json[] = [];
   let itemsDirty = false;
   const renderedItems = new Map<string, { signature: string; row: HTMLElement }>();
@@ -67,7 +68,7 @@ export function createConversation(options: ConversationOptions) {
   function failure(error: unknown) { status(`오류: ${errorText(error)}`, `Error: ${errorText(error)}`); }
   function button(selector: string) { return $<HTMLButtonElement>(selector); }
   function updateControls() {
-    const ready = visible && attached && connected && !loading;
+    const ready = visible && attached && connected && !loading && !deleted;
     input.disabled = !ready || sending || uncertain;
     button('.conversation-send').disabled = !ready || sending || staging || uncertain || !!activeTurn || (!input.value.trim() && !attachments.length);
     button('.conversation-stop').disabled = !ready || !activeTurn || interrupting || uncertain;
@@ -162,11 +163,18 @@ export function createConversation(options: ConversationOptions) {
       if (entry.detail) { const detail = document.createElement('button'); detail.type = 'button'; detail.className = 'quiet-button'; bindText(detail, '전체 내용 보기', 'Read full content'); detail.onclick = () => void loadDetail(entry, body, detail, 0); row.append(detail); }
       previous?.row.remove(); renderedItems.set(entry.id, { signature, row }); messages.append(row);
     }
-    if (!items.length) { const empty = document.createElement('p'); empty.className = 'conversation-placeholder'; bindText(empty, '표시할 대화가 없습니다. 메시지를 보내 작업을 시작하세요.', 'No conversation to display. Send a message to start.'); messages.append(empty); }
+    if (!items.length) {
+      const empty = document.createElement('p'); empty.className = 'conversation-placeholder';
+      if (deleted) bindText(empty, '원래 대화가 삭제되어 이력을 표시하지 않습니다. 입력 초안을 보존했습니다.', 'The original thread was deleted. History is unavailable and your draft is preserved.');
+      else if (historyUnavailable) bindText(empty, '이력을 아직 조회할 수 없습니다. 대화가 비어 있거나 실행 중인 작업이 없다고 확인된 상태가 아닙니다.', 'History is not available yet. This does not confirm an empty or idle conversation.');
+      else bindText(empty, '표시할 대화가 없습니다. 메시지를 보내 작업을 시작하세요.', 'No conversation to display. Send a message to start.');
+      messages.append(empty);
+    }
     button('.conversation-more').hidden = !nextItems;
     if (nearEnd) messages.scrollTop = messages.scrollHeight;
   }
   async function loadDetail(entry: Entry, body: HTMLElement, control: HTMLButtonElement, offset: number, snapshotId?: string) {
+    if (deleted) return;
     control.disabled = true; const version = epoch;
     try {
       const value = await rpc({ type: 'detail', turnId: selectedTurn, itemId: entry.id, offset, ...(offset > 0 && snapshotId ? { snapshotId } : {}) });
@@ -210,6 +218,7 @@ export function createConversation(options: ConversationOptions) {
     turns.value = selectedTurn; button('.conversation-older').hidden = !nextTurns;
   }
   async function loadItems(turnId: string, cursor = '') {
+    if (deleted) return;
     const version = epoch; const content = contentVersion; selectedTurn = turnId; loading = true; items = []; nextItems = ''; renderItems(); updateControls();
     try {
       const value = await rpc({ type: 'items', turnId, ...(cursor ? { cursor } : {}) });
@@ -229,18 +238,23 @@ export function createConversation(options: ConversationOptions) {
     finally { if (alive(version) && content === contentVersion) { loading = false; updateControls(); } }
   }
   async function loadPage(cursor = '') {
+    if (deleted) return;
     const version = epoch; const content = contentVersion; loading = true; updateControls();
     try {
       const value = await rpc({ type: 'page', ...(cursor ? { cursor } : {}) });
       if (!alive(version) || !foreground || content !== contentVersion) return;
-      turnPage = value.data ?? []; nextTurns = string(value.nextCursor); selectedTurn = string(turnPage[0]?.id); renderTurns();
-      if (!cursor) activeTurn = turnPage[0]?.status === 'inProgress' ? string(turnPage[0]?.id) : '';
+      if (!Array.isArray(value.data)) throw new Error(t('대화 구간 목록 형식이 올바르지 않습니다.', 'Invalid conversation turn list.'));
+      const wasUnknown = historyUnavailable || !activeTurnKnown; historyUnavailable = false;
+      turnPage = value.data; nextTurns = string(value.nextCursor); selectedTurn = string(turnPage[0]?.id); renderTurns();
+      if (!cursor) { activeTurn = turnPage[0]?.status === 'inProgress' ? string(turnPage[0]?.id) : ''; activeTurnKnown = true; }
+      if (wasUnknown) status('대화 이력과 실행 상태를 확인했습니다.', 'Conversation history and activity state confirmed.');
       items = []; nextItems = ''; renderItems();
       if (selectedTurn) await loadItems(selectedTurn);
     } catch (error) { if (alive(version) && content === contentVersion) failure(error); }
     finally { if (alive(version) && content === contentVersion) { loading = false; updateControls(); } }
   }
   async function loadModels(cursor = '') {
+    if (deleted) return;
     if (modelsLoading) return; modelsLoading = true; updateControls();
     const version = epoch;
     try { const value = await rpc({ type: 'models', ...(cursor ? { cursor } : {}) }); if (!alive(version)) return; models = value.data ?? []; nextModels = string(value.nextCursor); renderModels(); }
@@ -307,16 +321,30 @@ export function createConversation(options: ConversationOptions) {
     finally { responding.delete(requestId); }
   }
   function receive(event: RuntimeEvent) {
+    if (deleted) return;
     if (event.seq <= lastSeq) return;
     if (lastSeq && event.seq > lastSeq + 1) { confirmedSettings(undefined, undefined); status('실시간 이벤트 순번이 누락되었습니다. 최근 대화를 다시 불러오세요.', 'Live event sequence has a gap. Reload Recent conversation.'); button('.conversation-refresh').classList.add('needs-refresh'); }
     lastSeq = event.seq;
     const value = event.params;
+    if (event.method === 'thread/deleted') {
+      if (threadId && value.threadId === threadId) {
+        deleted = true; connected = false; activeTurn = ''; activeTurnKnown = false; historyUnavailable = true; epoch++; stopPolling();
+        models = []; nextModels = ''; modelDraft = false; effortDraft = false; questionDrafts.clear(); responding.clear();
+        clearDisplay(); confirmedSettings(undefined, undefined); status('원래 대화가 삭제되었습니다. 연결을 종료하고 초안을 보존합니다.', 'The original thread was deleted. Closing the connection and preserving your draft.');
+        changing = changing.catch(failure).then(async () => {
+          if (!attached || disposed) return;
+          try { await rpc({ type: 'detach' }); if (disposed) return; attached = false; options.ownerChanged?.(false); status('원래 대화가 삭제되어 연결을 해제했습니다. 초안은 보존했습니다.', 'The deleted thread connection was released. Your draft is preserved.'); }
+          catch (error) { if (!disposed) status(`원래 대화가 삭제되었습니다. 연결 해제 확인 실패: ${errorText(error)}`, `The original thread was deleted. Could not confirm connection release: ${errorText(error)}`); }
+        });
+      }
+      return;
+    }
     if (event.requestId) { if (!pendingRequests.some(entry => entry.requestId === event.requestId)) pendingRequests.push(event); renderRequests(); return; }
     if (event.method === 'thread/settings/updated') {
       if (threadId && value.threadId === threadId && value.threadSettings && typeof value.threadSettings === 'object' && !Array.isArray(value.threadSettings)) confirmedSettings(value.threadSettings.model, value.threadSettings.effort);
     }
-    else if (event.method === 'turn/started') { activeTurn = string(value.turn?.id ?? value.turnId); selectedTurn = activeTurn; items = []; nextItems = ''; itemsDirty = true; }
-    else if (event.method === 'turn/completed') { if (activeTurn === string(value.turn?.id ?? value.turnId)) activeTurn = ''; if (value.turn?.error) upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.turn.error.message) || JSON.stringify(value.turn.error) }); }
+    else if (event.method === 'turn/started') { activeTurn = string(value.turn?.id ?? value.turnId); activeTurnKnown = true; selectedTurn = activeTurn; items = []; nextItems = ''; itemsDirty = true; }
+    else if (event.method === 'turn/completed') { if (activeTurn === string(value.turn?.id ?? value.turnId)) { activeTurn = ''; activeTurnKnown = true; } if (value.turn?.error) upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.turn.error.message) || JSON.stringify(value.turn.error) }); }
     else if (event.method === 'error') upsert({ id: `error-${event.seq}`, role: 'error', text: string(value.error?.message ?? value.message) || JSON.stringify(value) });
     else if (!value.turnId || value.turnId === selectedTurn) {
       if (event.method === 'item/started' || event.method === 'item/completed') { if (value.item) upsert(itemEntry(value.item)); }
@@ -326,7 +354,7 @@ export function createConversation(options: ConversationOptions) {
     updateControls();
   }
   function stopPolling() { pollVersion++; clearTimeout(polling); }
-  function startPolling() { stopPolling(); if (visible && foreground && attached && !disposed) void poll(epoch, pollVersion); }
+  function startPolling() { stopPolling(); if (visible && foreground && attached && !disposed && !deleted) void poll(epoch, pollVersion); }
   async function poll(version: number, revision: number) {
     if (!alive(version) || !foreground || !attached || revision !== pollVersion) return;
     try {
@@ -337,7 +365,7 @@ export function createConversation(options: ConversationOptions) {
         if (wasUncertain && !uncertain && lastSendError) { status(`전송이 거절되었습니다. 초안을 보존했습니다. ${lastSendError}`, `Send was rejected. Your draft is preserved. ${lastSendError}`); lastSendError = ''; }
       }
       if (value.gap) { confirmedSettings(undefined, undefined); status('실시간 수신 구간이 누락되었습니다. 최근 대화를 다시 불러오세요.', 'Some live events were missed. Reload Recent conversation.'); button('.conversation-refresh').classList.add('needs-refresh'); }
-      for (const event of value.events ?? []) receive(event);
+      for (const event of value.events ?? []) { receive(event); if (deleted) return; }
       if (itemsDirty) { itemsDirty = false; renderItems(); }
       pendingRequests = value.pendingRequests ?? pendingRequests; renderRequests();
       const knownRequests = new Set(pendingRequests.map(event => event.requestId)); for (const id of questionDrafts.keys()) if (!knownRequests.has(id)) questionDrafts.delete(id);
@@ -352,20 +380,20 @@ export function createConversation(options: ConversationOptions) {
     sending = true; const version = epoch; const draft = input.value; const sentAttachments = [...attachments]; updateControls(); renderAttachments();
     try {
       const value = await rpc({ type: 'send', requestId: crypto.randomUUID(), text: draft, attachments: sentAttachments.map(({ type, path }) => ({ type, path })), ...(model.value ? { model: model.value } : {}), ...(effort.value ? { effort: effort.value } : {}) });
-      if (disposed) return;
+      if (disposed || deleted) return;
       if (value.turn?.id) activeTurn = string(value.turn.id);
       modelDraft = false; effortDraft = false; renderModels();
       if (input.value === draft) input.value = ''; attachments = []; for (const value of sentAttachments) stagedPaths.delete(value.path); renderAttachments();
       if (alive(version)) status('전송했습니다.', 'Sent.');
     } catch (error) {
-      if (!disposed) { uncertain = true; lastSendError = errorText(error); status(`전송 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 초안을 보존했습니다. ${lastSendError}`, `Send result is unknown. It will not be resent automatically. Your draft is preserved. ${lastSendError}`); }
+      if (!disposed && !deleted) { uncertain = true; lastSendError = errorText(error); status(`전송 결과를 확인하지 못했습니다. 자동으로 다시 보내지 않습니다. 초안을 보존했습니다. ${lastSendError}`, `Send result is unknown. It will not be resent automatically. Your draft is preserved. ${lastSendError}`); }
     } finally { sending = false; if (!disposed) { renderAttachments(); updateControls(); } }
   }
   async function interrupt() {
     if (!activeTurn || button('.conversation-stop').disabled) return;
     const id = activeTurn; interrupting = true; updateControls();
-    try { await rpc({ type: 'interrupt', turnId: id }); if (!disposed) status('중단을 요청했습니다. 실제 완료 이벤트를 기다립니다.', 'Interruption requested. Waiting for confirmation.'); }
-    catch (error) { if (!disposed) failure(error); }
+    try { await rpc({ type: 'interrupt', turnId: id }); if (!disposed && !deleted) status('중단을 요청했습니다. 실제 완료 이벤트를 기다립니다.', 'Interruption requested. Waiting for confirmation.'); }
+    catch (error) { if (!disposed && !deleted) failure(error); }
     finally { interrupting = false; if (!disposed) updateControls(); }
   }
   async function pickAttachments() {
@@ -400,6 +428,7 @@ export function createConversation(options: ConversationOptions) {
         attached = false; connected = false; options.ownerChanged?.(false);
         if (!visible) clearDisplay();
       }
+      if (deleted) { updateControls(); return; }
       if (!alive(version)) return;
       status('대화에 연결하는 중…', 'Connecting to conversation…');
       try {
@@ -412,9 +441,11 @@ export function createConversation(options: ConversationOptions) {
           attached = false; options.ownerChanged?.(false); return;
         }
         connected = true; uncertain = false; lastSeq = 0; threadId = string(value.threadId ?? value.thread?.id); confirmedSettings(value.model, value.reasoningEffort);
-        activeTurn = string(value.activeTurnId); pendingRequests = []; renderRequests(); renderModels();
-        status('연결됨', 'Connected');
-        await Promise.all([foreground ? loadPage() : Promise.resolve(), loadModels()]); if (alive(version)) startPolling();
+        historyUnavailable = value.historyUnavailable === true; activeTurnKnown = value.activeTurnKnown === true;
+        activeTurn = activeTurnKnown ? string(value.activeTurnId) : ''; pendingRequests = []; renderRequests(); renderModels(); renderItems();
+        if (historyUnavailable || !activeTurnKnown) status('연결됨 · 이력 또는 실행 상태 미확인. 전송 시 실행 환경이 입력 가능 여부를 확인합니다.', 'Connected · History or activity state is unknown. The runtime checks whether a new message can start.');
+        else status('연결됨', 'Connected');
+        await Promise.all([foreground && !historyUnavailable ? loadPage() : Promise.resolve(), loadModels()]); if (alive(version)) startPolling();
       } catch (error) { if (alive(version)) { connected = false; failure(error); } throw error; }
       finally { if (alive(version)) updateControls(); }
     });
