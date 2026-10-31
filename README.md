@@ -127,6 +127,12 @@ entries, refresh every five seconds while the popup is visible and never fetch
 conversation bodies. An uncertain mutation is reconciled by its original request
 ID rather than automatically sent again.
 
+The connected shared server must also support this feature, even when the selected
+CLI is newer. Selecting an executable or restarting the desktop app does not update
+that server. A server update can interrupt running work; finish that work before
+following the compatible package update instructions. The app never performs this
+update automatically.
+
 ## Plugins and skills
 
 Open **⚙ Settings** in the upper-right corner, then **Plugins & skills**.

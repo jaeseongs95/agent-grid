@@ -145,7 +145,7 @@ export function createSubagentManager(host: Host) {
           if (pending && value.parentRuntimeId === pending.expectedParentRuntimeId && value.mutationState === 'clear' && value.reconciledRequestId === pending.requestId) unresolved.delete(key(session));
         }
         $('.subagent-error').hidden = true;
-        if (!supported) status('이 실행 환경은 하위 에이전트 조회·관리를 지원하지 않습니다.', 'This runtime does not support subagent viewing or management.');
+        if (!supported) status('연결된 서버에서 이 기능을 지원하지 않습니다. 호환 CLI·서버로 업데이트한 뒤 세션을 다시 연결하세요.', 'The connected server does not support this feature. Update to a compatible CLI and server, then reconnect the session.');
         else if (!connected) status('실행기 연결을 확인하지 못했습니다. 마지막 목록은 현재 상태가 아닐 수 있습니다.', 'The runtime connection is unavailable. The last list may be out of date.');
         else status('하위 에이전트 목록을 확인했습니다.', 'Subagent list confirmed.');
         render();
