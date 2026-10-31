@@ -119,6 +119,17 @@ test('현재 연결에서 안전한 중단 지원이 확인돼야 현재 회차 
   }
 });
 
+test('현재 회차 중단만 미지원이면 예약 관리 전체가 미지원이라고 안내하지 않는다', async ({ page }) => {
+  await fixture(page, { jobs: 1 });
+  await page.locator('.cron-prompt').fill('보존할 예약 초안');
+  await page.evaluate(() => { (window as any).cronFixture.reply = 'unsupported'; });
+  await page.getByRole('button', { name: '현재 회차 중단', exact: true }).click();
+  await expect(page.locator('.cron-status')).toContainText('안전한 작업 중단');
+  await expect(page.locator('.cron-status')).not.toContainText('예약 관리를 지원하지 않습니다');
+  await expect(page.locator('.cron-prompt')).toHaveValue('보존할 예약 초안');
+  expect((await mutations(page))[0].request.type).toBe('cancel');
+});
+
 test('반복은 초 단위로, 단발 현지 시각은 정확한 epoch로 원래 세션에 전송한다', async ({ page }) => {
   await fixture(page);
   await page.locator('.cron-prompt').fill('  원문 작업\n둘째 줄  ');

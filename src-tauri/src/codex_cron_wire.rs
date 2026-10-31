@@ -271,6 +271,29 @@ impl ServerHandshake {
     }
 }
 
+/// 실제 통로 결합 시험만을 위한 클라이언트 증명이다. 제품에는 포함하지 않는다.
+#[cfg(test)]
+pub(super) fn fixture_client_auth(token_hex: &str, bootstrap: &Bootstrap, hello: &Hello, challenge: &Challenge) -> Result<Auth, String> {
+    if !lower_hex(token_hex, 64) { return Err(invalid()); }
+    if hello.session_id != bootstrap.session_id || hello.session_generation != bootstrap.session_generation { return Err(denied()); }
+    let mut token = SecretToken([0; 32]);
+    let digit = |byte: u8| if byte <= b'9' { byte - b'0' } else { byte - b'a' + 10 };
+    for (byte, pair) in token.0.iter_mut().zip(token_hex.as_bytes().chunks_exact(2)) {
+        *byte = digit(pair[0]) * 16 + digit(pair[1]);
+    }
+    let data = transcript(bootstrap, hello, &challenge.server_nonce);
+    let mut desktop = hmac_sha256(&token.0, &[b"desktop\n", &data])?;
+    let mut supplied = decode_mac(&challenge.proof);
+    let valid = constant_time_equal(&desktop, &supplied);
+    wipe(&mut desktop);
+    wipe(&mut supplied);
+    if !valid { return Err(denied()); }
+    let mut tui = hmac_sha256(&token.0, &[b"tui\n", &data])?;
+    let proof = MacHex(encode_hex(&tui));
+    wipe(&mut tui);
+    Ok(Auth { v: VersionOne, kind: AuthType::Value, proof })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Scope {
@@ -606,7 +629,11 @@ mod tests {
         let data = transcript(&bootstrap(), &hello(), &nonce);
         assert_eq!(String::from_utf8(data.clone()).unwrap(), format!(
             "desktop-cron/pipe-v1\n{SESSION}\n7\n42\n18446744073709551615\n{OWNER}\n99\n123\n0123456789abcdef0123456789abcdef\nfedcba9876543210fedcba9876543210\n"));
-        assert_ne!(hmac_sha256(&[1; 32], &[b"desktop\n", &data]).unwrap(), hmac_sha256(&[1; 32], &[b"tui\n", &data]).unwrap());
+        // Python·Node 표준 구현으로 별도 계산한 합성 시험값이다. 운영 자격이 아니다.
+        assert_eq!(encode_hex(&hmac_sha256(&[1; 32], &[b"desktop\n", &data]).unwrap()),
+            "489d9ff0363b9e57d0c56f6cd896bf72950f2990214236aad9dab4af41aee059");
+        assert_eq!(encode_hex(&hmac_sha256(&[1; 32], &[b"tui\n", &data]).unwrap()),
+            "237a786ed717c860cf61a5ab25289403d012c1b565a322a008141d51f7751679");
     }
 
     #[test]
@@ -735,6 +762,23 @@ mod tests {
         assert!(decode::<Response>(&response(list)).is_err());
         let mut error = response(list_result()); error.as_object_mut().unwrap().remove("result"); error["error"] = json!({"code":{"internal":null}});
         assert!(decode::<Response>(&error).is_err());
+    }
+
+    #[test]
+    fn fixture_client_auth_rejects_noncanonical_secret_and_unverified_desktop_proof() {
+        let (state, mut challenge) = ServerHandshake::begin(SecretToken([7; 32]), &bootstrap(), hello(), 99, 123).unwrap();
+        for invalid_token in [String::new(), "0".repeat(63), "0".repeat(65), "A".repeat(64), "g".repeat(64)] {
+            assert!(fixture_client_auth(&invalid_token, &bootstrap(), &hello(), &challenge).is_err());
+        }
+        let encoded = SecretToken([7; 32]).expose_hex();
+        let original_proof = challenge.proof.clone();
+        challenge.proof = MacHex("0".repeat(64));
+        assert!(fixture_client_auth(encoded.as_str(), &bootstrap(), &hello(), &challenge).is_err());
+        challenge.proof = original_proof;
+        let mut wrong_generation = hello(); wrong_generation.session_generation = DecimalU64::new(8);
+        assert!(fixture_client_auth(encoded.as_str(), &bootstrap(), &wrong_generation, &challenge).is_err());
+        let auth = fixture_client_auth(encoded.as_str(), &bootstrap(), &hello(), &challenge).unwrap();
+        assert_eq!(state.finish(auth).unwrap().owner_instance_id.as_str(), OWNER);
     }
 
 }

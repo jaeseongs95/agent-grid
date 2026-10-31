@@ -102,7 +102,7 @@ struct State {
     queue: VecDeque<Arc<Work>>, active: Option<Arc<Work>>, count: usize, bytes: usize,
     owner: Option<wire::UuidText>, scope: Option<wire::Scope>, pending: Option<Pending>,
     initial_list_reserved: bool, supports_interrupt: bool, closed: bool, finished: bool,
-    failure: Option<String>, worker_returned: bool,
+    failure: Option<String>, cleanup_failure: Option<String>, worker_returned: bool,
 }
 struct Pending { id: wire::UuidText, scope: wire::Scope, body: Arc<Value>, admission: Arc<()>, bytes: usize }
 struct Work {
@@ -114,7 +114,7 @@ enum Stage { Queued, Sending, Expired, Done }
 impl Shared {
     fn new(stopped: Arc<AtomicBool>, pipe_cancel: PipeCancellation) -> Self {
         Self { state: Mutex::new(State { queue: VecDeque::new(), active: None, count: 0, bytes: 0, owner: None, scope: None,
-            pending: None, initial_list_reserved: false, supports_interrupt: false, closed: false, finished: false, failure: None, worker_returned: false }),
+            pending: None, initial_list_reserved: false, supports_interrupt: false, closed: false, finished: false, failure: None, cleanup_failure: None, worker_returned: false }),
             wake: Notify::new(), done: Condvar::new(), stopped, pipe_cancel }
     }
     fn cancel(&self) {
@@ -133,7 +133,7 @@ impl Drop for Completion {
         let mut state = self.0.state.lock().unwrap_or_else(|error| error.into_inner());
         state.closed = true;
         state.supports_interrupt = false;
-        if !state.worker_returned { state.failure = Some("예약 제어 작업이 정상 반환 전에 종료됐습니다.".into()); }
+        if !state.worker_returned { state.cleanup_failure = Some("예약 제어 작업이 정상 반환 전에 종료됐습니다.".into()); }
         if let Some(work) = state.active.take() {
             let sent = *work.stage.lock().unwrap_or_else(|error| error.into_inner()) == Stage::Sending;
             let result = if sent && work.mutation { Ok(unknown()) } else { rejection(work.mutation, "connectionClosed") };
@@ -178,7 +178,7 @@ impl CronConnection {
             if remaining.is_zero() { return Err("예약 제어 작업의 실제 종료를 기한 안에 확인하지 못했습니다.".into()); }
             state = self.shared.done.wait_timeout(state, remaining).map_err(|_| "예약 제어 종료 대기가 손상됐습니다.")?.0;
         }
-        match &state.failure { Some(error) => Err(error.clone()), None => Ok(()) }
+        match &state.cleanup_failure { Some(error) => Err(error.clone()), None => Ok(()) }
     }
     pub(crate) fn request(&self, thread_id: &str, body: CronRequest) -> Result<Value, String> {
         let deadline = Instant::now() + REQUEST_TIMEOUT;
@@ -350,8 +350,10 @@ async fn run(mut pipe: OwnedTuiPipe, bootstrap: wire::Bootstrap, token: wire::Se
     let cancelled = state.closed;
     state.worker_returned = true;
     state.closed = true; state.supports_interrupt = false;
-    // 명시 취소는 정상 종료다. 정리 오류는 취소 여부와 무관하게 보존한다.
-    state.failure = close.err().or_else(|| if cancelled || shared.stopped.load(Ordering::Acquire) { None } else { result.err() });
+    // 인증·통신 기능 실패와 OS 자원 회수 실패는 다른 종료 결과다.
+    // 정상 회수한 기능 실패가 상위 세션의 종료 완료를 막으면 안 된다.
+    state.cleanup_failure = close.err();
+    state.failure = if cancelled || shared.stopped.load(Ordering::Acquire) { None } else { result.err() };
 }
 
 #[cfg(test)]
@@ -472,6 +474,290 @@ mod tests {
         }
         assert!(connection.request(THREAD, CronRequest::List {}).unwrap_err().contains("queueFull"));
         assert_eq!(connection.shared.state.lock().unwrap().count, 0);
+    }
+
+    // 이 결합 시험의 신원 callback은 같은 프로세스 신원만 반환한다.
+    // 실제 PTY Job 소속·PID 재사용 검증은 owned_tui_control의 별도 OS 시험 책임이다.
+    use serde::de::DeserializeOwned;
+    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::windows::named_pipe::{ClientOptions, NamedPipeClient}};
+
+    struct LiveFixture {
+        connection: CronConnection,
+        client: Option<NamedPipeClient>,
+        name: String,
+        owner: String,
+        scope: Value,
+    }
+    async fn fixture_write(client: &mut NamedPipeClient, value: &Value) {
+        let bytes = serde_json::to_vec(value).unwrap();
+        assert!((1..=crate::owned_tui_control::MAX_FRAME_BYTES).contains(&bytes.len()));
+        tokio::time::timeout(FRAME_TIMEOUT, async {
+            // 실제 byte pipe에서 헤더와 본문이 여러 쓰기로 나뉘는 경계도 지난다.
+            let prefix = (bytes.len() as u32).to_le_bytes();
+            client.write_all(&prefix[..2]).await.unwrap();
+            client.write_all(&prefix[2..]).await.unwrap();
+            for chunk in bytes.chunks(7) { client.write_all(chunk).await.unwrap(); }
+        }).await.expect("시험 통로 송신 기한");
+    }
+    async fn fixture_read<T: DeserializeOwned>(client: &mut NamedPipeClient) -> Result<T, String> {
+        tokio::time::timeout(FRAME_TIMEOUT, async {
+            let mut prefix = [0; 4];
+            client.read_exact(&mut prefix).await.map_err(|_| "시험 통로의 헤더 수신 실패".to_owned())?;
+            let length = u32::from_le_bytes(prefix) as usize;
+            if !(1..=crate::owned_tui_control::MAX_FRAME_BYTES).contains(&length) { return Err("시험 통로의 프레임 크기 오류".into()); }
+            let mut bytes = vec![0; length];
+            client.read_exact(&mut bytes).await.map_err(|_| "시험 통로의 본문 수신 실패".to_owned())?;
+            wire::from_json::<T>(&bytes)
+        }).await.map_err(|_| "시험 통로 수신 기한 초과".to_owned())?
+    }
+    fn begin_live_request(connection: &CronConnection, body: CronRequest) -> tokio::task::JoinHandle<Result<Value, String>> {
+        let connection = connection.clone();
+        // 동기 공개 호출이 입출력 실행기의 진행을 막지 않도록 시험 호출자만 blocking pool에서 실행한다.
+        tokio::task::spawn_blocking(move || connection.request(THREAD, body))
+    }
+    impl LiveFixture {
+        async fn connect(wrong_proof: bool) -> Self {
+            let pipe = OwnedTuiPipe::bind().unwrap();
+            let name = pipe.name().to_owned();
+            let identity = OwnedProcessIdentity::current().unwrap().identity();
+            let session = uuid::Uuid::new_v4().to_string();
+            let owner = uuid::Uuid::new_v4().to_string();
+            let bootstrap = wire::Bootstrap::new(&name, identity.pid, identity.created_filetime, &session, 1).unwrap();
+            let token = wire::SecretToken::generate().unwrap();
+            let token_hex = token.expose_hex();
+            let preparation = CronPreparation { pipe, bootstrap: bootstrap.clone(), token, cancelled: Arc::new(AtomicBool::new(false)) };
+            let connection = preparation.start(Arc::new(move |_| Ok(identity))).unwrap();
+            let client = ClientOptions::new().open(&name).unwrap();
+            let mut fixture = Self { connection, client: Some(client), name, owner: owner.clone(), scope: json!({
+                "backendId":uuid::Uuid::new_v4().to_string(),"backendEpoch":"1","threadId":THREAD
+            }) };
+            let hello_value = json!({"v":1,"type":"hello","sessionId":session,"sessionGeneration":"1",
+                "ownerInstanceId":owner,"clientPid":identity.pid,"clientCreatedFiletime":identity.created_filetime.to_string(),
+                "clientNonce":"0123456789abcdef0123456789abcdef"});
+            let hello: wire::Hello = serde_json::from_value(hello_value.clone()).unwrap();
+            fixture_write(fixture.client.as_mut().unwrap(), &hello_value).await;
+            let challenge: wire::Challenge = fixture_read(fixture.client.as_mut().unwrap()).await.unwrap();
+            let auth = wire::fixture_client_auth(token_hex.as_str(), &bootstrap, &hello, &challenge).unwrap();
+            let mut auth_value = serde_json::to_value(auth).unwrap();
+            if wrong_proof {
+                let proof = auth_value["proof"].as_str().unwrap();
+                let replacement = if proof.starts_with('0') { "1" } else { "0" };
+                auth_value["proof"] = json!(format!("{replacement}{}", &proof[1..]));
+            }
+            fixture_write(fixture.client.as_mut().unwrap(), &auth_value).await;
+            if wrong_proof {
+                assert!(fixture_read::<wire::Ready>(fixture.client.as_mut().unwrap()).await.is_err());
+                fixture.await_finished().await;
+            } else {
+                let ready: wire::Ready = fixture_read(fixture.client.as_mut().unwrap()).await.unwrap();
+                assert_eq!(ready.owner_instance_id.as_str(), fixture.owner);
+                let until = Instant::now() + FRAME_TIMEOUT;
+                while fixture.connection.shared.state.lock().unwrap().owner.is_none() {
+                    assert!(Instant::now() < until, "인증 뒤 소유 상태 공개 기한 초과");
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+            fixture
+        }
+        async fn read_request(&mut self) -> Value {
+            fixture_read::<Value>(self.client.as_mut().unwrap()).await.unwrap()
+        }
+        fn envelope(&self, request: &Value, result: Value) -> Value {
+            json!({"v":1,"type":"response","id":request["id"],"ownerInstanceId":self.owner,"scope":self.scope,"result":result})
+        }
+        async fn respond(&mut self, request: &Value, result: Value) {
+            let envelope = self.envelope(request, result);
+            fixture_write(self.client.as_mut().unwrap(), &envelope).await;
+        }
+        fn list_result(&self, supports_interrupt: bool) -> Value {
+            json!({"supported":true,"connected":true,"scope":"cliLifetime","jobs":[],"hasMore":false,
+                "supportsExpectedTurnInterrupt":supports_interrupt})
+        }
+        async fn bind_scope(&mut self, supports_interrupt: bool) {
+            let request = begin_live_request(&self.connection, CronRequest::List {});
+            let frame = self.read_request().await;
+            assert_eq!(frame["type"], "request");
+            assert_eq!(frame["targetThreadId"], THREAD);
+            assert!(frame["scope"].is_null());
+            self.respond(&frame, self.list_result(supports_interrupt)).await;
+            assert_eq!(request.await.unwrap().unwrap()["connected"], true);
+        }
+        async fn no_request_bytes(&mut self) {
+            let mut byte = [0];
+            let result = tokio::time::timeout(Duration::from_millis(30), self.client.as_mut().unwrap().read(&mut byte)).await;
+            assert!(result.is_err(), "로컬 거절 또는 확정 뒤 재송신이 통로 바이트를 만들었습니다.");
+        }
+        async fn await_finished(&self) {
+            let until = Instant::now() + FRAME_TIMEOUT;
+            while !self.connection.shared.state.lock().unwrap().finished {
+                assert!(Instant::now() < until, "실제 제어 작업 종료 기한 초과");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            self.connection.wait_until(Instant::now()).expect("기능 실패 뒤에도 정상 회수한 작업의 종료는 성공해야 합니다.");
+        }
+    }
+    impl Drop for LiveFixture {
+        fn drop(&mut self) {
+            self.connection.cancel();
+            drop(self.client.take());
+            // 통신 기능의 성공 여부와 별도로 실제 작업·핸들의 회수를 기다린다.
+            let _ = self.connection.wait_until(Instant::now() + FRAME_TIMEOUT);
+            if !std::thread::panicking() {
+                assert!(self.connection.shared.state.lock().unwrap().finished, "시험 제어 작업을 회수하지 못했습니다.");
+            }
+        }
+    }
+    fn live_add() -> (CronRequest, Value) {
+        let value = json!({"type":"add","requestId":uuid::Uuid::new_v4().to_string(),
+            "schedule":{"type":"every","seconds":10},"prompt":"  원문\n두 번째 줄  \t"});
+        (serde_json::from_value(value.clone()).unwrap(), value)
+    }
+    #[test]
+    fn cron_control_real_pipe_auth_list_cancel_gate_and_exact_add_round_trip() {
+        tauri::async_runtime::block_on(async {
+            let mut fixture = LiveFixture::connect(false).await;
+            fixture.bind_scope(false).await;
+            let cancel = CronRequest::Cancel { request_id: uuid::Uuid::new_v4().to_string(), job_id: "1".into() };
+            assert_eq!(fixture.connection.request(THREAD, cancel).unwrap()["status"], "unsupported");
+            fixture.no_request_bytes().await;
+            let (body, expected) = live_add();
+            let request = begin_live_request(&fixture.connection, body);
+            let frame = fixture.read_request().await;
+            assert_eq!(frame["body"], expected);
+            assert_eq!(frame["id"], expected["requestId"]);
+            assert_eq!(frame["scope"], fixture.scope);
+            fixture.respond(&frame, json!({"status":"applied","jobId":"1"})).await;
+            assert_eq!(request.await.unwrap().unwrap()["status"], "applied");
+            assert!(fixture.connection.shared.state.lock().unwrap().pending.is_none());
+            fixture.no_request_bytes().await;
+        });
+    }
+    #[test]
+    fn cron_control_real_pipe_disconnect_keeps_unknown_without_reconnection() {
+        tauri::async_runtime::block_on(async {
+            let mut fixture = LiveFixture::connect(false).await;
+            fixture.bind_scope(false).await;
+            let (body, expected) = live_add();
+            let request = begin_live_request(&fixture.connection, body);
+            let frame = fixture.read_request().await;
+            assert_eq!(frame["body"], expected);
+            drop(fixture.client.take());
+            assert_eq!(request.await.unwrap().unwrap()["status"], "unknown");
+            fixture.await_finished().await;
+            assert_eq!(fixture.connection.request(THREAD, add()).unwrap()["reason"], "unresolvedMutation");
+            assert_eq!(fixture.connection.request(THREAD, CronRequest::List {}).unwrap()["mutationState"], "unknown");
+            assert_eq!(fixture.connection.shared.state.lock().unwrap().pending.as_ref().unwrap().body.as_ref(), &expected);
+            assert!(ClientOptions::new().open(&fixture.name).is_err(), "종료된 일회 통로를 다시 열면 안 됩니다.");
+        });
+    }
+    #[test]
+    fn cron_control_real_pipe_unknown_resolves_only_with_exact_explicit_receipt() {
+        tauri::async_runtime::block_on(async {
+            let mut fixture = LiveFixture::connect(false).await;
+            fixture.bind_scope(false).await;
+            let (body, expected) = live_add();
+            let request = begin_live_request(&fixture.connection, body);
+            let frame = fixture.read_request().await;
+            fixture.respond(&frame, json!({"status":"unknown"})).await;
+            assert_eq!(request.await.unwrap().unwrap()["status"], "unknown");
+            assert_eq!(fixture.connection.request(THREAD, add()).unwrap()["reason"], "unresolvedMutation");
+            for clear in [false, true] {
+                let list = begin_live_request(&fixture.connection, CronRequest::List {});
+                let frame = fixture.read_request().await;
+                assert_eq!(frame["scope"], fixture.scope);
+                assert_eq!(frame["reconcile"]["request"], expected);
+                let mut result = fixture.list_result(false);
+                result["mutationState"] = json!(if clear { "clear" } else { "unknown" });
+                if clear { result["reconciledRequestId"] = expected["requestId"].clone(); }
+                fixture.respond(&frame, result).await;
+                assert_eq!(list.await.unwrap().unwrap()["mutationState"], if clear { "clear" } else { "unknown" });
+                assert_eq!(fixture.connection.shared.state.lock().unwrap().pending.is_none(), clear);
+            }
+            let (body, _) = live_add();
+            let request = begin_live_request(&fixture.connection, body);
+            let frame = fixture.read_request().await;
+            fixture.respond(&frame, json!({"status":"applied","jobId":"2"})).await;
+            assert_eq!(request.await.unwrap().unwrap()["status"], "applied");
+        });
+    }
+    #[test]
+    fn cron_control_real_pipe_wrong_response_binding_never_confirms_mutation() {
+        tauri::async_runtime::block_on(async {
+            for field in ["ownerInstanceId", "scope", "id"] {
+                let mut fixture = LiveFixture::connect(false).await;
+                fixture.bind_scope(false).await;
+                let (body, _) = live_add();
+                let request = begin_live_request(&fixture.connection, body);
+                let frame = fixture.read_request().await;
+                let mut response = fixture.envelope(&frame, json!({"status":"applied","jobId":"1"}));
+                if field == "scope" { response["scope"]["backendEpoch"] = json!("2"); }
+                else { response[field] = json!(uuid::Uuid::new_v4().to_string()); }
+                fixture_write(fixture.client.as_mut().unwrap(), &response).await;
+                assert_eq!(request.await.unwrap().unwrap()["status"], "unknown");
+                fixture.await_finished().await;
+                assert!(fixture.connection.shared.state.lock().unwrap().pending.is_some());
+                assert_eq!(fixture.connection.request(THREAD, add()).unwrap()["reason"], "unresolvedMutation");
+            }
+        });
+    }
+    #[test]
+    fn cron_control_real_pipe_wrong_auth_proof_never_enables_requests() {
+        tauri::async_runtime::block_on(async {
+            let fixture = LiveFixture::connect(true).await;
+            assert!(fixture.connection.shared.state.lock().unwrap().owner.is_none());
+            assert_eq!(fixture.connection.request(THREAD, add()).unwrap()["status"], "notApplied");
+            assert_eq!(fixture.connection.request(THREAD, CronRequest::List {}).unwrap()["connected"], false);
+            assert!(fixture.connection.shared.state.lock().unwrap().pending.is_none());
+        });
+    }
+
+    #[test]
+    fn cron_control_real_pipe_unrelated_receipt_cannot_clear_unknown() {
+        tauri::async_runtime::block_on(async {
+            let mut fixture = LiveFixture::connect(false).await;
+            fixture.bind_scope(false).await;
+            let (body, expected) = live_add();
+            let request = begin_live_request(&fixture.connection, body);
+            let frame = fixture.read_request().await;
+            fixture.respond(&frame, json!({"status":"unknown"})).await;
+            assert_eq!(request.await.unwrap().unwrap()["status"], "unknown");
+            let list = begin_live_request(&fixture.connection, CronRequest::List {});
+            let frame = fixture.read_request().await;
+            assert_eq!(frame["reconcile"]["request"], expected);
+            let mut result = fixture.list_result(false);
+            result["mutationState"] = json!("clear");
+            result["reconciledRequestId"] = json!(uuid::Uuid::new_v4().to_string());
+            fixture.respond(&frame, result).await;
+            assert!(list.await.unwrap().is_err());
+            fixture.await_finished().await;
+            assert!(fixture.connection.shared.state.lock().unwrap().pending.is_some());
+            assert_eq!(fixture.connection.request(THREAD, add()).unwrap()["reason"], "unresolvedMutation");
+        });
+    }
+
+    #[test]
+    fn cron_control_wait_distinguishes_feature_failure_cleanup_failure_and_incomplete_worker() {
+        let connection = fixture();
+        assert!(connection.wait_until(Instant::now()).is_err());
+        {
+            let mut state = connection.shared.state.lock().unwrap();
+            state.finished = true;
+            state.failure = Some("시험 인증 실패".into());
+        }
+        connection.wait_until(Instant::now()).expect("정상 회수한 기능 실패는 세션 종료를 막으면 안 됩니다.");
+        {
+            let mut state = connection.shared.state.lock().unwrap();
+            state.cleanup_failure = Some("시험 통로 회수 실패".into());
+        }
+        assert_eq!(connection.wait_until(Instant::now()).unwrap_err(), "시험 통로 회수 실패");
+    }
+    #[test]
+    fn cron_control_abnormal_worker_completion_remains_a_cleanup_error() {
+        let connection = fixture();
+        connection.shared.state.lock().unwrap().worker_returned = false;
+        drop(Completion(connection.shared.clone()));
+        assert!(connection.shared.state.lock().unwrap().finished);
+        assert!(connection.wait_until(Instant::now()).unwrap_err().contains("정상 반환 전에"));
     }
 
 }
