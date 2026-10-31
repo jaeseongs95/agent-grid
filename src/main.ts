@@ -52,6 +52,9 @@ let initialization: Promise<void> = Promise.resolve();
 let runtimePreparation: Promise<void> | undefined;
 let runtimeRestoration: Promise<void> | undefined;
 let runtimeReady = !native;
+let runtimeGeneration = 0;
+let runtimeCommand: Promise<void> | undefined;
+let executableMutation: Promise<unknown> | undefined;
 const restoringRequests = new Map<SavedSession, Promise<SessionInfo>>();
 const startOperations = new Set<Promise<SessionInfo>>();
 // Failed shutdown events must not erase the restart intent saved before stopping.
@@ -318,16 +321,32 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
 }
 
 function prepareRuntime(): Promise<void> {
-  if (!native) return Promise.resolve();
+  if (!native || exitInProgress) return Promise.resolve();
   if (runtimePreparation) return runtimePreparation;
+  const generation = runtimeGeneration;
+  const mutation = executableMutation;
   $('#runtime-banner').hidden = false;
   const retry = $<HTMLButtonElement>('#runtime-retry'); retry.hidden = true; retry.disabled = true;
   bindText($('#runtime-status'), '공유서버를 준비하는 중… 준비되면 이전 세션을 복원합니다.', 'Preparing the shared server… Saved sessions will resume when it is ready.');
-  runtimePreparation = call<void>('prepare_runtime').then(() => {
+  const operation = Promise.resolve().then(async () => {
+    // A settings command can save its selection before its IPC response arrives.
+    if (mutation) await mutation.catch(() => {});
+    // The native startup operation has one owner; invalidation is not cancellation.
+    if (runtimeCommand) await runtimeCommand.catch(() => {});
+    if (generation !== runtimeGeneration || exitInProgress) return;
+    const command = call<void>('prepare_runtime'); runtimeCommand = command;
+    try { await command; }
+    finally { if (runtimeCommand === command) runtimeCommand = undefined; }
+  });
+  runtimePreparation = operation.then(() => {
+    if (generation !== runtimeGeneration) return prepareRuntime();
+    if (exitInProgress) { runtimePreparation = undefined; return; }
     $('#runtime-banner').hidden = true;
     runtimeReady = true;
     weeklyUsage.setVisible(nativeWindowVisible);
   }, error => {
+    if (generation !== runtimeGeneration) return prepareRuntime();
+    if (exitInProgress) { runtimePreparation = undefined; return; }
     bindText($('#runtime-status'), `공유서버 준비 실패: ${message(error, 'ko')}`, `Could not prepare the shared server: ${message(error, 'en')}`);
     bindText(retry, '다시 시도', 'Retry'); retry.hidden = false; retry.disabled = false;
     throw error;
@@ -845,9 +864,17 @@ $('.sidebar').append(weeklyUsage.element);
 bindText($('#extensions-open-label'), '플러그인·스킬', 'Plugins & skills');
 $('#extensions-open').onclick = () => extensionsManager.open(selectedProjectCwd());
 const executableSettings = createExecutableSettings(async <T>(command: string, args?: Record<string, unknown>) => {
-  const result = await call<T>(command, args);
-  if (result && ['choose_codex_executable', 'set_codex_executable'].includes(command)) weeklyUsage.refresh();
-  return result;
+  if (!['choose_codex_executable', 'set_codex_executable'].includes(command)) return call<T>(command, args);
+  runtimeGeneration++; runtimePreparation = undefined; runtimeReady = false;
+  weeklyUsage.setVisible(false); weeklyUsage.refresh();
+  const mutation = call<T>(command, args); executableMutation = mutation;
+  try { return await mutation; }
+  finally {
+    if (executableMutation === mutation) {
+      executableMutation = undefined;
+      if (workspaceReady && !exitInProgress) void prepareRuntime().then(() => resumeWorkspace()).catch(error => notifyError('공유서버 준비 실패', 'Could not prepare the shared server', error));
+    }
+  }
 });
 $('#codex-settings-open').onclick = () => void executableSettings.open();
 $('#settings-open').onclick = () => $<HTMLDialogElement>('#settings-dialog').showModal();
@@ -889,6 +916,8 @@ async function start(request: SavedSession, focus = true) {
       if (sessions.size + saved.length - pendingRestoreOwnerIds().size + pendingStarts - Number(saved.includes(request)) >= MAX_SAVED_WORKSPACE_SESSIONS) throw new UiError('저장 메타데이터는 최대 512개입니다. 저장 목록에서 불필요한 항목을 제거한 뒤 다시 시도하세요.', 'Workspace metadata is limited to 512 entries. Remove unused saved entries and retry.');
       pendingStarts++; reserved = true;
       try {
+        // Ownership refreshes above may have yielded while the executable changed.
+        await prepareRuntime();
         if (exitInProgress) throw new UiError('앱 종료 중에는 세션을 시작할 수 없습니다.', 'Cannot start a session while the app is exiting.');
         const info = await call<SessionInfo>('start_session', { request: { title: request.title, cwd: request.cwd, ...(request.threadId ? { threadId: request.threadId } : {}), ...(request.projectAssigned || request.projectId !== undefined ? { projectId: request.projectId ?? null, projectAssigned: true } : {}), cols: 100, rows: 30 } });
         if (!info.active || (sessions.get(info.id)?.generation ?? -1) < info.generation) receiveSession(info);
