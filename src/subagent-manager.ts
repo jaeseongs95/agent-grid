@@ -26,7 +26,7 @@ export function createSubagentManager(host: Host) {
   dialog.innerHTML = `<div class="dialog-heading"><h2 id="subagent-title"></h2><button class="subagent-close icon-button" type="button">×</button></div>
     <p class="subagent-session"></p><p class="subagent-help"></p>
     <div class="subagent-toolbar"><button class="subagent-refresh quiet-button" type="button"></button><span class="subagent-status" role="status" aria-live="polite"></span></div>
-    <p class="subagent-error inline-error" role="alert" hidden></p><p class="subagent-unknown" role="status" hidden></p>
+    <p class="subagent-error inline-error" role="alert" hidden></p><p class="subagent-unknown" role="status" hidden></p><p class="subagent-remote-unknown" role="status" hidden></p>
     <div class="subagent-columns"><section class="subagent-browser"><label class="subagent-search-label"><span></span><input class="subagent-search" type="search" maxlength="512"></label>
     <div class="subagent-list"></div><div class="subagent-pages"><button class="subagent-first quiet-button" type="button"></button><button class="subagent-next quiet-button" type="button"></button><span class="subagent-page"></span></div><p class="subagent-limit" hidden></p></section>
     <section class="subagent-detail"><p class="subagent-empty-detail"></p><div class="subagent-fields" hidden><h3 class="subagent-name"></h3><p class="subagent-id"></p><dl></dl>
@@ -42,7 +42,7 @@ export function createSubagentManager(host: Host) {
   const unresolved = new Map<string, { requestId: string; expectedParentRuntimeId: string; expectedRuntimeId: string | null }>();
   let selected: Session | undefined; let agentId: string | undefined; let agents: Agent[] = [];
   let parentRuntimeId: string | undefined;
-  let available = false; let supported = false; let connected = false; let fresh = false; let knownList = false;
+  let available = false; let supported = false; let connected = false; let fresh = false; let knownList = false; let remoteUnknown = false;
   let visible = true; let exiting = false; let disposed = false; let epoch = 0;
   let request: Promise<void> | undefined; let reading = false; let timer: ReturnType<typeof setTimeout> | undefined;
   let cursor: string | null = null; let nextCursor: string | null = null; let page = 1; let overflow = false; let confirming = false;
@@ -55,7 +55,7 @@ export function createSubagentManager(host: Host) {
   function error(ko: string, en: string) { bindText($('.subagent-error'), ko, en); $('.subagent-error').hidden = false; }
   function controls() {
     const agent = currentAgent();
-    const eligible = !!selected && live(epoch) && supported && connected && fresh && validUuid(parentRuntimeId) && !uncertain() && unresolved.size < MAX_WORKSPACE_SESSIONS;
+    const eligible = !!selected && live(epoch) && supported && connected && fresh && validUuid(parentRuntimeId) && !uncertain() && !remoteUnknown && unresolved.size < MAX_WORKSPACE_SESSIONS;
     const ready = eligible && !request;
     prompt.disabled = !eligible || (!!request && !reading) || !agent?.capabilities.send;
     $<HTMLButtonElement>('.subagent-send').disabled = !ready || !agent?.capabilities.send;
@@ -67,6 +67,7 @@ export function createSubagentManager(host: Host) {
     $<HTMLButtonElement>('.subagent-first').disabled = !readyToRead() || cursor === null;
     $<HTMLButtonElement>('.subagent-next').disabled = !readyToRead() || !fresh || !nextCursor;
     $('.subagent-unknown').hidden = !uncertain();
+    $('.subagent-remote-unknown').hidden = !remoteUnknown;
     $('.subagent-confirm').hidden = !confirming || !agent;
     dialog.setAttribute('aria-busy', String(!!request));
   }
@@ -132,7 +133,10 @@ export function createSubagentManager(host: Host) {
       try {
         const value = await rpc<List>(session, { type: 'list', cursor: targetCursor }); if (!live(version)) return;
         validate(value); supported = value.supported; connected = value.connected; fresh = supported && connected;
+        if (!fresh) remoteUnknown = false;
         if (fresh) {
+          if (value.mutationState === 'unknown') remoteUnknown = true;
+          else if (value.mutationState === 'clear') remoteUnknown = false;
           parentRuntimeId = value.parentRuntimeId ?? undefined;
           agents = value.agents.slice(0, LIMIT).filter(agent => agent.parentThreadId === session.threadId).map(agent => ({ id: agent.id, parentThreadId: agent.parentThreadId, runtimeId: agent.runtimeId, nickname: agent.nickname, role: agent.role, status: agent.status, model: agent.model, effort: agent.effort, activeTurnId: agent.activeTurnId, capabilities: { send: agent.capabilities.send, interrupt: agent.capabilities.interrupt, close: agent.capabilities.close, resume: agent.capabilities.resume } }));
           cursor = targetCursor; page = targetPage; nextCursor = value.nextCursor || null; overflow = value.agents.length > LIMIT; knownList = true; confirming = false;
@@ -146,14 +150,14 @@ export function createSubagentManager(host: Host) {
         else status('하위 에이전트 목록을 확인했습니다.', 'Subagent list confirmed.');
         render();
       } catch {
-        if (live(version)) { fresh = false; error('목록을 불러오지 못했습니다. 연결을 확인하고 새로고침하세요. 마지막 목록과 초안은 보존합니다.', 'Could not load subagents. Check the connection and refresh. The last list and draft are preserved.'); controls(); }
+        if (live(version)) { fresh = false; remoteUnknown = false; error('목록을 불러오지 못했습니다. 연결을 확인하고 새로고침하세요. 마지막 목록과 초안은 보존합니다.', 'Could not load subagents. Check the connection and refresh. The last list and draft are preserved.'); controls(); }
       }
     }, true);
   }
   function mutate(type: Action) {
     const session = selected; const agent = currentAgent(); const version = epoch; const text = prompt.value;
     const expectedParentRuntimeId = parentRuntimeId;
-    if (!session || !agent || !live(version) || request || !fresh || !supported || !connected || uncertain() || unresolved.size >= MAX_WORKSPACE_SESSIONS || !agent.capabilities[type] || agent.parentThreadId !== session.threadId || !validUuid(expectedParentRuntimeId) || (agent.runtimeId !== null && !validUuid(agent.runtimeId))) return Promise.resolve();
+    if (!session || !agent || !live(version) || request || !fresh || !supported || !connected || uncertain() || remoteUnknown || unresolved.size >= MAX_WORKSPACE_SESSIONS || !agent.capabilities[type] || agent.parentThreadId !== session.threadId || !validUuid(expectedParentRuntimeId) || (agent.runtimeId !== null && !validUuid(agent.runtimeId))) return Promise.resolve();
     if (type === 'interrupt' && (agent.status !== 'running' || !validText(agent.activeTurnId))) return Promise.resolve();
     if (type === 'close' && !confirming) return Promise.resolve();
     if (type === 'send' && (!text.trim() || text.includes('\0') || new TextEncoder().encode(text).byteLength > 65536)) { error('보낼 내용을 입력하세요. UTF-8 기준 64 KiB까지 보낼 수 있습니다.', 'Enter a message, up to 64 KiB in UTF-8.'); return Promise.resolve(); }
@@ -178,7 +182,7 @@ export function createSubagentManager(host: Host) {
   }
   function clear() {
     epoch++; selected = undefined; agentId = undefined; parentRuntimeId = undefined; available = false; agents = []; rows.clear();
-    supported = false; connected = false; fresh = false; knownList = false; cursor = null; nextCursor = null; page = 1; overflow = false; confirming = false;
+    supported = false; connected = false; fresh = false; knownList = false; remoteUnknown = false; cursor = null; nextCursor = null; page = 1; overflow = false; confirming = false;
     clearTimeout(timer); prompt.value = ''; search.value = ''; $('.subagent-error').hidden = true; status('', ''); render();
   }
   const onClose = () => { if (!dialog.open) clear(); };
@@ -196,6 +200,7 @@ export function createSubagentManager(host: Host) {
   const labels: [string, string, string][] = [
     ['#subagent-title', '하위 에이전트', 'Subagents'], ['.subagent-help', '선택한 세션의 직접 하위 에이전트만 조회합니다. 전체 대화는 불러오지 않습니다.', 'View direct subagents of the selected session. Full conversations are not loaded.'],
     ['.subagent-refresh', '새로고침', 'Refresh'], ['.subagent-unknown', '이 세션에 결과 미확인 요청이 있습니다. 같은 요청의 처리 여부가 확인될 때까지 새 변경을 제한합니다.', 'This session has an unresolved request. New changes remain blocked until that request is reconciled.'],
+    ['.subagent-remote-unknown', '다른 관리 요청의 결과를 확인하고 있습니다. 새로고침하여 확인이 끝난 뒤 변경할 수 있습니다.', 'Another management request is being checked. Refresh to confirm it has been resolved before making changes.'],
     ['.subagent-search-label span', '현재 페이지 검색', 'Search this page'], ['.subagent-first', '처음', 'First'], ['.subagent-next', '다음', 'Next'], ['.subagent-limit', '한 페이지에 최대 100개만 표시합니다.', 'At most 100 agents are displayed per page.'],
     ['.subagent-empty-detail', '목록에서 에이전트를 선택하세요.', 'Select an agent from the list.'], ['.subagent-prompt-label', '보낼 내용', 'Message'], ['.subagent-send', '보내기', 'Send'], ['.subagent-interrupt', '현재 작업 중단', 'Interrupt current turn'], ['.subagent-resume', '재개', 'Resume'], ['.subagent-end', '에이전트 종료', 'Close agent'],
     ['.subagent-confirm p', '이 에이전트와 하위 에이전트의 작업이 중단됩니다. 저장된 대화를 삭제하지 않습니다. 종료를 요청할까요?', 'This agent and its subagents will be interrupted. Saved conversations will not be deleted. Request closure?'], ['.subagent-confirm-end', '종료 요청 확인', 'Confirm closure'], ['.subagent-confirm-cancel', '취소', 'Cancel'],
@@ -211,7 +216,7 @@ export function createSubagentManager(host: Host) {
     },
     updateSessions(sessions: Session[]) {
       const current = selected && sessions.find(session => key(session) === key(selected!) && session.active);
-      if (selected && !current) { epoch++; available = false; fresh = false; confirming = false; agents = []; agentId = undefined; rows.clear(); clearTimeout(timer); status('원래 세션이 종료되거나 바뀌었습니다. 창을 다시 열어 현재 세션을 확인하세요.', 'The original session ended or changed. Reopen to select the current session.'); render(); }
+      if (selected && !current) { epoch++; available = false; fresh = false; remoteUnknown = false; confirming = false; agents = []; agentId = undefined; rows.clear(); clearTimeout(timer); status('원래 세션이 종료되거나 바뀌었습니다. 창을 다시 열어 현재 세션을 확인하세요.', 'The original session ended or changed. Reopen to select the current session.'); render(); }
     },
     setVisible(value: boolean) { if (visible === value || disposed) return; visible = value; epoch++; clearTimeout(timer); controls(); if (visible && dialog.open && !document.hidden) void refresh(); },
     async beginExit() { exiting = true; if (dialog.open) dialog.close(); clear(); await request; controls(); },

@@ -93,6 +93,48 @@ test('지원되는 실제 목록의 null 정합화 식별자를 허용하고 잘
   expect(await mutations(page)).toEqual([]);
 });
 
+test('다른 관리 요청 결과가 미확인이면 전송하지 않고 명시적 clear 목록 뒤에만 허용한다', async ({ page }) => {
+  await fixture(page); await page.locator('.subagent-prompt').fill('확인 후 한 번 전송');
+  await page.evaluate(() => { (window as any).subagentFixture.snapshot.mutationState = 'unknown'; });
+  await refresh(page);
+  await expect(page.locator('.subagent-unknown')).toBeHidden();
+  await expect(page.locator('.subagent-remote-unknown')).toContainText('다른 관리 요청');
+  await expect(page.locator('.subagent-remote-unknown')).toBeVisible();
+  for (const selector of ['.subagent-send', '.subagent-interrupt', '.subagent-resume', '.subagent-end']) {
+    await expect(page.locator(selector)).toBeDisabled();
+    await page.locator(selector).evaluate(button => button.dispatchEvent(new MouseEvent('click', { bubbles: true })));
+  }
+  await submit(page); expect(await mutations(page)).toEqual([]);
+  await page.evaluate(() => { delete (window as any).subagentFixture.snapshot.mutationState; });
+  await refresh(page); await expect(page.locator('.subagent-send')).toBeDisabled();
+  await expect(page.locator('.subagent-remote-unknown')).toBeVisible();
+  await submit(page); expect(await mutations(page)).toEqual([]);
+  await page.evaluate(() => { (window as any).subagentFixture.snapshot.mutationState = 'clear'; });
+  await refresh(page); await expect(page.locator('.subagent-remote-unknown')).toBeHidden();
+  await expect(page.locator('.subagent-send')).toBeEnabled(); await page.locator('.subagent-send').click();
+  await expect.poll(async () => (await mutations(page)).length).toBe(1);
+  await expect(page.locator('.subagent-unknown')).toBeHidden();
+});
+
+test('원격 미확인 안내는 미지원·연결 실패·세션 전환·닫힘에서 정리한다', async ({ page }) => {
+  await fixture(page);
+  for (const mode of ['unsupported', 'disconnected', 'failure', 'switch', 'close']) {
+    await page.evaluate(() => { const data = (window as any).subagentFixture; data.failRead = false; Object.assign(data.snapshot, { supported: true, connected: true, mutationState: 'unknown' }); });
+    await refresh(page); await expect(page.locator('.subagent-remote-unknown')).toBeVisible();
+    if (mode === 'switch') {
+      await page.evaluate(async () => { const state = window as any; const data = state.subagentFixture; data.session = { ...data.session, id: 'session-b', generation: data.session.generation + 1 }; data.snapshot.mutationState = 'clear'; await state.subagentManager.open(data.session); });
+      await expect(page.locator('.subagent-send')).toBeEnabled();
+    } else if (mode === 'close') {
+      await page.locator('.subagent-close').click();
+    } else {
+      await page.evaluate(mode => { const data = (window as any).subagentFixture; if (mode === 'unsupported') data.snapshot.supported = false; else if (mode === 'disconnected') data.snapshot.connected = false; else data.failRead = true; }, mode);
+      await refresh(page); await expect(page.locator('.subagent-send')).toBeDisabled();
+    }
+    await expect(page.locator('.subagent-remote-unknown')).toBeHidden();
+  }
+  expect(await mutations(page)).toEqual([]);
+});
+
 test('직접 부모가 같은 에이전트만 표시하고 선택된 식별자로 전송한다', async ({ page }) => {
   await fixture(page, { count: 3 });
   await page.evaluate(() => {
