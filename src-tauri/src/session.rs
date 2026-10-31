@@ -275,12 +275,28 @@ impl Session {
     }
 }
 
+#[derive(Default)]
+struct RuntimeSelection {
+    generation: u64,
+    preparation: u64,
+    executable: Option<std::ffi::OsString>,
+    ready: bool,
+    preparing: bool,
+    changing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeSnapshot { generation: u64, executable: std::ffi::OsString }
+#[derive(Debug)]
+struct PreparedRuntime { selection: RuntimeSnapshot, preparation: u64 }
+
 struct EngineInner {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     store: Arc<Mutex<Store>>,
     sink: EventSink,
     exiting: Arc<AtomicBool>,
     attachments: crate::conversation_attachments::ConversationAttachments,
+    runtime: Mutex<RuntimeSelection>,
 }
 
 #[derive(Clone)]
@@ -298,7 +314,7 @@ impl Engine {
         for info in saved {
             sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone(), attachments:attachments.clone() }));
         }
-        Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: Arc::new(AtomicBool::new(false)), attachments }) })
+        Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: Arc::new(AtomicBool::new(false)), attachments, runtime: Mutex::new(RuntimeSelection::default()) }) })
     }
 
     fn allocate(&self, request: &StartRequest) -> Result<Arc<Session>, String> {
@@ -348,7 +364,9 @@ impl Engine {
         let weak = Arc::downgrade(&session);
         let on_event = Arc::new(move |event| { if let Some(session) = weak.upgrade() { session.observe(event); } });
         let info = session.info()?;
-        let adapter = match self.codex_executable().and_then(|exe| codex::prepare_with_cancellation(&exe, Path::new(&info.cwd), info.thread_id.as_deref(), on_event, session.stop_requested.clone())) {
+        let adapter = match self.runtime_snapshot().and_then(|selected| self.prepare_start_with(selected, &session.stop_requested,
+            |exe| codex::prepare_runtime_with_executable(exe, &session.stop_requested),
+            |exe| codex::prepare_with_cancellation(exe, Path::new(&info.cwd), info.thread_id.as_deref(), on_event, session.stop_requested.clone()))) {
             Ok(adapter) => adapter,
             Err(error) => { session.finish("error")?; return Err(error); }
         };
@@ -617,7 +635,7 @@ impl Engine {
         // Validate before changing the existing value. Cancel and invalid saves
         // cannot discard a working configuration or restart live sessions.
         let selected = path.map(|path| crate::codex_settings::validate(Path::new(path))).transpose()?;
-        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.set_codex_executable(selected.as_deref())?;
+        self.change_runtime_selection_with(|| self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.set_codex_executable(selected.as_deref()))?;
         // Reset is successful even when its environment/PATH fallback is absent.
         // Return that resolution failure as status, never as a failed save.
         Ok(crate::codex_settings::resolve(selected.as_deref()))
@@ -625,10 +643,91 @@ impl Engine {
 
     fn codex_executable(&self) -> Result<std::ffi::OsString, String> { self.get_codex_settings()?.executable() }
 
+    fn change_runtime_selection_with(&self, save: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        {
+            let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+            if runtime.changing { return Err("실행파일 설정을 저장 중입니다. 잠시 후 다시 시도하세요.".into()); }
+            if runtime.generation == u64::MAX { return Err("실행파일 선택 세대 한도에 도달했습니다.".into()); }
+            runtime.changing = true;
+        }
+        // 저장소 쓰기와 파일 확인은 선택 잠금 밖에서 수행한다. 실패한 저장은 캐시를 보존한다.
+        let result = save();
+        let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+        if result.is_ok() {
+            runtime.generation += 1;
+            runtime.executable = None;
+            runtime.ready = false;
+            runtime.preparing = false;
+        }
+        runtime.changing = false;
+        result
+    }
+
+    fn runtime_snapshot(&self) -> Result<RuntimeSnapshot, String> { self.runtime_snapshot_with(|| self.codex_executable()) }
+
+    fn runtime_snapshot_with(&self, resolve: impl FnOnce() -> Result<std::ffi::OsString, String>) -> Result<RuntimeSnapshot, String> {
+        let generation = {
+            let runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+            if runtime.changing { return Err("실행파일 설정을 저장 중입니다. 잠시 후 다시 시도하세요.".into()); }
+            runtime.generation
+        };
+        let executable = resolve()?;
+        let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+        if runtime.changing || runtime.generation != generation { return Err("실행파일 선택이 바뀌었습니다. 다시 시도하세요.".into()); }
+        if runtime.executable.as_ref() != Some(&executable) {
+            runtime.generation = runtime.generation.checked_add(1).ok_or("실행파일 선택 세대 한도에 도달했습니다.")?;
+            runtime.executable = Some(executable.clone());
+            runtime.ready = false;
+            runtime.preparing = false;
+        }
+        Ok(RuntimeSnapshot { generation: runtime.generation, executable })
+    }
+
+    fn verify_runtime_selection(&self, selected: &RuntimeSnapshot, runtime: &RuntimeSelection, cancelled: &AtomicBool) -> Result<(), String> {
+        if self.inner.exiting.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) { return Err("종료 또는 중단 요청으로 실행파일 준비 결과를 사용하지 않았습니다.".into()); }
+        if runtime.changing || runtime.generation != selected.generation || runtime.executable.as_ref() != Some(&selected.executable) { return Err("실행파일 선택이 바뀌었습니다. 다시 준비하세요.".into()); }
+        Ok(())
+    }
+
+    fn prepare_selected_runtime_with(&self, selected: RuntimeSnapshot, force: bool, cancelled: &AtomicBool, prepare: impl FnOnce(&std::ffi::OsString) -> Result<(), String>) -> Result<PreparedRuntime, String> {
+        let preparation = {
+            let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+            self.verify_runtime_selection(&selected, &runtime, cancelled)?;
+            if !force && runtime.ready { return Ok(PreparedRuntime { selection: selected, preparation: runtime.preparation }); }
+            if !force && runtime.preparing { return Err("선택한 실행파일을 준비 중입니다. 잠시 후 다시 시도하세요.".into()); }
+            runtime.preparation = runtime.preparation.checked_add(1).ok_or("실행파일 준비 세대 한도에 도달했습니다.")?;
+            runtime.ready = false;
+            runtime.preparing = true;
+            runtime.preparation
+        };
+        let result = prepare(&selected.executable);
+        let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+        if runtime.generation == selected.generation && runtime.preparation == preparation { runtime.preparing = false; }
+        self.verify_runtime_selection(&selected, &runtime, cancelled)?;
+        if runtime.preparation != preparation { return Err("더 최근 실행파일 준비 요청이 있습니다. 이전 결과를 사용하지 않았습니다.".into()); }
+        result?;
+        runtime.ready = true;
+        Ok(PreparedRuntime { selection: selected, preparation })
+    }
+
+    fn verify_prepared_runtime(&self, prepared: &PreparedRuntime, cancelled: &AtomicBool) -> Result<(), String> {
+        let runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+        self.verify_runtime_selection(&prepared.selection, &runtime, cancelled)?;
+        if !runtime.ready || runtime.preparation != prepared.preparation { return Err("선택한 실행파일의 준비가 완료되지 않았습니다. 다시 준비하세요.".into()); }
+        Ok(())
+    }
+
+    fn prepare_start_with<T>(&self, selected: RuntimeSnapshot, cancelled: &AtomicBool, prepare: impl FnOnce(&std::ffi::OsString) -> Result<(), String>, connect: impl FnOnce(&std::ffi::OsString) -> Result<T, String>) -> Result<T, String> {
+        let prepared = self.prepare_selected_runtime_with(selected, false, cancelled, prepare)?;
+        let connection = connect(&prepared.selection.executable)?;
+        // 연결을 기다리는 사이 설정 또는 강제 준비가 바뀌었으면 연결을 해제하고 PTY를 만들지 않는다.
+        self.verify_prepared_runtime(&prepared, cancelled)?;
+        Ok(connection)
+    }
+
     pub fn prepare_runtime(&self) -> Result<(), String> {
         if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 공유 서버를 시작하지 않았습니다.".into()); }
-        // 저장소 잠금은 실행 파일을 읽을 때만 유지하며 외부 명령을 기다리지 않는다.
-        codex::prepare_runtime_with_executable(&self.codex_executable()?, &self.inner.exiting)
+        self.prepare_selected_runtime_with(self.runtime_snapshot()?, true, &self.inner.exiting, |exe| codex::prepare_runtime_with_executable(exe, &self.inner.exiting)).map(|_| ())
     }
 
     pub fn catalog_list(&self, request: codex::CatalogQuery) -> Result<codex::CatalogPage, String> {
@@ -640,15 +739,24 @@ impl Engine {
     }
 
     fn with_extension_operation<T>(&self, operation: impl FnOnce(&std::ffi::OsString, &codex::ExtensionPermit) -> Result<T, String>) -> Result<T, String> {
+        self.with_extension_operation_ready(false, operation)
+    }
+
+    fn with_extension_operation_ready<T>(&self, require_ready: bool, operation: impl FnOnce(&std::ffi::OsString, &codex::ExtensionPermit) -> Result<T, String>) -> Result<T, String> {
         if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting; no extension operation was started".into()); }
         // Resolve one executable snapshot without holding the extension permit
         // or a metadata/session lock across admission or vendor I/O.
-        let exe = self.codex_executable()?;
+        let selected = self.runtime_snapshot()?;
         let permit = codex::extension_admission()?;
         // This check and shutdown's exiting.store share the same permit. A
         // pre-admission flag check alone would allow a late mutation to race exit.
         if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting; no extension operation was started".into()); }
-        operation(&exe, &permit)
+        {
+            let runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+            self.verify_runtime_selection(&selected, &runtime, &self.inner.exiting)?;
+            if require_ready && !runtime.ready { return Err("선택한 실행파일의 준비가 완료되지 않아 사용량을 조회하지 않았습니다.".into()); }
+        }
+        operation(&selected.executable, &permit)
     }
 
     pub fn extensions_list(&self, cwd: Option<String>) -> Result<codex::ExtensionsSnapshot, String> {
@@ -660,7 +768,7 @@ impl Engine {
     }
 
     pub fn weekly_usage(&self, manual: bool) -> Result<codex::WeeklyUsageSnapshot, String> {
-        self.with_extension_operation(|exe, _permit| codex::weekly_usage_with_executable(exe, manual))
+        self.with_extension_operation_ready(true, |exe, _permit| codex::weekly_usage_with_executable(exe, manual))
     }
 
     pub fn mobile_control(&self, id: &str, generation: u64, action: codex::MobileAction) -> Result<codex::MobileReply, String> {
@@ -835,6 +943,155 @@ mod launch_guard_tests;
 #[cfg(all(test, windows))]
 #[path = "session_shutdown_race_tests.rs"]
 mod shutdown_race_tests;
+
+#[cfg(test)]
+mod runtime_preparation_tests {
+    use super::*;
+
+    fn engine() -> Engine { Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap() }
+    fn select(engine: &Engine, executable: &str) -> RuntimeSnapshot {
+        engine.runtime_snapshot_with(|| Ok(executable.into())).unwrap()
+    }
+    fn unlocked(engine: &Engine) {
+        assert!(engine.inner.runtime.try_lock().is_ok(), "외부 작업 중 선택 잠금이 유지됨");
+        assert!(engine.inner.store.try_lock().is_ok(), "외부 작업 중 저장소 잠금이 유지됨");
+        assert!(engine.inner.sessions.try_lock().is_ok(), "외부 작업 중 세션 잠금이 유지됨");
+    }
+
+    #[test]
+    fn readiness_reuses_only_success_and_forced_failure_discards_the_old_ticket() {
+        let engine = engine();
+        let selected = select(&engine, "runtime-a.exe");
+        let cancelled = AtomicBool::new(false);
+        let first = engine.prepare_selected_runtime_with(selected.clone(), false, &cancelled, |_| { unlocked(&engine); Ok(()) }).unwrap();
+        let reused = engine.prepare_selected_runtime_with(selected.clone(), false, &cancelled, |_| panic!("성공 캐시를 재사용하지 않음")).unwrap();
+        assert_eq!(first.preparation, reused.preparation);
+        engine.verify_prepared_runtime(&first, &cancelled).unwrap();
+        assert_eq!(engine.prepare_selected_runtime_with(selected.clone(), true, &cancelled, |_| Err("준비 실패".into())).unwrap_err(), "준비 실패");
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+        assert!(engine.verify_prepared_runtime(&first, &cancelled).is_err());
+        let retried = engine.prepare_selected_runtime_with(selected, false, &cancelled, |_| Ok(())).unwrap();
+        assert!(retried.preparation > first.preparation);
+        engine.verify_prepared_runtime(&retried, &cancelled).unwrap();
+    }
+
+    #[test]
+    fn late_preparation_cannot_commit_over_a_new_selection_or_forced_request() {
+        for change_selection in [true, false] {
+            let engine = engine();
+            let selected = select(&engine, "runtime-a.exe");
+            let (entered, entry) = std::sync::mpsc::sync_channel(0);
+            let (release, released) = std::sync::mpsc::sync_channel(0);
+            let worker_engine = engine.clone();
+            let worker = thread::spawn(move || worker_engine.prepare_selected_runtime_with(selected, true, &AtomicBool::new(false), |_| {
+                unlocked(&worker_engine);
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            }));
+            entry.recv_timeout(Duration::from_secs(5)).unwrap();
+            let competing = select(&engine, "runtime-a.exe");
+            assert!(engine.prepare_selected_runtime_with(competing, false, &AtomicBool::new(false), |_| panic!("동시 시작이 준비 작업을 중복 실행함")).is_err());
+            if change_selection { engine.change_runtime_selection_with(|| { unlocked(&engine); Ok(()) }).unwrap(); }
+            let selected = select(&engine, if change_selection { "runtime-b.exe" } else { "runtime-a.exe" });
+            let latest = engine.prepare_selected_runtime_with(selected, true, &AtomicBool::new(false), |_| Ok(())).unwrap();
+            release.send(()).unwrap();
+            assert!(worker.join().unwrap().is_err(), "오래된 준비 결과가 확정됨");
+            engine.verify_prepared_runtime(&latest, &AtomicBool::new(false)).unwrap();
+            assert_eq!(engine.inner.runtime.lock().unwrap().preparation, latest.preparation);
+        }
+    }
+
+    #[test]
+    fn selection_save_and_resolution_are_fenced_without_holding_io_locks() {
+        let engine = engine();
+        let selected = select(&engine, "runtime-a.exe");
+        let prepared = engine.prepare_selected_runtime_with(selected, false, &AtomicBool::new(false), |_| Ok(())).unwrap();
+        assert_eq!(engine.change_runtime_selection_with(|| { unlocked(&engine); Err("저장 실패".into()) }).unwrap_err(), "저장 실패");
+        engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).unwrap();
+        engine.change_runtime_selection_with(|| {
+            unlocked(&engine);
+            assert!(engine.runtime_snapshot_with(|| panic!("저장 중 실행파일을 해석함")).is_err());
+            assert!(engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).is_err());
+            Ok(())
+        }).unwrap();
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+        assert!(engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).is_err());
+        let resolved = engine.runtime_snapshot_with(|| {
+            unlocked(&engine);
+            engine.change_runtime_selection_with(|| Ok(())).unwrap();
+            Ok("runtime-b.exe".into())
+        });
+        assert!(resolved.is_err(), "해석 중 선택이 바뀐 결과를 채택함");
+        assert!(engine.inner.runtime.lock().unwrap().executable.is_none());
+    }
+
+    #[test]
+    fn start_rejects_selection_changes_during_preparation_or_connection_and_drops_the_connection() {
+        let engine = engine();
+        let selected = select(&engine, "runtime-a.exe");
+        let cancelled = AtomicBool::new(false);
+        assert!(engine.prepare_start_with::<()>(selected, &cancelled, |_| {
+            engine.change_runtime_selection_with(|| Ok(())).unwrap();
+            Ok(())
+        }, |_| panic!("선택이 바뀐 준비 결과로 연결을 시작함")).is_err());
+        let selected = select(&engine, "runtime-b.exe");
+        struct Connection(Arc<AtomicBool>);
+        impl Drop for Connection { fn drop(&mut self) { self.0.store(true, Ordering::Release); } }
+        let dropped = Arc::new(AtomicBool::new(false));
+        assert!(engine.prepare_start_with(selected, &cancelled, |exe| { assert_eq!(exe, &std::ffi::OsString::from("runtime-b.exe")); Ok(()) }, |exe| {
+            unlocked(&engine);
+            assert_eq!(exe, &std::ffi::OsString::from("runtime-b.exe"));
+            engine.change_runtime_selection_with(|| Ok(())).unwrap();
+            Ok(Connection(dropped.clone()))
+        }).is_err());
+        assert!(dropped.load(Ordering::Acquire), "거절한 연결의 소유권이 해제되지 않음");
+    }
+
+    #[test]
+    fn stop_and_exit_prevent_preparation_admission_and_result_commit() {
+        let engine = engine();
+        let selected = select(&engine, "runtime-a.exe");
+        let stopped = AtomicBool::new(true);
+        assert!(engine.prepare_selected_runtime_with(selected.clone(), false, &stopped, |_| panic!("중단 이후 준비가 시작됨")).is_err());
+        stopped.store(false, Ordering::Release);
+        assert!(engine.prepare_selected_runtime_with(selected.clone(), false, &stopped, |_| { stopped.store(true, Ordering::Release); Ok(()) }).is_err());
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+        stopped.store(false, Ordering::Release);
+        let prepared = engine.prepare_selected_runtime_with(selected.clone(), false, &stopped, |_| Ok(())).unwrap();
+        stopped.store(true, Ordering::Release);
+        assert!(engine.verify_prepared_runtime(&prepared, &stopped).is_err());
+        stopped.store(false, Ordering::Release);
+        assert!(engine.prepare_selected_runtime_with(selected.clone(), true, &stopped, |_| {
+            unlocked(&engine);
+            engine.inner.exiting.store(true, Ordering::Release);
+            Ok(())
+        }).is_err());
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+        assert!(engine.prepare_selected_runtime_with(selected, true, &stopped, |_| panic!("종료 이후 준비가 시작됨")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_save_preserves_readiness_but_successful_save_and_reset_require_preparation() {
+        let _admission = super::lifecycle_tests::EXTENSION_ADMISSION_TEST.lock().unwrap();
+        let engine = engine();
+        let executable = std::env::current_exe().unwrap();
+        engine.set_codex_executable(Some(executable.to_str().unwrap())).unwrap();
+        let selected = engine.runtime_snapshot().unwrap();
+        let prepared = engine.prepare_selected_runtime_with(selected, false, &AtomicBool::new(false), |_| Ok(())).unwrap();
+        assert!(engine.set_codex_executable(Some("relative.cmd")).is_err());
+        engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).unwrap();
+        engine.with_extension_operation_ready(true, |exe, _| { assert_eq!(exe, &prepared.selection.executable); unlocked(&engine); Ok(()) }).unwrap();
+        engine.set_codex_executable(Some(executable.to_str().unwrap())).unwrap();
+        assert!(engine.with_extension_operation_ready::<()>(true, |_, _| panic!("미준비 실행파일로 사용량을 조회함")).is_err());
+        let selected = engine.runtime_snapshot().unwrap();
+        let selected = engine.prepare_selected_runtime_with(selected, false, &AtomicBool::new(false), |_| Ok(())).unwrap();
+        engine.set_codex_executable(None).unwrap();
+        assert!(engine.verify_prepared_runtime(&selected, &AtomicBool::new(false)).is_err());
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+    }
+}
 
 #[cfg(test)]
 mod lifecycle_tests {
