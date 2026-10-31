@@ -156,8 +156,11 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
         listener.set_nonblocking(true).unwrap();
         let server_cwd = cwd.clone();
         let server = thread::spawn(move || {
+            let mut connections = Vec::new();
+            // 시작 전 준비가 짧은 초기화 연결을 닫은 뒤 실제 세션 관측자가 별도로 연결한다.
+            for preparation in [true, false] {
             let mut accepted = None;
-            until("proxy 연결", || match listener.accept() { Ok(pair) => {accepted=Some(pair);true}, Err(e) if e.kind()==std::io::ErrorKind::WouldBlock => false, Err(e) => panic!("{e}") });
+            until(if preparation {"준비 proxy 연결"} else {"관측 proxy 연결"}, || match listener.accept() { Ok(pair) => {accepted=Some(pair);true}, Err(e) if e.kind()==std::io::ErrorKind::WouldBlock => false, Err(e) => panic!("{e}") });
             let (stream, _) = accepted.unwrap();
             stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
@@ -172,6 +175,7 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
                 let result = match method.as_str() {
                     "initialize" => json!({}),
                     "initialized" => continue,
+                    _ if preparation => panic!("사전 준비 연결이 대화 변경 또는 관측을 요청했다: {method}"),
                     "thread/start" => json!({"thread":{"id":id,"cwd":server_cwd,"status":{"type":"idle"}}}),
                     "thread/subscribePassive" => {
                         assert_eq!(methods.iter().filter(|method|method.as_str()=="thread/subscribePassive").count(),1,"수동 관측 구독은 한 번만 허용한다");
@@ -183,7 +187,10 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
                 };
                 ws.send(Message::Text(json!({"id":request["id"],"result":result}).to_string().into())).unwrap();
             }
-            methods
+            if preparation { assert_eq!(methods, ["initialize", "initialized"], "사전 준비는 초기화만 하고 연결을 닫아야 한다"); }
+            connections.push(methods);
+            }
+            connections
         });
         let (entered, entry) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -254,7 +261,7 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
         assert!(engine.shutdown().is_err());
         assert!(!engine.inner.exiting.load(Ordering::Acquire));
         stage("재시도 반환");
-        assert_eq!(server.join().unwrap(), ["initialize", "initialized", "thread/start", "thread/read", "thread/subscribePassive"]);
+        assert_eq!(server.join().unwrap(), [vec!["initialize", "initialized"], vec!["initialize", "initialized", "thread/start", "thread/read", "thread/subscribePassive"]]);
         stage("server 회수");
         no_more_connections.set_nonblocking(true).unwrap();
         assert!(matches!(no_more_connections.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock), "불명 요청을 다시 연결·전송하면 안 된다");
