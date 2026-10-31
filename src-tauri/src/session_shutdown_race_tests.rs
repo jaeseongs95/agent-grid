@@ -106,6 +106,9 @@ using System.Threading;
 class Fixture {
  static int Main(string[] args) {
   string root = AppDomain.CurrentDomain.BaseDirectory;
+  if (args.Length == 1 && args[0] == "--help") {
+   Console.Write("Usage: fixture [OPTIONS]\n\nOptions:\n  -h, --help\n          Print help\n"); return 0;
+  }
   if (args.Length == 2 && args[0] == "app-server" && args[1] == "--help") {
    Console.Write("Usage: fixture app-server [OPTIONS] [COMMAND]\n\nCommands:\n  daemon  Manage daemon\n  proxy  Relay\n\nOptions:\n  -h, --help\n          Print help\n"); return 0;
   }

@@ -34,8 +34,10 @@ fn help_supports_control(bytes: &[u8]) -> Result<bool, String> {
         let position = line.find("--help")?;
         (line[position..].split_ascii_whitespace().next()?.trim_end_matches(',') == "--help").then_some(position)
     }).min().ok_or("예약 제어 도움말의 옵션 선언 열을 확인할 수 없습니다.")?;
+    // 실제 옵션 열보다 더 들여쓴 설명문의 유사 옵션은 선언이 아니다.
     let declaration = options.iter().position(|line| line.trim_start().starts_with('-')
-        && line.get(column..).is_some_and(|tail| tail.split_ascii_whitespace().next() == Some("--desktop-cron-control")));
+        && line.get(column..).is_some_and(|tail| tail.starts_with("--")
+            && tail.split_ascii_whitespace().next() == Some("--desktop-cron-control")));
     let Some(index) = declaration else { return Ok(false); };
     let item = options[index..].iter().enumerate().take_while(|(offset,line)| *offset == 0
         || !(line.trim_start().starts_with('-') && line.get(column..).is_some_and(|tail| tail.starts_with("--"))))
@@ -363,9 +365,21 @@ mod tests {
     fn cron_control_help_requires_real_option_and_exact_possible_value() {
         let help = |item: &str| format!("Usage: codex [OPTIONS]\n\nOptions:\n      --help  도움말\n{item}\n");
         assert!(help_supports_control(help("      --desktop-cron-control <MODE>\n          [possible values: pipe-v1]").as_bytes()).unwrap());
+        assert!(help_supports_control(b"Usage: codex [OPTIONS]
+
+Options:
+  -h, --help  help
+      --desktop-cron-control <MODE>
+          [possible values: pipe-v1]
+").unwrap());
         for item in ["      --other <MODE>\n          --desktop-cron-control [possible values: pipe-v1]",
             "      --desktop-cron-control <MODE>\n          [possible values: pipe-v10]",
-            "      --desktop-cron-control-fake <MODE>\n          [possible values: pipe-v1]"] {
+            "      --desktop-cron-control-fake <MODE>\n          [possible values: pipe-v1]",
+            "      --other <MODE>
+       --desktop-cron-control [possible values: pipe-v1]",
+            "      --other <MODE>
+          --desktop-cron-control <MODE>
+              [possible values: pipe-v1]"] {
             assert!(!help_supports_control(help(item).as_bytes()).unwrap());
         }
         assert!(help_supports_control(help("      --desktop-cron-control <MODE>\n          설명 pipe-v1").as_bytes()).is_err());
