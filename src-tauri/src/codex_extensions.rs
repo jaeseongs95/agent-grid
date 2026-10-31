@@ -127,7 +127,7 @@ pub(super) fn command_stdout_until(exe: &OsString, cwd: &Path, args: &[String], 
 // 명시적인 서버 시작 명령만 공유 서버가 launcher의 Job 밖에서 살아남도록 허용한다.
 // 조회·설치·업데이트·일반 PTY에는 이 정책을 사용할 수 없다.
 pub(super) fn start_daemon_stdout_until(exe: &OsString, cwd: &Path, deadline: Instant, cancelled: Option<&Arc<AtomicBool>>) -> Result<Vec<u8>, String> {
-    command_stdout_with_job(exe, cwd, &["app-server".into(), "daemon".into(), "start".into()], deadline, cancelled, true)
+    command_stdout_with_job(exe, cwd, &["app-server".into(), "daemon".into(), "start".into(), "--existing-installation".into()], deadline, cancelled, true)
 }
 fn command_stdout_with_job(exe: &OsString, cwd: &Path, args: &[String], deadline: Instant, cancelled: Option<&Arc<AtomicBool>>, daemon_launcher: bool) -> Result<Vec<u8>, String> {
     check_cancelled(cancelled)?;
