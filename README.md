@@ -113,6 +113,20 @@ Saved entries that are not running do not consume a concurrent-terminal slot.
 The existing resource limit of 32 terminals remains; automatic restoration leaves
 additional entries in the saved list when those terminal slots are full.
 
+## Subagent management
+
+Use **Manage subagents** in a running session header to view its direct subagents.
+Search the current page on the left and inspect status, role, model and reasoning
+effort on the right. Send instructions, interrupt the observed turn, close an
+agent or resume it. Closing requires confirmation, also stops its descendants
+and preserves saved conversations.
+
+A compatible CLI advertising `supportsSubagentManagement` is required. Unsupported
+runtimes receive no management requests. Lists use pages of up to 100 metadata
+entries, refresh every five seconds while the popup is visible and never fetch
+conversation bodies. An uncertain mutation is reconciled by its original request
+ID rather than automatically sent again.
+
 ## Plugins and skills
 
 Open **⚙ Settings** in the upper-right corner, then **Plugins & skills**.

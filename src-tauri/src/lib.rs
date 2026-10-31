@@ -202,6 +202,11 @@ async fn mobile_control(engine: State<'_, Engine>, id: String, generation: u64, 
     tauri::async_runtime::spawn_blocking(move || engine.mobile_control(&id, generation, action)).await.map_err(|e| format!("Mobile control worker: {e}"))?
 }
 #[tauri::command]
+async fn subagents_request(engine: State<'_, Engine>, id: String, generation: u64, request: codex::SubagentRequest) -> Result<serde_json::Value, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.subagents_request(&id, generation, request)).await.map_err(|e| format!("하위 에이전트 요청 작업자: {e}"))?
+}
+#[tauri::command]
 async fn cron_request(engine: State<'_, Engine>, id: String, generation: u64, request: codex::CronRequest) -> Result<serde_json::Value,String> {
     let engine=engine.inner().clone();
     tauri::async_runtime::spawn_blocking(move||engine.cron_request(&id,generation,request)).await.map_err(|e|format!("예약 요청 작업자: {e}"))?
@@ -330,7 +335,7 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, prepare_runtime, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, create_project, rename_project, set_project_favorite, delete_project, move_session_to_project, choose_project_folder, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, extensions_list, extensions_mutate, choose_skill_folder, mobile_control, cron_request, conversation_request, list_pending_questions, respond_pending_question, choose_conversation_attachments, stage_conversation_image, cleanup_conversation_attachment, weekly_usage, unconfirmed_exit_available, complete_exit])
+        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, prepare_runtime, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, create_project, rename_project, set_project_favorite, delete_project, move_session_to_project, choose_project_folder, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, extensions_list, extensions_mutate, choose_skill_folder, mobile_control, cron_request, subagents_request, conversation_request, list_pending_questions, respond_pending_question, choose_conversation_attachments, stage_conversation_image, cleanup_conversation_attachment, weekly_usage, unconfirmed_exit_available, complete_exit])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<ExitState>().0.load(Ordering::Acquire) {

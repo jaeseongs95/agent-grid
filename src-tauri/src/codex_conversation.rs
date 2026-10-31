@@ -1,5 +1,9 @@
 //! 기존 서버·대화의 구조화 연결. 입력과 응답은 한 작업자가 소유하며 재전송하지 않는다.
 use super::*;
+
+#[path = "codex_subagents.rs"]
+mod subagents;
+pub use subagents::SubagentRequest;
 use std::{collections::{HashMap, HashSet, VecDeque}, path::PathBuf, sync::Weak};
 
 const EVENT_COUNT: usize = 128;
@@ -57,6 +61,7 @@ struct Control {
     unknown: AtomicBool,
     deleted: AtomicBool,
     detail: Mutex<Option<DetailSnapshot>>,
+    subagents: Mutex<subagents::State>,
 }
 struct DetailSnapshot { id: String, turn_id: String, item_id: String, text: Arc<str> }
 struct Worker {
@@ -193,7 +198,7 @@ impl ConversationConnection {
         }
     }
     pub(super) fn new(endpoint: Endpoint, stopped: Arc<AtomicBool>) -> Self {
-        Self(Arc::new(Control {endpoint,stopped,input:Mutex::new(false),owned:AtomicBool::new(false),worker:Mutex::new(None),events:Mutex::new(Events::default()),sent:Mutex::new(HashSet::new()),unknown:AtomicBool::new(false),deleted:AtomicBool::new(false),detail:Mutex::new(None)}))
+        Self(Arc::new(Control {endpoint,stopped,input:Mutex::new(false),owned:AtomicBool::new(false),worker:Mutex::new(None),events:Mutex::new(Events::default()),sent:Mutex::new(HashSet::new()),unknown:AtomicBool::new(false),deleted:AtomicBool::new(false),detail:Mutex::new(None),subagents:Mutex::new(subagents::State::default())}))
     }
     pub(crate) fn terminal_write<T>(&self, write: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
         let gui = self.0.input.lock().map_err(|_| "대화 입력 소유 상태를 확인할 수 없습니다.")?;

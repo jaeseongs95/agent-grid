@@ -48,7 +48,7 @@ pub(crate) fn prepare_runtime_with_executable(exe: &OsString, cancelled: &Arc<At
 
 #[path = "codex_conversation.rs"]
 mod conversation;
-pub use conversation::{ConversationConnection, ConversationRequest};
+pub use conversation::{ConversationConnection, ConversationRequest, SubagentRequest};
 
 #[path = "codex_cron.rs"]
 mod cron;

@@ -17,6 +17,7 @@ import './weekly-usage.css';
 import { createConversation } from './conversation';
 import { createContextControls } from './context-controls';
 import { createCronManager } from './cron-manager';
+import { createSubagentManager } from './subagent-manager';
 import { createQuestionCenter } from './question-center';
 import { InputQueueError, TerminalInputQueue, TerminalResizeQueue, TerminalOutputAcknowledgements } from './terminal-flow';
 import { bindAttribute, bindText, getLanguage, languageStorageError, onLanguageChange, setLanguage, t } from './i18n';
@@ -560,7 +561,7 @@ function mountConversation(session: Session) {
 
 function createTerminal(session: Session) {
   const card = document.createElement('article'); card.className = 'terminal-card'; card.dataset.id = session.id;
-  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-compaction" role="status" hidden></span><span class="session-state"></span><div class="card-actions"><button class="session-id-copy icon-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button><span class="context-controls"></span><button class="cron-open icon-button" type="button" aria-haspopup="dialog" aria-controls="cron-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg></button><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="conversation-toggle icon-button" type="button" aria-label="대화 보기" title="대화 / 터미널">☷</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">직접 입력 · IME · 붙여넣기</span></div>`;
+  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-compaction" role="status" hidden></span><span class="session-state"></span><div class="card-actions"><button class="session-id-copy icon-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button><span class="context-controls"></span><button class="subagents-open icon-button" type="button" aria-haspopup="dialog" aria-controls="subagents-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M12 8v4M5 16v-4h14v4"/></svg></button><button class="cron-open icon-button" type="button" aria-haspopup="dialog" aria-controls="cron-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg></button><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="conversation-toggle icon-button" type="button" aria-label="대화 보기" title="대화 / 터미널">☷</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">직접 입력 · IME · 붙여넣기</span></div>`;
   localizeMarkup(card);
   const terminal = new Terminal({ fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.45, cursorBlink: true, scrollback: 10000, disableStdin: !native, allowProposedApi: false, theme: { background: '#141820', foreground: '#ced5e3', cursor: '#a5b4fc', selectionBackground: '#3b4567', black: '#212735', red: '#f78b99', green: '#91d6ad', yellow: '#eac184', blue: '#8eaafb', magenta: '#c4a4f3', cyan: '#87cfd9', white: '#e3e8f0' } });
   const fit = new FitAddon(); const search = new SearchAddon(); terminal.loadAddon(fit); terminal.loadAddon(search);
@@ -616,6 +617,9 @@ function createTerminal(session: Session) {
     try { await navigator.clipboard.writeText(threadId); notify('세션 ID를 복사했습니다.', false, 'Session ID copied.'); }
     catch { notify('세션 ID를 복사하지 못했습니다. 다시 시도하세요.', true, 'Could not copy the session ID. Try again.'); }
   };
+  const subagentsButton = card.querySelector<HTMLButtonElement>('.subagents-open')!;
+  bindAttribute(subagentsButton, 'aria-label', '서브에이전트 관리', 'Manage subagents'); bindAttribute(subagentsButton, 'title', '서브에이전트 관리', 'Manage subagents');
+  subagentsButton.onclick = () => { const current = sessions.get(session.id); if (current?.active && current.threadId && !exitInProgress) void subagentManager.open(current); };
   const cronButton = card.querySelector<HTMLButtonElement>('.cron-open')!;
   bindAttribute(cronButton, 'aria-label', '예약 작업', 'Scheduled jobs'); bindAttribute(cronButton, 'title', '예약 작업', 'Scheduled jobs');
   cronButton.onclick = () => { const current = sessions.get(session.id); if (current?.active && !exitInProgress) void cronManager.open(current); };
@@ -794,10 +798,12 @@ function renderHandles(count: number, rows: number) {
 
 function renderAll() {
   cronManager.updateSessions([...sessions.values()]);
+  subagentManager.updateSessions([...sessions.values()]);
   for (const [id, session] of sessions) {
     const card = terminals.get(id)!.card;
     card.querySelector<HTMLButtonElement>('.session-id-copy')!.disabled = demo || !session.threadId;
     card.querySelector<HTMLButtonElement>('.cron-open')!.disabled = !session.active || exitInProgress;
+    card.querySelector<HTMLButtonElement>('.subagents-open')!.disabled = !native || !session.active || !session.threadId || exitInProgress;
     card.querySelector('.terminal-title')!.textContent = session.title;
     card.querySelector('.terminal-path')!.textContent = `▱  ${session.cwd}`;
     const state = card.querySelector('.session-state')!;
@@ -830,6 +836,7 @@ const sessionBrowser = createSessionBrowser({
   notify,
 });
 const cronManager = createCronManager({ call, notify });
+const subagentManager = createSubagentManager({ call, notify });
 const projectManager = createProjectManager({
   call, projects: () => importedProjects,
   async changed(project, deletedId) {
@@ -996,7 +1003,7 @@ async function requestExit(allowUnconfirmedRemote = false) {
     // Raw preparation owns the native operation even when no restore is pending.
     // A rejection settles ownership; prepareRuntime retains its distinct failure state.
     const preparing = runtimeCommand && runtimeCommandGeneration === runtimeGeneration ? runtimePreparation : undefined;
-    await Promise.all([extensionsManager.beginExit(), mobileControl.beginExit(), weeklyUsage.beginExit(), questionCenter.beginExit(), cronManager.beginExit(), initialization, runtimeRestoration?.catch(() => {}), Promise.allSettled([runtimeCommand, preparing])]);
+    await Promise.all([extensionsManager.beginExit(), mobileControl.beginExit(), weeklyUsage.beginExit(), questionCenter.beginExit(), cronManager.beginExit(), subagentManager.beginExit(), initialization, runtimeRestoration?.catch(() => {}), Promise.allSettled([runtimeCommand, preparing])]);
     await Promise.allSettled([...startOperations, ...restoringRequests.values()]);
     if (native && !workspaceReady) throw new UiError('저장된 작업 공간을 확인하지 못해 종료 정보를 덮어쓰지 않았습니다.', 'Could not load the saved workspace; exit metadata was not overwritten.');
     bindText(button, '종료 중…', 'Exiting…');
@@ -1005,7 +1012,7 @@ async function requestExit(allowUnconfirmedRemote = false) {
     if (native) await nativeLanguageQueue;
     await call('complete_exit', { confirmed: true, ...(allowUnconfirmedRemote ? { allowUnconfirmedRemote: true } : {}) }); completed = true;
   } catch (error) {
-    extensionsManager.cancelExit(); mobileControl.cancelExit(); weeklyUsage.setVisible(false); weeklyUsage.cancelExit(); questionCenter.cancelExit(); cronManager.cancelExit();
+    extensionsManager.cancelExit(); mobileControl.cancelExit(); weeklyUsage.setVisible(false); weeklyUsage.cancelExit(); questionCenter.cancelExit(); cronManager.cancelExit(); subagentManager.cancelExit();
     if (native) {
       try { if (await call<boolean>('unconfirmed_exit_available') === true) { unconfirmedExitButton.hidden = false; $('#unconfirmed-exit-warning').hidden = false; } }
       catch { /* 복구 선택은 숨긴 채 원래 종료 오류를 보존한다. */ }
@@ -1053,7 +1060,7 @@ async function initialize() {
     unlisteners.push(await listen<Output>('terminal-output', event => receiveOutput(event.payload)));
     unlisteners.push(await listen<SessionInfo>('session-changed', event => receiveSession(event.payload)));
     unlisteners.push(await listen<string>('application-error', event => notify(event.payload, true)));
-    unlisteners.push(await listen<boolean>('application-visibility', event => { nativeWindowVisible = event.payload; weeklyUsage.setVisible(event.payload && runtimeReady); questionCenter.setVisible(event.payload); cronManager.setVisible(event.payload); updateConversationVisibility(); }));
+    unlisteners.push(await listen<boolean>('application-visibility', event => { nativeWindowVisible = event.payload; weeklyUsage.setVisible(event.payload && runtimeReady); questionCenter.setVisible(event.payload); cronManager.setVisible(event.payload); subagentManager.setVisible(event.payload); updateConversationVisibility(); }));
     unlisteners.push(await listen('exit-requested', openExitDialog));
     const [layoutValue, existing] = await Promise.all([call<unknown>('load_layout'), call<SessionInfo[]>('list_sessions')]);
     const wrapper = layoutValue as { layout?: unknown; sessions?: SessionInfo[] } | null;
