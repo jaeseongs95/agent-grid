@@ -8,6 +8,7 @@ interface WeeklyUsageSnapshot {
 }
 interface WeeklyUsageHost {
   call<T>(command: string, args?: Record<string, unknown>): Promise<T>;
+  initiallyVisible?: boolean;
 }
 const pollInterval = 60 * 1000;
 const manualInterval = 5 * 1000;
@@ -21,7 +22,7 @@ export function createWeeklyUsage(host: WeeklyUsageHost) {
   let error = '';
   let generation = 0;
   let exiting = false;
-  let nativeVisible = true;
+  let nativeVisible = host.initiallyVisible ?? true;
   let lastStarted = -Infinity;
   let lastFinished = -Infinity;
   let lastManualStarted = -Infinity;

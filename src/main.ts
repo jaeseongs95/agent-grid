@@ -51,6 +51,7 @@ let exitInProgress = false;
 let initialization: Promise<void> = Promise.resolve();
 let runtimePreparation: Promise<void> | undefined;
 let runtimeRestoration: Promise<void> | undefined;
+let runtimeReady = !native;
 const restoringRequests = new Map<SavedSession, Promise<SessionInfo>>();
 const startOperations = new Set<Promise<SessionInfo>>();
 // Failed shutdown events must not erase the restart intent saved before stopping.
@@ -324,6 +325,8 @@ function prepareRuntime(): Promise<void> {
   bindText($('#runtime-status'), '공유서버를 준비하는 중… 준비되면 이전 세션을 복원합니다.', 'Preparing the shared server… Saved sessions will resume when it is ready.');
   runtimePreparation = call<void>('prepare_runtime').then(() => {
     $('#runtime-banner').hidden = true;
+    runtimeReady = true;
+    weeklyUsage.setVisible(nativeWindowVisible);
   }, error => {
     bindText($('#runtime-status'), `공유서버 준비 실패: ${message(error, 'ko')}`, `Could not prepare the shared server: ${message(error, 'en')}`);
     bindText(retry, '다시 시도', 'Retry'); retry.hidden = false; retry.disabled = false;
@@ -835,7 +838,7 @@ $('#project-tabs').addEventListener('keydown', event => {
 });
 const extensionsManager = createExtensionsManager({ call, notify });
 const mobileControl = createMobileControl({ call, notify, openExecutableSettings: () => void executableSettings.open() });
-const weeklyUsage = createWeeklyUsage({ call });
+const weeklyUsage = createWeeklyUsage({ call, initiallyVisible: !native });
 const questionCenter = createQuestionCenter({ call, button: $<HTMLButtonElement>('#notifications'), openSession: focusSession });
 document.body.append(questionCenter.element);
 $('.sidebar').append(weeklyUsage.element);
@@ -1008,7 +1011,7 @@ async function initialize() {
     unlisteners.push(await listen<Output>('terminal-output', event => receiveOutput(event.payload)));
     unlisteners.push(await listen<SessionInfo>('session-changed', event => receiveSession(event.payload)));
     unlisteners.push(await listen<string>('application-error', event => notify(event.payload, true)));
-    unlisteners.push(await listen<boolean>('application-visibility', event => { nativeWindowVisible = event.payload; weeklyUsage.setVisible(event.payload); questionCenter.setVisible(event.payload); cronManager.setVisible(event.payload); updateConversationVisibility(); }));
+    unlisteners.push(await listen<boolean>('application-visibility', event => { nativeWindowVisible = event.payload; weeklyUsage.setVisible(event.payload && runtimeReady); questionCenter.setVisible(event.payload); cronManager.setVisible(event.payload); updateConversationVisibility(); }));
     unlisteners.push(await listen('exit-requested', openExitDialog));
     const [layoutValue, existing] = await Promise.all([call<unknown>('load_layout'), call<SessionInfo[]>('list_sessions')]);
     const wrapper = layoutValue as { layout?: unknown; sessions?: SessionInfo[] } | null;

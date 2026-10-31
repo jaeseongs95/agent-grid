@@ -147,6 +147,8 @@ conversations on that server. At startup, the app reuses a running daemon or sta
 the installed daemon, then verifies its connection before restoring sessions. A
 failed start leaves saved sessions available for retry. The app does not install,
 replace or stop the shared daemon.
+Automatic startup requires the CLI's `app-server daemon start --existing-installation`
+option. With older CLIs, start the shared server before opening the app.
 
 For older CLIs without shared commands, the app-owned server remains available.
 Its mobile mutations require `--remote-control-client-name` to avoid replacing

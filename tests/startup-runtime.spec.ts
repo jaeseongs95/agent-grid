@@ -15,6 +15,7 @@ async function workspace(page: Page, options: { hold?: boolean; fail?: number; h
     const fixture = state.startupFixture = {
       calls: [] as { command: string; args: any }[], live: [] as any[], preparations: 0, preparing: 0, maxPreparing: 0,
       failures: options.fail ?? 0, release: () => {},
+      visibility(visible: boolean) { listeners.get('application-visibility')?.({ event: 'application-visibility', id: 1, payload: visible }); },
     };
     state.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     state.__TAURI_INTERNALS__ = {
@@ -28,6 +29,7 @@ async function workspace(page: Page, options: { hold?: boolean; fail?: number; h
         if (command === 'list_sessions') return fixture.live;
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: options.saved === false ? [] : savedSessions };
         if (command === 'save_layout') { localStorage.setItem('startup-layout', JSON.stringify(args.layout)); return null; }
+        if (command === 'weekly_usage') return { executable: 'startup-test', observedAt: Date.now(), limitName: null, weekly: null };
         if (command === 'prepare_runtime') {
           const attempt = ++fixture.preparations;
           fixture.preparing++; fixture.maxPreparing = Math.max(fixture.maxPreparing, fixture.preparing);
@@ -60,6 +62,8 @@ test('공유서버 준비가 끝난 뒤에만 저장 세션을 복원하고 기�
   await expect(page.locator('#runtime-banner')).toContainText('공유서버를 준비하는 중');
   expect(await calls(page, 'start_session')).toEqual([]);
   expect(await calls(page, 'save_layout')).toEqual([]);
+  await page.evaluate(() => { const f = (window as any).startupFixture; f.visibility(false); f.visibility(true); document.querySelector<HTMLButtonElement>('#weekly-usage-refresh')!.click(); });
+  expect(await calls(page, 'weekly_usage')).toEqual([]);
   const sequence = await page.evaluate(() => (window as any).startupFixture.calls.map((item: any) => item.command));
   expect(sequence.indexOf('get_ui_language')).toBeLessThan(sequence.indexOf('load_layout'));
   expect(sequence.indexOf('load_layout')).toBeLessThan(sequence.indexOf('prepare_runtime'));
@@ -69,6 +73,7 @@ test('공유서버 준비가 끝난 뒤에만 저장 세션을 복원하고 기�
   await page.evaluate(() => (window as any).startupFixture.release());
   await expect(page.locator('.terminal-title')).toHaveText(savedSessions.map(item => item.title));
   await expect(page.locator('#runtime-banner')).toBeHidden();
+  expect(await calls(page, 'weekly_usage')).toHaveLength(1);
   expect((await calls(page, 'prepare_runtime')).map((item: any) => item.args)).toEqual([{}]);
   expect((await calls(page, 'start_session')).map((item: any) => item.args.request.threadId)).toEqual(['saved-a', 'saved-b']);
 });
@@ -79,12 +84,16 @@ test('준비 실패는 복원 없이 저장 의도를 보존하고 단일 재시
   await expect(page.locator('#runtime-retry')).toBeEnabled();
   expect(await calls(page, 'start_session')).toEqual([]);
   await expect.poll(async () => (await persisted(page))?.sessions.map((item: any) => item.resumeOnStartup)).toEqual([true, true]);
+  await page.evaluate(() => { const f = (window as any).startupFixture; f.visibility(false); f.visibility(true); document.querySelector<HTMLButtonElement>('#weekly-usage-refresh')!.click(); });
+  expect(await calls(page, 'weekly_usage')).toEqual([]);
   const listensBefore = await calls(page, 'plugin:event|listen');
   await page.locator('#runtime-retry').evaluate((button: HTMLButtonElement) => { button.click(); button.click(); button.click(); });
   await expect.poll(async () => (await calls(page, 'prepare_runtime')).length).toBe(2);
   expect(await calls(page, 'start_session')).toEqual([]);
+  expect(await calls(page, 'weekly_usage')).toEqual([]);
   await page.evaluate(() => (window as any).startupFixture.release());
   await expect(page.locator('.terminal-title')).toHaveText(savedSessions.map(item => item.title));
+  expect(await calls(page, 'weekly_usage')).toHaveLength(1);
   expect(await calls(page, 'load_layout')).toHaveLength(1);
   expect(await calls(page, 'get_ui_language')).toHaveLength(1);
   expect(await calls(page, 'plugin:event|listen')).toEqual(listensBefore);
@@ -123,4 +132,5 @@ for (const retry of [false, true]) test(`${retry ? '재시도' : '최초 준비'
   await expect.poll(async () => (await calls(page, 'complete_exit')).length).toBe(1);
   expect(await calls(page, 'start_session')).toEqual([]);
   expect((await persisted(page)).sessions.map((item: any) => item.resumeOnStartup)).toEqual([true, true]);
+  expect(await calls(page, 'weekly_usage')).toEqual([]);
 });

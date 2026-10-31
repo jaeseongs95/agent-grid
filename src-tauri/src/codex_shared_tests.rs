@@ -48,8 +48,8 @@ fn startup_starts_installed_server_once_then_verifies_ready_for_both_start_resul
 #[test]
 fn startup_requires_declared_preserving_start_option_without_unsafe_fallback() {
     for help in [
-        b"Usage: fixture start [OPTIONS]\n\nOptions:\n  -h, --help\n          Use --existing-installation if available\n".to_vec(),
-        b"Usage: fixture start [OPTIONS]\n\nOptions:\n      --existing-installation-extra\n  -h, --help\n          Print help\n".to_vec(),
+        b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n  -h, --help\n          Use --existing-installation if available\n".to_vec(),
+        b"Usage: fixture app-server daemon start [OPTIONS]\n\nOptions:\n      --existing-installation-extra\n  -h, --help\n          Print help\n".to_vec(),
         b"invalid help".to_vec(),
     ] {
         let (result, calls) = startup_commands_case(vec![Ok(startup_help()), Err("연결 없음".into()), Ok(help)], Err("시작 금지".into()));
