@@ -54,6 +54,7 @@ let runtimeRestoration: Promise<void> | undefined;
 let runtimeReady = !native;
 let runtimeGeneration = 0;
 let runtimeCommand: Promise<void> | undefined;
+let runtimeCommandGeneration = 0;
 let executableMutation: Promise<unknown> | undefined;
 const restoringRequests = new Map<SavedSession, Promise<SessionInfo>>();
 const startOperations = new Set<Promise<SessionInfo>>();
@@ -333,20 +334,20 @@ function prepareRuntime(): Promise<void> {
     if (mutation) await mutation.catch(() => {});
     // The native startup operation has one owner; invalidation is not cancellation.
     if (runtimeCommand) await runtimeCommand.catch(() => {});
-    if (generation !== runtimeGeneration || exitInProgress) return;
-    const command = call<void>('prepare_runtime'); runtimeCommand = command;
+    if (generation !== runtimeGeneration || exitInProgress) return false;
+    const command = call<void>('prepare_runtime'); runtimeCommand = command; runtimeCommandGeneration = generation;
     try { await command; }
     finally { if (runtimeCommand === command) runtimeCommand = undefined; }
+    return true;
   });
-  runtimePreparation = operation.then(() => {
+  runtimePreparation = operation.then(prepared => {
     if (generation !== runtimeGeneration) return prepareRuntime();
-    if (exitInProgress) { runtimePreparation = undefined; return; }
+    if (!prepared) { runtimePreparation = undefined; return; }
     $('#runtime-banner').hidden = true;
     runtimeReady = true;
     weeklyUsage.setVisible(nativeWindowVisible);
   }, error => {
     if (generation !== runtimeGeneration) return prepareRuntime();
-    if (exitInProgress) { runtimePreparation = undefined; return; }
     bindText($('#runtime-status'), `공유서버 준비 실패: ${message(error, 'ko')}`, `Could not prepare the shared server: ${message(error, 'en')}`);
     bindText(retry, '다시 시도', 'Retry'); retry.hidden = false; retry.disabled = false;
     throw error;
@@ -377,6 +378,7 @@ function resumeWorkspace(): Promise<void> {
 $('#runtime-retry').onclick = () => {
   if (exitInProgress || runtimeRestoration) return;
   runtimePreparation = undefined;
+  weeklyUsage.refresh();
   void resumeWorkspace().catch(error => notifyError('공유서버 준비 실패', 'Could not prepare the shared server', error));
 };
 
@@ -987,10 +989,14 @@ async function requestExit(allowUnconfirmedRemote = false) {
   const dismissButtons = [...exitDialog.querySelectorAll<HTMLButtonElement>('[data-close]')];
   const dismissStates = dismissButtons.map(control => control.disabled);
   const languageWasDisabled = languageSelect.disabled; const extensionsWasDisabled = extensionsButton.disabled; let completed = false;
+  const runtimeWasReady = runtimeReady;
   button.disabled = true; unconfirmedExitButton.disabled = true; extensionsButton.disabled = true; for (const control of dismissButtons) control.disabled = true; if (native) languageSelect.disabled = true;
   try {
-    bindText(button, '확장 작업 완료를 기다리는 중…', 'Waiting for extension work to finish…');
-    await Promise.all([extensionsManager.beginExit(), mobileControl.beginExit(), weeklyUsage.beginExit(), questionCenter.beginExit(), cronManager.beginExit(), initialization, runtimeRestoration?.catch(() => {})]);
+    bindText(button, '진행 중 작업 완료를 기다리는 중…', 'Waiting for work to finish…');
+    // Raw preparation owns the native operation even when no restore is pending.
+    // A rejection settles ownership; prepareRuntime retains its distinct failure state.
+    const preparing = runtimeCommand && runtimeCommandGeneration === runtimeGeneration ? runtimePreparation : undefined;
+    await Promise.all([extensionsManager.beginExit(), mobileControl.beginExit(), weeklyUsage.beginExit(), questionCenter.beginExit(), cronManager.beginExit(), initialization, runtimeRestoration?.catch(() => {}), Promise.allSettled([runtimeCommand, preparing])]);
     await Promise.allSettled([...startOperations, ...restoringRequests.values()]);
     if (native && !workspaceReady) throw new UiError('저장된 작업 공간을 확인하지 못해 종료 정보를 덮어쓰지 않았습니다.', 'Could not load the saved workspace; exit metadata was not overwritten.');
     bindText(button, '종료 중…', 'Exiting…');
@@ -999,7 +1005,7 @@ async function requestExit(allowUnconfirmedRemote = false) {
     if (native) await nativeLanguageQueue;
     await call('complete_exit', { confirmed: true, ...(allowUnconfirmedRemote ? { allowUnconfirmedRemote: true } : {}) }); completed = true;
   } catch (error) {
-    extensionsManager.cancelExit(); mobileControl.cancelExit(); weeklyUsage.cancelExit(); questionCenter.cancelExit(); cronManager.cancelExit();
+    extensionsManager.cancelExit(); mobileControl.cancelExit(); weeklyUsage.setVisible(false); weeklyUsage.cancelExit(); questionCenter.cancelExit(); cronManager.cancelExit();
     if (native) {
       try { if (await call<boolean>('unconfirmed_exit_available') === true) { unconfirmedExitButton.hidden = false; $('#unconfirmed-exit-warning').hidden = false; } }
       catch { /* 복구 선택은 숨긴 채 원래 종료 오류를 보존한다. */ }
@@ -1008,7 +1014,12 @@ async function requestExit(allowUnconfirmedRemote = false) {
   }
   finally {
     button.disabled = false; unconfirmedExitButton.disabled = false; dismissButtons.forEach((control, index) => { control.disabled = dismissStates[index]; }); bindText(button, '세션 종료 후 앱 닫기', 'Stop sessions and exit');
-    if (!completed) { exitInProgress = false; updateRestoreBanner(); extensionsButton.disabled = extensionsWasDisabled; if (native) languageSelect.disabled = languageWasDisabled; }
+    if (!completed) {
+      exitInProgress = false; updateRestoreBanner(); extensionsButton.disabled = extensionsWasDisabled; if (native) languageSelect.disabled = languageWasDisabled;
+      if (!runtimeWasReady && runtimeReady) weeklyUsage.refresh();
+      weeklyUsage.setVisible(nativeWindowVisible && runtimeReady);
+      if (!runtimeWasReady && runtimeReady) void resumeWorkspace().catch(error => notifyError('공유서버 준비 실패', 'Could not prepare the shared server', error));
+    }
   }
 }
 $('#confirm-exit').onclick = () => void requestExit();
