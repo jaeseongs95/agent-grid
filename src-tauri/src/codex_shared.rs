@@ -1,7 +1,103 @@
-//! 기존 공유 서버의 연결만 소유한다. 서버의 설치·시작·종료·원격 등록은 바꾸지 않는다.
+//! 공유 서버 연결과 앱 시작 준비. 설치·교체·종료·원격 등록은 바꾸지 않는다.
 use super::*;
 use std::{fs, path::PathBuf};
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(40);
+static STARTUP_REQUEST: Mutex<()> = Mutex::new(());
+
+/// 앱 시작의 명시적 준비 경로다. 카탈로그 조회·개별 연결은 서버를 시작하지 않는다.
+pub(super) fn prepare_runtime(exe: &OsString, cwd: &Path, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
+    let _request = STARTUP_REQUEST.try_lock().map_err(|_| "공유 서버를 준비 중입니다. 잠시 후 다시 시도하세요.")?;
+    check_cancelled(Some(cancelled))?;
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let value = prepare_runtime_commands(
+        |args| extensions::command_stdout_until(exe, cwd, &args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(), deadline, Some(cancelled)),
+        || extensions::start_daemon_stdout_until(exe, cwd, deadline, Some(cancelled)),
+        || installed_daemon(&startup_home()?).map(|_| ()),
+    )?;
+    let Some(value) = value else { return Ok(()); }; // 명시 미지원 CLI의 기존 개별 서버 경로 유지.
+    check_cancelled(Some(cancelled))?;
+    let socket = lifecycle_socket(&value)?;
+    let endpoint = SharedEndpoint { exe: exe.clone(), stamp: socket_stamp(&socket)?, socket };
+    let mut proxy = endpoint.open_until(Some(cancelled.clone()), Some(deadline))?;
+    let ready = initialize_proxy(&mut proxy).and_then(|_| check_cancelled(Some(cancelled)));
+    let cleanup = proxy.finish();
+    match (ready, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(cleanup)) => Err(format!("{error}; 준비 연결 정리 실패: {cleanup}")),
+    }
+}
+
+// 명령 경계를 주입하여 실행 순서·시작 횟수·실패 후 복원 금지를 합성 응답으로 검사한다.
+fn prepare_runtime_commands(
+    mut query: impl FnMut(&[&str]) -> Result<Vec<u8>, String>,
+    start: impl FnOnce() -> Result<Vec<u8>, String>,
+    installed: impl FnOnce() -> Result<(), String>,
+) -> Result<Option<Value>, String> {
+    let help = query(&["app-server", "--help"])?;
+    if !supports_shared(&help)? { return Ok(None); }
+    let version = ["app-server", "daemon", "version"];
+    match query(&version) {
+        Ok(bytes) => {
+            let value = lifecycle_value(&bytes)?;
+            lifecycle_socket(&value)?;
+            Ok(Some(value))
+        }
+        Err(probe) => {
+            installed().map_err(|error| format!("공유 서버를 준비하지 못했습니다: {error}; 실행 상태 확인: {probe}"))?;
+            let started = lifecycle_value(&start().map_err(|error| format!("공유 서버 시작 실패: {error}"))?)?;
+            if !matches!(started["status"].as_str(), Some("started" | "alreadyRunning")) {
+                return Err("공유 서버 시작 결과를 확인할 수 없습니다. 세션을 복원하지 않았습니다.".into());
+            }
+            let mut running = started.clone();
+            running["status"] = json!("running");
+            let started_socket = lifecycle_socket(&running)?;
+            // start 자체의 ready 대기 뒤 실제 version 응답과 같은 endpoint인지 재확인한다.
+            let ready = lifecycle_value(&query(&version).map_err(|error| format!("공유 서버가 연결 가능한 상태인지 확인하지 못했습니다: {error}"))?)?;
+            if lifecycle_socket(&ready)? != started_socket {
+                return Err("준비 중 공유 서버 연결 경로가 바뀌었습니다. 세션을 복원하지 않았습니다.".into());
+            }
+            Ok(Some(ready))
+        }
+    }
+}
+fn lifecycle_value(bytes: &[u8]) -> Result<Value, String> {
+    serde_json::from_slice(bytes).map_err(|_| "공유 서버 상태 응답이 올바른 JSON이 아닙니다.".into())
+}
+fn startup_home() -> Result<PathBuf, String> {
+    let home = match env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => {
+            #[cfg(windows)] let key = "USERPROFILE";
+            #[cfg(not(windows))] let key = "HOME";
+            PathBuf::from(env::var_os(key).ok_or("Codex 사용자 폴더를 확인할 수 없습니다.")?).join(".codex")
+        }
+    };
+    if !home.is_absolute() { return Err("Codex 사용자 폴더가 절대 경로가 아니어서 서버를 시작하지 않았습니다.".into()); }
+    Ok(home)
+}
+fn installed_daemon(home: &Path) -> Result<PathBuf, String> {
+    // CLI의 기존 전용/이전 패키지 선택 규칙과 동일한 파일 존재 조건만 확인한다.
+    // 로그 내용·사용자 설정은 읽지 않으며, 미설치 start의 자동 설치 경로를 막는다.
+    let dedicated = home.join("packages/app-server-daemon");
+    let exists = |path: &Path| !matches!(path.symlink_metadata(), Err(error) if error.kind() == io::ErrorKind::NotFound);
+    let state = home.join("app-server-daemon");
+    let root = if exists(&dedicated.join("current"))
+        || ["daemon.pid", "daemon.stderr.log", "daemon-updater.pid", "daemon-updater.stderr.log"].iter().any(|name| exists(&state.join(name))) {
+        dedicated
+    } else if ["app-server.pid", "app-server.stderr.log", "app-server-updater.pid", "app-server-updater.stderr.log"].iter().any(|name| exists(&state.join(name))) {
+        home.join("packages/standalone")
+    } else { dedicated };
+    #[cfg(windows)] let name = "codex.exe";
+    #[cfg(not(windows))] let name = "codex";
+    let packaged = root.join("current/bin").join(name);
+    let legacy = root.join("current").join(name);
+    let path = if packaged.is_file() || cfg!(windows) || root.ends_with("app-server-daemon") { packaged } else { legacy };
+    if !path.is_file() { return Err("설치된 공유 서버를 찾지 못했습니다. Codex에서 공유 서버를 설치한 뒤 다시 시도하세요. 앱이 자동 설치하지는 않습니다.".into()); }
+    Ok(path)
+}
 
 #[derive(Clone)]
 pub(super) struct SharedEndpoint {

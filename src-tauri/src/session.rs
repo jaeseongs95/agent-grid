@@ -279,7 +279,7 @@ struct EngineInner {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     store: Arc<Mutex<Store>>,
     sink: EventSink,
-    exiting: AtomicBool,
+    exiting: Arc<AtomicBool>,
     attachments: crate::conversation_attachments::ConversationAttachments,
 }
 
@@ -298,7 +298,7 @@ impl Engine {
         for info in saved {
             sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone(), attachments:attachments.clone() }));
         }
-        Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: AtomicBool::new(false), attachments }) })
+        Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: Arc::new(AtomicBool::new(false)), attachments }) })
     }
 
     fn allocate(&self, request: &StartRequest) -> Result<Arc<Session>, String> {
@@ -624,6 +624,12 @@ impl Engine {
     }
 
     fn codex_executable(&self) -> Result<std::ffi::OsString, String> { self.get_codex_settings()?.executable() }
+
+    pub fn prepare_runtime(&self) -> Result<(), String> {
+        if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 공유 서버를 시작하지 않았습니다.".into()); }
+        // 저장소 잠금은 실행 파일을 읽을 때만 유지하며 외부 명령을 기다리지 않는다.
+        codex::prepare_runtime_with_executable(&self.codex_executable()?, &self.inner.exiting)
+    }
 
     pub fn catalog_list(&self, request: codex::CatalogQuery) -> Result<codex::CatalogPage, String> {
         codex::catalog_list_with_executable(&self.codex_executable()?, request)

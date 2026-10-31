@@ -11,7 +11,7 @@ mod platform {
         NetworkManagement::IpHelper::{GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID, MIB_TCP_STATE_ESTAB, TCP_TABLE_OWNER_PID_ALL},
         Networking::WinSock::AF_INET,
         System::{
-            JobObjects::{AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE},
+            JobObjects::{AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject, TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE},
             Pipes::GetNamedPipeClientProcessId,
             Threading::{GetCurrentProcess, GetProcessId, GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE},
         },
@@ -78,7 +78,7 @@ mod platform {
     static APP_JOB: OnceLock<ProcessJob> = OnceLock::new();
 
     impl ProcessJob {
-        fn assign(handle: HANDLE) -> Result<Self, String> {
+        fn assign(handle: HANDLE, allow_breakaway: bool) -> Result<Self, String> {
             unsafe {
                 let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
                 if job.is_null() {
@@ -87,6 +87,9 @@ mod platform {
                 let guard = Self(job);
                 let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
                 limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if allow_breakaway {
+                    limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+                }
                 if SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits as *const _ as _, std::mem::size_of_val(&limits) as u32) == 0 {
                     return Err(format!("configure owned process job: {}", std::io::Error::last_os_error()));
                 }
@@ -98,12 +101,18 @@ mod platform {
         }
 
         pub fn assign_std(child: &std::process::Child) -> Result<Self, String> {
-            Self::assign(child.as_raw_handle() as HANDLE)
+            Self::assign(child.as_raw_handle() as HANDLE, false)
+        }
+
+        /// 공유 daemon을 시작하는 전용 LaunchGate 실행기에만 사용한다.
+        /// 명시적 CREATE_BREAKAWAY_FROM_JOB만 허용하며, 보통 자손은 계속 회수한다.
+        pub fn assign_daemon_launcher(child: &std::process::Child) -> Result<Self, String> {
+            Self::assign(child.as_raw_handle() as HANDLE, true)
         }
 
         pub fn assign_pty(child: &dyn portable_pty::Child) -> Result<Self, String> {
             let handle = child.as_raw_handle().ok_or("owned PTY has no Windows process handle")?;
-            Self::assign(handle as HANDLE)
+            Self::assign(handle as HANDLE, false)
         }
 
         /// 실제 연결 상대만 검사한다. Job을 짧게 빌리고 I/O·프로세스 대기를 하지 않는다.
@@ -218,9 +227,10 @@ mod platform {
 
     pub fn install_app_job() -> Result<(), String> {
         // Never dropped in-process: closing this handle would also kill this app.
-        // Windows closes it on exit/crash, reclaiming every app-created descendant.
+        // Windows closes it on exit/crash, reclaiming descendants except the
+        // explicitly detached shared daemon. Per-query/PTY jobs forbid breakaway.
         if APP_JOB.get().is_none() {
-            let job = ProcessJob::assign(unsafe { GetCurrentProcess() })?;
+            let job = ProcessJob::assign(unsafe { GetCurrentProcess() }, true)?;
             if let Err(job) = APP_JOB.set(job) {
                 // Startup is single threaded, but never close a second self job.
                 std::mem::forget(job);
@@ -238,6 +248,7 @@ mod platform {
     pub struct ProcessJob;
     impl ProcessJob {
         pub fn assign_std(_: &std::process::Child) -> Result<Self, String> { Ok(Self) }
+        pub fn assign_daemon_launcher(_: &std::process::Child) -> Result<Self, String> { Ok(Self) }
         pub fn assign_pty(_: &dyn portable_pty::Child) -> Result<Self, String> { Ok(Self) }
         pub fn terminate(&self) -> Result<(), String> { Ok(()) }
         pub fn verify_tcp_peer(&self, _: &std::net::TcpStream) -> Result<(), String> { Err("owned TCP peer verification is supported only on Windows".into()) }
@@ -250,3 +261,7 @@ pub use platform::{app_owned_processes, install_app_job, ProcessJob};
 
 #[cfg(windows)]
 pub use platform::{OwnedProcessIdentity, ProcessIdentity};
+
+#[cfg(all(test, windows))]
+#[path = "process_job_tests.rs"]
+mod tests;

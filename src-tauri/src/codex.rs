@@ -41,6 +41,11 @@ pub use mobile::{MobileAction, MobileConnection, MobileReply, MobileStatus, Mobi
 #[path = "codex_shared.rs"]
 mod shared;
 
+pub(crate) fn prepare_runtime_with_executable(exe: &OsString, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
+    let cwd = env::current_dir().map_err(|error| format!("공유 서버 준비 폴더를 확인할 수 없습니다: {error}"))?;
+    shared::prepare_runtime(exe, &cwd, cancelled)
+}
+
 #[path = "codex_conversation.rs"]
 mod conversation;
 pub use conversation::{ConversationConnection, ConversationRequest};

@@ -30,6 +30,7 @@ jobs:
       - run: npm run build
       - run: npx playwright install chromium
       - run: npm run test:e2e
+      - run: cargo build --locked --manifest-path src-tauri/Cargo.toml --bin opendiy-desktop-helper
       - run: cargo test --locked --manifest-path src-tauri/Cargo.toml -- --nocapture
       - uses: actions/upload-artifact@v4
         if: always()

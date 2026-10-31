@@ -93,8 +93,8 @@ mod platform {
                 use std::os::windows::process::CommandExt;
                 command.creation_flags(0x08000000); // CREATE_NO_WINDOW for protocol pipes.
             }
-            // The helper is already assigned to the session Job; every child
-            // inherits it at creation. A helper termination kills descendants.
+            // Every child inherits the assigned Job. Only the daemon launcher
+            // Job permits the shared server's explicit breakaway from that Job.
             let mut child = command.spawn().map_err(|e| format!("launch owned child: {e}"))?;
             // Command가 보유한 자격 복사본도 실행 직후 해제한다.
             for key in control_keys {command.env_remove(key);}

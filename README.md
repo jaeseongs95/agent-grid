@@ -143,7 +143,10 @@ The selected CLI must support the remote-control app-server APIs and be signed
 in with a ChatGPT account. API key authentication is unsupported. Shared-capable
 CLIs connect the terminal, status observer and mobile controls to the same existing
 daemon through its default proxy. Shared enable, disable and pairing affect all
-conversations on that server. The app never installs, starts or stops the daemon.
+conversations on that server. At startup, the app reuses a running daemon or starts
+the installed daemon, then verifies its connection before restoring sessions. A
+failed start leaves saved sessions available for retry. The app does not install,
+replace or stop the shared daemon.
 
 For older CLIs without shared commands, the app-owned server remains available.
 Its mobile mutations require `--remote-control-client-name` to avoid replacing
