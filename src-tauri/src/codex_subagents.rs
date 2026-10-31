@@ -401,6 +401,33 @@ mod tests {
         let mut empty=page();empty["agents"]=json!([]);state.page(PARENT,empty).unwrap();assert!(state.agents.is_empty());
     }
     #[test]
+    fn subagents_unknown_live_runtime_is_visible_but_all_controls_stay_unsent() {
+        for explicit_null in [false,true] {
+            let mut value=page();value["agents"][0]["status"]=json!("unknown");
+            value["agents"][0]["capabilities"]=json!({"send":false,"interrupt":false,"close":false,"resume":false});
+            if explicit_null {value["agents"][0]["activeTurnId"]=Value::Null;} else {value["agents"][0].as_object_mut().unwrap().remove("activeTurnId");}
+            for request in [send(),SubagentRequest::Interrupt {agent_id:CHILD.into(),request_id:REQUEST.into(),expected_turn_id:TURN.into(),expected_parent_runtime_id:PARENT_RUNTIME.into(),expected_runtime_id:Some(RUNTIME.into())},
+                SubagentRequest::Close {agent_id:CHILD.into(),request_id:REQUEST.into(),expected_parent_runtime_id:PARENT_RUNTIME.into(),expected_runtime_id:Some(RUNTIME.into())},
+                SubagentRequest::Resume {agent_id:CHILD.into(),request_id:REQUEST.into(),expected_parent_runtime_id:PARENT_RUNTIME.into(),expected_runtime_id:Some(RUNTIME.into())}] {
+                let connection=connection();let (mut rpc,mut peer)=raw_rpc();
+                let server=thread::spawn(move|| {initialize_peer(&mut peer,json!({"supportsSubagentManagement":true}));assert!(peer.read().is_err(),"보존된 불명 실행의 권한이 모두 false이면 관리 프레임을 보내면 안 됩니다.");});
+                let result=with_request(&connection.0.subagents,&request,|state| {
+                    let normalized=state.page(PARENT,value.clone())?;
+                    assert_eq!(normalized["mutationState"],"clear","전역 불명 잠금과 무관하게 항목 권한을 확인합니다.");
+                    assert_eq!(normalized["agents"][0]["status"],"unknown");assert_eq!(normalized["agents"][0]["runtimeId"],RUNTIME);
+                    assert!(normalized["agents"][0]["activeTurnId"].is_null());
+                    assert_eq!(normalized["agents"][0]["capabilities"],json!({"send":false,"interrupt":false,"close":false,"resume":false}));
+                    exchange(&connection.0,state,&mut rpc,PARENT,&request,&Arc::new(AtomicBool::new(false)),Instant::now()+RPC_TIMEOUT)
+                }).unwrap();
+                assert_eq!(result["status"],"notApplied");assert!(result["reason"].as_str().unwrap().contains("지원하지 않습니다"));
+                let state=connection.0.subagents.lock().unwrap();assert!(state.receipts.is_empty());assert!(state.unresolved.is_none());
+                drop(state);drop(rpc);server.join().unwrap();assert!(!*connection.0.input.lock().unwrap());
+            }
+            value["agents"][0]["status"]=json!("closed");
+            assert!(State::default().page(PARENT,value).is_err(),"closed와 살아 있는 runtimeId 조합은 계속 거절해야 합니다.");
+        }
+    }
+    #[test]
     fn subagents_unsupported_sends_no_list_or_mutation_rpc() {
         for request in [SubagentRequest::List {cursor:None},send()] {
             let (mut rpc,mut peer)=raw_rpc();
