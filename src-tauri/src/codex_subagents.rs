@@ -15,6 +15,9 @@ pub enum SubagentRequest {
     Resume { agent_id: String, request_id: String, expected_parent_runtime_id: String, #[serde(deserialize_with="nullable_runtime")] expected_runtime_id: Option<String> },
 }
 impl SubagentRequest {
+    pub(crate) fn receipt_identity(&self) -> Result<Option<(String,[u8;32])>,String> {
+        self.mutation().map(|(_,id,_)| {uuid(id)?;digest(self).map(|digest|(id.to_owned(),digest))}).transpose()
+    }
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::List { cursor } => return valid_cursor(cursor),
@@ -338,6 +341,22 @@ mod tests {
     fn initialize_peer(ws: &mut WebSocket<TcpStream>,capability: Value) {
         let request=read(ws);assert_eq!(request["method"],"initialize");reply(ws,&request["id"],capability);
         assert_eq!(read(ws)["method"],"initialized");
+    }
+    impl ConversationConnection {
+        pub(crate) fn fixture_subagent_connection() -> Self {connection()}
+        pub(crate) fn fixture_subagent_lost_reply(&self,parent: &str,request: SubagentRequest) -> Result<Value,String> {
+            let (mut rpc,mut peer)=raw_rpc();
+            let server=thread::spawn(move|| {initialize_peer(&mut peer,json!({"supportsSubagentManagement":true}));assert_eq!(read(&mut peer)["method"],CONTROL);});
+            let result=with_request(&self.0.subagents,&request,|state| {
+                request.validate()?;state.bind(parent)?;
+                let (agent,_,_)=request.mutation().unwrap();let (parent_runtime,runtime)=request.expected_runtime().unwrap();
+                let mut value=page();value["parentThreadId"]=json!(parent);value["parentRuntimeId"]=json!(parent_runtime);
+                value["agents"][0]["id"]=json!(agent);value["agents"][0]["parentThreadId"]=json!(parent);value["agents"][0]["runtimeId"]=json!(runtime);
+                state.page(parent,value)?;
+                exchange(&self.0,state,&mut rpc,parent,&request,&Arc::new(AtomicBool::new(false)),Instant::now()+RPC_TIMEOUT)
+            });
+            drop(rpc);server.join().unwrap();result
+        }
     }
     #[test]
     fn subagents_requests_validate_identity_bytes_and_strict_fields() {

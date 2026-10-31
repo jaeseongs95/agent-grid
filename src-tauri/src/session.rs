@@ -163,12 +163,16 @@ struct Session {
     stop_requested: Arc<AtomicBool>,
     cleanup_failed: AtomicBool,
     process: Mutex<Option<Arc<ProcessControl>>>,
+    // 프로세스가 정리돼도 같은 세대의 결과 불명을 확정 미적용으로 바꾸지 않는다.
+    // 복원 메타데이터(None)는 이전 실행의 영수증 유무를 증명하지 않는다.
+    subagent_receipts: Mutex<Option<HashMap<String, SubagentReceipt>>>,
     flow: OutputFlow,
     done: (Mutex<bool>, Condvar),
     sink: EventSink,
     store: Arc<Mutex<Store>>,
     attachments: crate::conversation_attachments::ConversationAttachments,
 }
+struct SubagentReceipt { digest: [u8;32], status: &'static str }
 impl Session {
     fn info(&self) -> Result<SessionInfo, String> {
         let guard = self.info.lock().map_err(|_| "session metadata lock poisoned")?;
@@ -312,7 +316,7 @@ impl Engine {
         let attachments = crate::conversation_attachments::ConversationAttachments::default();
         let mut sessions = HashMap::new();
         for info in saved {
-            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone(), attachments:attachments.clone() }));
+            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), subagent_receipts: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone(), attachments:attachments.clone() }));
         }
         Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: Arc::new(AtomicBool::new(false)), attachments, runtime: Mutex::new(RuntimeSelection::default()) }) })
     }
@@ -348,7 +352,7 @@ impl Engine {
             live_ids.push(info.id.clone());
             store.prune_sessions(&live_ids)?;
         }
-        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone(),attachments:self.inner.attachments.clone() });
+        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), subagent_receipts: Mutex::new(Some(HashMap::new())), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone(),attachments:self.inner.attachments.clone() });
         if let Some(id) = retired_id { sessions.remove(&id); }
         sessions.insert(info.id.clone(), session.clone());
         drop(sessions);
@@ -799,13 +803,37 @@ impl Engine {
         connection.request_for_session(&thread_id, Path::new(&info.cwd), request,id,self.inner.attachments.clone())
     }
 
+    fn with_subagent_receipt(&self,id: &str,generation: u64,request: codex::SubagentRequest,execute: impl FnOnce(Arc<Session>,codex::SubagentRequest)->Result<serde_json::Value,String>) -> Result<serde_json::Value,String> {
+        // 찾을 수 없거나 교체된 세대의 영수증을 현재 세대의 미송신으로 단정하지 않는다.
+        let session=self.lookup(id,generation)?;
+        let Some((request_id,digest))=request.receipt_identity()? else {return execute(session,request);};
+        {
+            let mut receipts=session.subagent_receipts.lock().map_err(|_|"하위 에이전트 영수증 상태 오류")?;
+            let receipts=receipts.as_mut().ok_or("복원된 세션의 이전 하위 에이전트 요청 결과를 확인할 수 없습니다. 확정 미적용으로 처리하지 않았습니다.")?;
+            if let Some(receipt)=receipts.get(&request_id) {
+                if receipt.digest!=digest {return Err("동일 요청 식별자에 다른 하위 에이전트 변경을 지정할 수 없습니다.".into());}
+                return Ok(serde_json::json!({"status":receipt.status}));
+            }
+            if receipts.len()>=1024 {return Ok(serde_json::json!({"status":"notApplied","reason":"세션의 하위 에이전트 영수증 상한에 도달해 새 요청을 보내지 않았습니다."}));}
+            // 새 요청만 수락 검사로 들어간다. 동시 재조회는 이 진행 중 기록을 본다.
+            receipts.insert(request_id.clone(),SubagentReceipt {digest,status:"unknown"});
+        }
+        let result=execute(session.clone(),request);
+        let status=match result.as_ref().ok().and_then(|value|value["status"].as_str()) {
+            Some("applied")=>"applied",Some("notApplied")=>"notApplied",Some("unsupported")=>"unsupported",_=>"unknown",
+        };
+        let mut receipts=session.subagent_receipts.lock().map_err(|_|"하위 에이전트 영수증 상태 오류")?;
+        if let Some(receipt)=receipts.as_mut().and_then(|receipts|receipts.get_mut(&request_id)) {receipt.status=status;}
+        result
+    }
+
     pub fn subagents_request(&self, id: &str, generation: u64, request: codex::SubagentRequest) -> Result<serde_json::Value, String> {
+        self.with_subagent_receipt(id,generation,request,|session,request| {
         let mutation = !matches!(&request, codex::SubagentRequest::List { .. });
-        // 이 구간은 전송 전에 끝난다. 수락 실패를 송신 후 결과 불명으로 바꾸지 않는다.
+        // 기존·진행 중 영수증 조회 뒤의 새 요청에만 확정 미송신 결과를 돌려준다.
         let admitted = (|| {
             request.validate()?;
             if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 하위 에이전트 요청을 시작하지 않았습니다.".to_owned()); }
-            let session = self.lookup(id, generation)?;
             if session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) { return Err("실행 중인 세션에서만 하위 에이전트를 관리할 수 있습니다.".into()); }
             let info = session.info.lock().map_err(|_| "하위 에이전트 부모 세션 상태 오류")?.clone();
             let thread_id = info.thread_id.ok_or("부모 대화 식별자가 아직 확인되지 않았습니다.")?;
@@ -821,6 +849,7 @@ impl Engine {
             Err(reason) => return Err(reason),
         };
         connection.subagents_request(&thread_id, Path::new(&cwd), request)
+        })
     }
 
     pub fn cron_request(&self,id: &str,generation: u64,request: codex::CronRequest) -> Result<serde_json::Value,String> {
@@ -1187,8 +1216,74 @@ mod lifecycle_tests {
             let result = engine.subagents_request(&info.id, info.generation, send()).unwrap();
             assert_eq!(result["status"], "notApplied"); assert!(result["reason"].is_string());
         }
-        assert_eq!(engine.subagents_request(&info.id, info.generation + 1, send()).unwrap()["status"], "notApplied");
+        assert!(engine.subagents_request(&info.id, info.generation + 1, send()).unwrap_err().contains("stale"));
         assert!(session.process.lock().unwrap().is_none()); session.finish("stopped").unwrap();
+    }
+
+    fn subagent_send_value() -> serde_json::Value {
+        serde_json::json!({"type":"send","agentId":Uuid::new_v4().to_string(),"requestId":Uuid::new_v4().to_string(),"text":"합성 지시",
+            "expectedParentRuntimeId":Uuid::new_v4().to_string(),"expectedRuntimeId":Uuid::new_v4().to_string()})
+    }
+
+    #[test]
+    fn subagent_engine_preserves_sent_unknown_across_stop_exit_phase_process_and_stale_lookup() {
+        for boundary in 0..4 {
+            let engine=Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
+            let session=engine.allocate(&request()).unwrap();let info=session.info().unwrap();let parent=Uuid::new_v4().to_string();
+            session.phase.store(1,Ordering::Release);session.info.lock().unwrap().thread_id=Some(parent.clone());
+            let value=subagent_send_value();let send=||serde_json::from_value::<codex::SubagentRequest>(value.clone()).unwrap();
+            let connection=codex::ConversationConnection::fixture_subagent_connection();
+            let first=engine.with_subagent_receipt(&info.id,info.generation,send(),|_,request|connection.fixture_subagent_lost_reply(&parent,request)).unwrap();
+            assert_eq!(first["status"],"unknown","실제 CONTROL 송신 후 응답 유실을 먼저 확인합니다.");
+            match boundary {
+                0=>session.stop_requested.store(true,Ordering::Release),
+                1=>engine.inner.exiting.store(true,Ordering::Release),
+                2=>session.phase.store(2,Ordering::Release),
+                _=>{assert!(session.process.lock().unwrap().is_none());},
+            }
+            let repeated=engine.subagents_request(&info.id,info.generation,send()).unwrap();
+            assert_eq!(repeated["status"],"unknown","종료·프로세스 소실 뒤 기존 요청을 미적용으로 바꾸면 안 됩니다.");
+            let fresh=serde_json::from_value(subagent_send_value()).unwrap();
+            assert_eq!(engine.subagents_request(&info.id,info.generation,fresh).unwrap()["status"],"notApplied");
+            assert!(engine.subagents_request(&info.id,info.generation+1,send()).unwrap_err().contains("stale"));
+            assert_eq!(engine.subagents_request(&info.id,info.generation,send()).unwrap()["status"],"unknown");
+            let mut different=value.clone();different["text"]=serde_json::json!("다른 내용");
+            assert!(engine.subagents_request(&info.id,info.generation,serde_json::from_value(different).unwrap()).is_err());
+            assert!(session.process.lock().unwrap().is_none(),"추가 송신을 위한 프로세스·통로를 만들지 않습니다.");
+            session.finish("stopped").unwrap();
+        }
+    }
+
+    #[test]
+    fn subagent_engine_reads_inflight_receipt_before_shutdown_admission() {
+        let engine=Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();let session=engine.allocate(&request()).unwrap();let info=session.info().unwrap();
+        let value=subagent_send_value();let send=||serde_json::from_value::<codex::SubagentRequest>(value.clone()).unwrap();
+        let result=engine.with_subagent_receipt(&info.id,info.generation,send(),|session,_| {
+            session.stop_requested.store(true,Ordering::Release);engine.inner.exiting.store(true,Ordering::Release);
+            assert_eq!(engine.subagents_request(&info.id,info.generation,send()).unwrap()["status"],"unknown");
+            let fresh=serde_json::from_value(subagent_send_value()).unwrap();
+            assert_eq!(engine.subagents_request(&info.id,info.generation,fresh).unwrap()["status"],"notApplied");
+            Err("진행 중 요청의 최종 결과 미확인".into())
+        });
+        assert!(result.is_err());assert_eq!(engine.subagents_request(&info.id,info.generation,send()).unwrap()["status"],"unknown");session.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn subagent_engine_receipts_bound_new_admission_and_restored_state_is_unconfirmed() {
+        let engine=Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();let session=engine.allocate(&request()).unwrap();let info=session.info().unwrap();
+        let value=subagent_send_value();let send=||serde_json::from_value::<codex::SubagentRequest>(value.clone()).unwrap();
+        let (id,digest)=send().receipt_identity().unwrap().unwrap();
+        {
+            let mut ledger=session.subagent_receipts.lock().unwrap();let ledger=ledger.as_mut().unwrap();
+            ledger.insert(id,SubagentReceipt {digest,status:"unknown"});
+            for _ in 1..1024 {ledger.insert(Uuid::new_v4().to_string(),SubagentReceipt {digest:[0;32],status:"applied"});}
+        }
+        assert_eq!(engine.subagents_request(&info.id,info.generation,send()).unwrap()["status"],"unknown");
+        let fresh=serde_json::from_value(subagent_send_value()).unwrap();
+        assert_eq!(engine.subagents_request(&info.id,info.generation,fresh).unwrap()["status"],"notApplied");
+        *session.subagent_receipts.lock().unwrap()=None;
+        assert!(engine.subagents_request(&info.id,info.generation,send()).unwrap_err().contains("이전 하위 에이전트 요청 결과를 확인할 수 없습니다"));
+        assert!(engine.subagents_request("확인할 수 없는 세션",info.generation,send()).is_err());session.finish("stopped").unwrap();
     }
 
     #[test]
