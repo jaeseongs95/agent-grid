@@ -6,7 +6,7 @@ const savedSessions = [
   { title: '이전 둘째 작업', cwd: 'D:\\startup-test', threadId: 'saved-b', resumeOnStartup: true },
 ];
 
-async function workspace(page: Page, options: { hold?: boolean; fail?: number; holdRetry?: boolean; saved?: boolean; holdSelected?: boolean; holdMutation?: boolean; failSelected?: number; failExit?: boolean } = {}) {
+async function workspace(page: Page, options: { hold?: boolean; fail?: number; holdRetry?: boolean; saved?: boolean; holdSelected?: boolean; holdMutation?: boolean; failSelected?: number; failExit?: boolean; selectionResult?: 'cancel' | 'reject' } = {}) {
   await page.addInitScript(({ options, savedSessions }) => {
     const state = window as any; state.isTauri = true;
     let callback = 0;
@@ -33,8 +33,10 @@ async function workspace(page: Page, options: { hold?: boolean; fail?: number; h
         if (command === 'get_ui_language') return 'ko';
         if (command === 'get_codex_settings') return settings();
         if (command === 'choose_codex_executable' || command === 'set_codex_executable') {
-          fixture.selected = 'B';
+          if (!options.selectionResult) fixture.selected = 'B';
           if (options.holdMutation) await new Promise<void>(resolve => { fixture.releaseMutation = resolve; });
+          if (options.selectionResult === 'cancel') return null;
+          if (options.selectionResult === 'reject') throw '선택 저장 시험 오류';
           return settings();
         }
         if (command === 'list_projects') return [];
@@ -318,4 +320,50 @@ for (const failPrepare of [false, true]) test(`최초 실행 파일 준비 ${fai
   await expect(page.locator('#runtime-banner')).toBeHidden();
   expect(await page.evaluate(() => (window as any).startupFixture.usageWith)).toEqual(['A']);
   expect(await calls(page, 'prepare_runtime')).toHaveLength(failPrepare ? 2 : 1);
+});
+
+for (const selectionResult of [undefined, 'cancel', 'reject'] as const) for (const failOriginal of [false, true]) test(`선택 ${selectionResult ?? '저장'}과 이전 준비 ${failOriginal ? '실패' : '성공'} 뒤 종료 실패는 건너뛴 현재 준비를 한 번 재개한다`, async ({ page }) => {
+  await workspace(page, { hold: true, holdRetry: true, fail: failOriginal ? 1 : 0, failExit: true, selectionResult });
+  await expect.poll(async () => (await calls(page, 'prepare_runtime')).length).toBe(1);
+  await page.locator('#settings-open').click(); await page.locator('#codex-settings-open').click();
+  await expect(page.locator('#codex-executable-choose')).toBeEnabled(); await page.locator('#codex-executable-choose').click();
+  await expect.poll(async () => (await calls(page, 'choose_codex_executable')).length).toBe(1);
+  await expect(page.locator('#codex-executable-choose')).toBeEnabled();
+  if (selectionResult === 'reject') await expect(page.locator('#codex-settings-error')).toContainText('선택 저장 시험 오류');
+  await closeSettings(page);
+  expect(await page.evaluate(() => (window as any).startupFixture.prepared)).toEqual(['A']);
+  await page.locator('#exit').click(); await page.locator('#confirm-exit').click();
+  await expect(page.locator('#confirm-exit')).toBeDisabled(); expect(await calls(page, 'complete_exit')).toEqual([]);
+  await page.evaluate(() => (window as any).startupFixture.releaseFor('A'));
+  await expect(page.locator('.toast.error').last()).toContainText('종료 시험 오류');
+  await expect(page.locator('#confirm-exit')).toBeEnabled();
+  const selected = selectionResult ? 'A' : 'B';
+  await expect.poll(() => page.evaluate(() => (window as any).startupFixture.prepared)).toEqual(['A', selected]);
+  expect(await page.evaluate(() => (window as any).startupFixture.exitPreparing)).toEqual([0]);
+  expect(await page.evaluate(() => (window as any).startupFixture.maxPreparing)).toBe(1);
+  expect(await calls(page, 'start_session')).toEqual([]); expect(await calls(page, 'weekly_usage')).toEqual([]);
+  await page.locator('#exit-dialog [data-close]').last().click();
+  await page.evaluate(selected => (window as any).startupFixture.releaseFor(selected), selected);
+  await expect(page.locator('.terminal-title')).toHaveText(savedSessions.map(item => item.title));
+  await expect(page.locator('#runtime-banner')).toBeHidden();
+  expect(await page.evaluate(() => (window as any).startupFixture.usageWith)).toEqual([selected]);
+  expect(await page.evaluate(() => (window as any).startupFixture.startedWith)).toEqual([selected, selected]);
+  expect(await calls(page, 'prepare_runtime')).toHaveLength(2);
+});
+
+test('선택 준비를 종료 실패 뒤 재개해도 실제 실패는 추가 자동 재시도 없이 보존한다', async ({ page }) => {
+  await workspace(page, { hold: true, failExit: true, failSelected: 1 });
+  await expect.poll(async () => (await calls(page, 'prepare_runtime')).length).toBe(1);
+  await selectExecutable(page); await closeSettings(page);
+  await page.locator('#exit').click(); await page.locator('#confirm-exit').click();
+  expect(await calls(page, 'complete_exit')).toEqual([]);
+  await page.evaluate(() => (window as any).startupFixture.releaseFor('A'));
+  await expect(page.locator('#confirm-exit')).toBeEnabled();
+  await expect(page.locator('#runtime-banner')).toContainText('새 실행 파일 준비 오류');
+  expect(await calls(page, 'prepare_runtime')).toHaveLength(2);
+  expect(await calls(page, 'start_session')).toEqual([]); expect(await calls(page, 'weekly_usage')).toEqual([]);
+  await page.locator('#exit-dialog [data-close]').last().click(); await page.locator('#runtime-retry').click();
+  await expect(page.locator('.terminal-title')).toHaveText(savedSessions.map(item => item.title));
+  expect(await calls(page, 'prepare_runtime')).toHaveLength(3);
+  expect(await page.evaluate(() => (window as any).startupFixture.usageWith)).toEqual(['B']);
 });

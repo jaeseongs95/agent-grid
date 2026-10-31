@@ -1016,9 +1016,11 @@ async function requestExit(allowUnconfirmedRemote = false) {
     button.disabled = false; unconfirmedExitButton.disabled = false; dismissButtons.forEach((control, index) => { control.disabled = dismissStates[index]; }); bindText(button, '세션 종료 후 앱 닫기', 'Stop sessions and exit');
     if (!completed) {
       exitInProgress = false; updateRestoreBanner(); extensionsButton.disabled = extensionsWasDisabled; if (native) languageSelect.disabled = languageWasDisabled;
-      if (!runtimeWasReady && runtimeReady) weeklyUsage.refresh();
+      // Skipped preparation clears its cache; an actual failure retains a rejected promise.
+      const resumePreparation = !runtimeWasReady && workspaceReady && (runtimeReady || !runtimePreparation);
+      if (resumePreparation) weeklyUsage.refresh();
       weeklyUsage.setVisible(nativeWindowVisible && runtimeReady);
-      if (!runtimeWasReady && runtimeReady) void resumeWorkspace().catch(error => notifyError('공유서버 준비 실패', 'Could not prepare the shared server', error));
+      if (resumePreparation) void resumeWorkspace().catch(error => notifyError('공유서버 준비 실패', 'Could not prepare the shared server', error));
     }
   }
 }
