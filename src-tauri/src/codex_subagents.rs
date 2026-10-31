@@ -265,7 +265,7 @@ fn exchange<S: Read+Write>(control: &Control,state: &mut State,rpc: &mut Rpc<S>,
     let mut params=json!({"parentThreadId":parent,"agentId":agent_id,"action":action,"requestId":request_id,"expectedParentRuntimeId":expected_parent_runtime,"expectedRuntimeId":expected_runtime});
     match request {SubagentRequest::Send { text,.. }=>params["text"]=json!(text),SubagentRequest::Interrupt { expected_turn_id,.. }=>params["expectedTurnId"]=json!(expected_turn_id),_=>{}}
     let receipt=Receipt {digest:digest(request)?,status:"unknown"};
-    let response=control_call(control,rpc,params,cancelled,|| {
+    let response=control_call(control,rpc,params,cancelled,deadline,|| {
         // 전송 함수의 마지막 사전 검사가 끝난 실제 송신 경계에서만 기록한다.
         state.receipts.insert(request_id.into(),receipt);state.unresolved=Some(request_id.into());state.unresolved_runtime=Some(expected_parent_runtime.into());
     })?;
@@ -283,18 +283,18 @@ fn exchange<S: Read+Write>(control: &Control,state: &mut State,rpc: &mut Rpc<S>,
     Ok(json!({"status":status}))
 }
 
-fn control_call<S: Read+Write>(control: &Control,rpc: &mut Rpc<S>,params: Value,cancelled: &AtomicBool,before_send: impl FnOnce()) -> Result<Value,String> {
+fn control_call<S: Read+Write>(control: &Control,rpc: &mut Rpc<S>,params: Value,cancelled: &AtomicBool,overall_deadline: Instant,before_send: impl FnOnce()) -> Result<Value,String> {
+    let deadline=rpc.deadline.map_or(overall_deadline,|deadline|deadline.min(overall_deadline));
     rpc.next_id+=1;let id=rpc.next_id;
     let message=Message::Text(json!({"id":id,"method":CONTROL,"params":params}).to_string().into());
     live(control,cancelled)?;
     check_cancelled(rpc.cancelled.as_ref())?;
-    if rpc.deadline.is_some_and(|deadline|Instant::now()>=deadline) {return Err("하위 에이전트 요청 기한이 지나 변경을 보내지 않았습니다.".into());}
+    if Instant::now()>=deadline {return Err("하위 에이전트 요청 기한이 지나 변경을 보내지 않았습니다.".into());}
     before_send();
     // 취소·기한 검사와 영수증 기록을 같은 전송 경계가 소유한다.
     // 이 뒤의 부분 송신·응답 유실은 결과 불명이며 재전송하지 않는다.
     rpc.ws.send(message)
         .map_err(|error|format!("하위 에이전트 변경 송신 결과를 확인할 수 없습니다: {error}"))?;
-    let deadline=rpc.deadline.unwrap_or_else(||Instant::now()+RPC_TIMEOUT);
     while Instant::now()<deadline {
         check_cancelled(rpc.cancelled.as_ref())?;
         if let Some(message)=rpc.read()? {if let Some(result)=response(&message,id) {return result;}}
@@ -533,7 +533,7 @@ mod tests {
             if boundary==1 {connection.0.stopped.store(true,Ordering::Release);}
             rpc.deadline=Some(if boundary==2 {Instant::now()-Duration::from_millis(1)} else {Instant::now()+RPC_TIMEOUT});
             let result=with_request(&connection.0.subagents,&send(),|state| {
-                control_call(&connection.0,&mut rpc,json!({"parentThreadId":PARENT,"agentId":CHILD,"action":"send","requestId":REQUEST}),&cancelled,|| {
+                control_call(&connection.0,&mut rpc,json!({"parentThreadId":PARENT,"agentId":CHILD,"action":"send","requestId":REQUEST}),&cancelled,Instant::now()+RPC_TIMEOUT,|| {
                     state.receipts.insert(REQUEST.into(),Receipt {digest:digest(&send()).unwrap(),status:"unknown"});
                     state.unresolved=Some(REQUEST.into());state.unresolved_runtime=Some(PARENT_RUNTIME.into());
                 })
@@ -542,6 +542,21 @@ mod tests {
             let state=connection.0.subagents.lock().unwrap();assert!(state.receipts.is_empty());assert!(state.unresolved.is_none());
             drop(state);drop(rpc);server.join().unwrap();
         }
+    }
+    #[test]
+    fn subagents_control_honors_expired_overall_deadline_without_rpc_deadline() {
+        let connection=connection();let (mut rpc,mut peer)=raw_rpc();assert!(rpc.deadline.is_none());
+        let server=thread::spawn(move||assert!(peer.read().is_err(),"전체 기한이 만료되면 RPC 자체 기한이 없어도 프레임을 보내면 안 됩니다."));
+        let cancelled=AtomicBool::new(false);
+        let result=with_request(&connection.0.subagents,&send(),|state| {
+            control_call(&connection.0,&mut rpc,json!({"parentThreadId":PARENT,"agentId":CHILD,"action":"send","requestId":REQUEST}),&cancelled,Instant::now()-Duration::from_millis(1),|| {
+                state.receipts.insert(REQUEST.into(),Receipt {digest:digest(&send()).unwrap(),status:"unknown"});
+                state.unresolved=Some(REQUEST.into());state.unresolved_runtime=Some(PARENT_RUNTIME.into());
+            })
+        }).unwrap();
+        assert_eq!(result["status"],"notApplied");
+        let state=connection.0.subagents.lock().unwrap();assert!(state.receipts.is_empty());assert!(state.unresolved.is_none());
+        drop(state);drop(rpc);server.join().unwrap();
     }
     #[test]
     fn subagents_busy_same_request_is_unknown_and_new_request_is_not_applied() {
