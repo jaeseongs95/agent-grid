@@ -77,7 +77,10 @@ pub(super) struct State {
     unresolved: Option<String>,
     unresolved_runtime: Option<String>,
     remote_unknown: bool,
+    in_flight: Option<InFlight>,
 }
+enum InFlight { List, Mutation { request_id: String, digest: [u8;32] } }
+#[derive(Clone)]
 struct Receipt { digest: [u8;32], status: &'static str }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -158,17 +161,57 @@ fn digest(request: &SubagentRequest) -> Result<[u8;32],String> {
     Ok(Sha256::digest(bytes).into())
 }
 
+// 공유 잠금은 인계·복원 때만 잡는다. 바깥 상태에는 진행 중 식별자와 기존
+// 영수증만 남겨, 다른 새 요청의 확정 미송신과 같은 요청의 결과 불명을 구분한다.
+struct Checkout<'a> { shared: &'a Mutex<State>, state: Option<State> }
+impl Drop for Checkout<'_> {
+    fn drop(&mut self) {
+        if let Some(state)=self.state.take() {*self.shared.lock().unwrap_or_else(|error|error.into_inner())=state;}
+    }
+}
+fn with_request(shared: &Mutex<State>,request: &SubagentRequest,execute: impl FnOnce(&mut State)->Result<Value,String>) -> Result<Value,String> {
+    let mut slot=shared.lock().map_err(|_|"하위 에이전트 관리 상태 오류")?;
+    if let Some(active)=&slot.in_flight {
+        let Some((_,id,_))=request.mutation() else {return Err("하위 에이전트 요청이 이미 진행 중입니다.".into());};
+        if let Some(receipt)=slot.receipts.get(id) {
+            if receipt.digest!=digest(request)? {return Err("동일 요청 식별자에 다른 하위 에이전트 변경을 지정할 수 없습니다.".into());}
+            return Ok(json!({"status":receipt.status}));
+        }
+        if let InFlight::Mutation {request_id,digest:active_digest}=active {
+            if request_id==id {
+                if *active_digest!=digest(request)? {return Err("진행 중인 요청 식별자에 다른 변경을 지정할 수 없습니다.".into());}
+                return Ok(json!({"status":"unknown","reason":"같은 하위 에이전트 요청이 진행 중입니다."}));
+            }
+        }
+        return Ok(json!({"status":"notApplied","reason":"다른 하위 에이전트 요청이 진행 중이어서 새 요청을 보내지 않았습니다."}));
+    }
+    let active=match request.mutation() {
+        None=>InFlight::List,
+        Some((_,id,_))=>InFlight::Mutation {request_id:id.into(),digest:digest(request)?},
+    };
+    let local=std::mem::take(&mut *slot);
+    slot.receipts=local.receipts.clone();slot.in_flight=Some(active);
+    drop(slot);
+    let mut checkout=Checkout {shared,state:Some(local)};
+    let state=checkout.state.as_mut().unwrap();
+    let result=execute(state);
+    match (result,request.mutation()) {
+        (Err(reason),Some((_,id,_)))=>match state.receipts.get(id) {
+            Some(receipt) if receipt.digest==digest(request)?=>Ok(json!({"status":receipt.status,"reason":reason})),
+            Some(_)=>Err(reason),
+            None=>Ok(json!({"status":"notApplied","reason":reason})),
+        },
+        (result,_)=>result,
+    }
+}
+
 impl ConversationConnection {
     pub(crate) fn subagents_request(&self, thread_id: &str, _cwd: &Path, request: SubagentRequest) -> Result<Value,String> {
+        with_request(&self.0.subagents,&request,|state| {
         request.validate()?; uuid(thread_id)?;
-        // 대화의 입력 소유권·GUI 작업자 잠금을 획득하지 않는다. 조회도 단일 요청으로 제한한다.
-        let mut state=self.0.subagents.try_lock().map_err(|error|match error {
-            std::sync::TryLockError::WouldBlock=>"하위 에이전트 요청이 이미 진행 중입니다.",
-            std::sync::TryLockError::Poisoned(_)=>"하위 에이전트 관리 상태 오류",
-        })?;
         state.bind(thread_id)?;
-        live(&self.0,&AtomicBool::new(false))?;
         if let Some(previous)=state.previous(&request)? {return Ok(previous);}
+        live(&self.0,&AtomicBool::new(false))?;
         let deadline=Instant::now()+RPC_TIMEOUT;
         let cancelled=Arc::new(AtomicBool::new(false));
         let transport=Arc::new(Mutex::new(Transport::default()));
@@ -177,7 +220,7 @@ impl ConversationConnection {
             Endpoint::Shared(endpoint)=>{
                 let mut proxy=endpoint.open_until(Some(cancelled.clone()),Some(deadline))?;
                 transport.lock().map_err(|_|"하위 에이전트 연결 정리 상태 오류")?.proxy=proxy.job.as_ref().map(Arc::downgrade);
-                let result=exchange(&self.0,&mut state,proxy.rpc.as_mut().ok_or("하위 에이전트 연결을 찾을 수 없습니다.")?,thread_id,&request,&cancelled,deadline);
+                let result=exchange(&self.0,state,proxy.rpc.as_mut().ok_or("하위 에이전트 연결을 찾을 수 없습니다.")?,thread_id,&request,&cancelled,deadline);
                 match (result,proxy.finish()) { (Ok(result),Ok(()))=>Ok(result),(Err(error),Ok(()))=>Err(error),(result,Err(error))=>Err(format!("{}; 하위 에이전트 연결 정리 실패: {error}",result.err().unwrap_or_default())) }
             },
             Endpoint::Owned { address,token,job }=>{
@@ -186,10 +229,11 @@ impl ConversationConnection {
                 job.upgrade().ok_or("기존 대화 서버가 종료되었습니다.")?.verify_tcp_peer(&stream).map_err(|_|"하위 에이전트 서버의 연결 소유권을 확인할 수 없습니다.")?;
                 transport.lock().map_err(|_|"하위 에이전트 연결 정리 상태 오류")?.socket=Some(stream.try_clone().map_err(|error|error.to_string())?);
                 let mut rpc=authenticated_socket(address,token,stream)?;
-                let result=exchange(&self.0,&mut state,&mut rpc,thread_id,&request,&cancelled,deadline);
+                let result=exchange(&self.0,state,&mut rpc,thread_id,&request,&cancelled,deadline);
                 let _=rpc.ws.get_ref().shutdown(Shutdown::Both); result
             },
         }
+        })
     }
 }
 
@@ -220,12 +264,11 @@ fn exchange<S: Read+Write>(control: &Control,state: &mut State,rpc: &mut Rpc<S>,
     }
     let mut params=json!({"parentThreadId":parent,"agentId":agent_id,"action":action,"requestId":request_id,"expectedParentRuntimeId":expected_parent_runtime,"expectedRuntimeId":expected_runtime});
     match request {SubagentRequest::Send { text,.. }=>params["text"]=json!(text),SubagentRequest::Interrupt { expected_turn_id,.. }=>params["expectedTurnId"]=json!(expected_turn_id),_=>{}}
-    live(control,cancelled)?;check_cancelled(rpc.cancelled.as_ref())?;
-    if Instant::now()>=deadline {return Err("하위 에이전트 요청 기한이 지나 변경을 보내지 않았습니다.".into());}
     let receipt=Receipt {digest:digest(request)?,status:"unknown"};
-    // 마지막 사전 검사 뒤 실제 송신 경계. 부분 송신·응답 유실은 재시도하지 않는다.
-    state.receipts.insert(request_id.into(),receipt);state.unresolved=Some(request_id.into());state.unresolved_runtime=Some(expected_parent_runtime.into());
-    let response=rpc.call(CONTROL,params)?;
+    let response=control_call(control,rpc,params,cancelled,|| {
+        // 전송 함수의 마지막 사전 검사가 끝난 실제 송신 경계에서만 기록한다.
+        state.receipts.insert(request_id.into(),receipt);state.unresolved=Some(request_id.into());state.unresolved_runtime=Some(expected_parent_runtime.into());
+    })?;
     live(control,cancelled)?;
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -238,6 +281,25 @@ fn exchange<S: Read+Write>(control: &Control,state: &mut State,rpc: &mut Rpc<S>,
     state.receipts.get_mut(request_id).unwrap().status=status;
     if status!="unknown" {state.unresolved=None;state.unresolved_runtime=None;}
     Ok(json!({"status":status}))
+}
+
+fn control_call<S: Read+Write>(control: &Control,rpc: &mut Rpc<S>,params: Value,cancelled: &AtomicBool,before_send: impl FnOnce()) -> Result<Value,String> {
+    rpc.next_id+=1;let id=rpc.next_id;
+    let message=Message::Text(json!({"id":id,"method":CONTROL,"params":params}).to_string().into());
+    live(control,cancelled)?;
+    check_cancelled(rpc.cancelled.as_ref())?;
+    if rpc.deadline.is_some_and(|deadline|Instant::now()>=deadline) {return Err("하위 에이전트 요청 기한이 지나 변경을 보내지 않았습니다.".into());}
+    before_send();
+    // 취소·기한 검사와 영수증 기록을 같은 전송 경계가 소유한다.
+    // 이 뒤의 부분 송신·응답 유실은 결과 불명이며 재전송하지 않는다.
+    rpc.ws.send(message)
+        .map_err(|error|format!("하위 에이전트 변경 송신 결과를 확인할 수 없습니다: {error}"))?;
+    let deadline=rpc.deadline.unwrap_or_else(||Instant::now()+RPC_TIMEOUT);
+    while Instant::now()<deadline {
+        check_cancelled(rpc.cancelled.as_ref())?;
+        if let Some(message)=rpc.read()? {if let Some(result)=response(&message,id) {return result;}}
+    }
+    Err("하위 에이전트 변경 응답 기한이 지나 결과 불명을 보존했습니다.".into())
 }
 
 #[cfg(test)]
@@ -402,11 +464,102 @@ mod tests {
     }
     #[test]
     fn subagents_concurrent_or_stopped_requests_fail_before_opening_a_transport() {
-        let connection=connection();let state=connection.0.subagents.lock().unwrap();
-        assert!(connection.subagents_request(PARENT,Path::new("."),SubagentRequest::List {cursor:None}).unwrap_err().contains("이미 진행"));
-        drop(state);connection.0.stopped.store(true,Ordering::Release);
+        let connection=connection();
+        with_request(&connection.0.subagents,&SubagentRequest::List {cursor:None},|_| {
+            assert!(connection.subagents_request(PARENT,Path::new("."),SubagentRequest::List {cursor:None}).unwrap_err().contains("이미 진행"));
+            Ok(json!({}))
+        }).unwrap();
+        connection.0.stopped.store(true,Ordering::Release);
         assert!(connection.subagents_request(PARENT,Path::new("."),SubagentRequest::List {cursor:None}).unwrap_err().contains("종료"));
+        assert_eq!(connection.subagents_request(PARENT,Path::new("."),send()).unwrap()["status"],"notApplied");
         assert!(!*connection.0.input.lock().unwrap());assert!(connection.0.worker.lock().unwrap().is_none());
+    }
+    #[test]
+    fn subagents_pretransmission_initialize_failure_returns_not_applied_and_allows_recovery() {
+        let connection=connection();let (mut rpc,mut peer)=raw_rpc();
+        let server=thread::spawn(move|| {
+            let initialize=read(&mut peer);assert_eq!(initialize["method"],"initialize");
+            peer.send(Message::Text(json!({"id":initialize["id"],"error":{"code":-1,"message":"초기화 실패"}}).to_string().into())).unwrap();
+            assert!(peer.read().is_err(),"초기화 실패 뒤 관리 요청을 보내면 안 됩니다.");
+        });
+        let result=with_request(&connection.0.subagents,&send(),|state|
+            exchange(&connection.0,state,&mut rpc,PARENT,&send(),&Arc::new(AtomicBool::new(false)),Instant::now()+RPC_TIMEOUT)).unwrap();
+        assert_eq!(result["status"],"notApplied");drop(rpc);server.join().unwrap();
+        let (mut rpc,mut peer)=raw_rpc();let server=thread::spawn(move|| {
+            initialize_peer(&mut peer,json!({"supportsSubagentManagement":true}));let wire=read(&mut peer);assert_eq!(wire["method"],CONTROL);reply(&mut peer,&wire["id"],json!({"status":"applied"}));
+        });
+        let result=with_request(&connection.0.subagents,&send(),|state| {
+            assert!(state.receipts.is_empty());assert!(state.unresolved.is_none());assert!(state.in_flight.is_none());
+            state.page(PARENT,page())?;assert!(state.previous(&send())?.is_none());
+            exchange(&connection.0,state,&mut rpc,PARENT,&send(),&Arc::new(AtomicBool::new(false)),Instant::now()+RPC_TIMEOUT)
+        }).unwrap();
+        assert_eq!(result["status"],"applied");server.join().unwrap();
+    }
+    #[test]
+    fn subagents_stale_runtime_is_not_applied_but_lost_control_reply_remains_unknown() {
+        for transmitted in [false,true] {
+            let connection=connection();let (mut rpc,mut peer)=raw_rpc();
+            let server=thread::spawn(move|| {
+                initialize_peer(&mut peer,json!({"supportsSubagentManagement":true}));
+                if transmitted {assert_eq!(read(&mut peer)["method"],CONTROL);} else {assert!(peer.read().is_err(),"실행 세대 사전 오류 뒤 관리 요청을 보내면 안 됩니다.");}
+            });
+            let result=with_request(&connection.0.subagents,&send(),|state| {
+                let mut value=page();if !transmitted {value["parentRuntimeId"]=json!(Uuid::new_v4().to_string());}state.page(PARENT,value)?;
+                exchange(&connection.0,state,&mut rpc,PARENT,&send(),&Arc::new(AtomicBool::new(false)),Instant::now()+RPC_TIMEOUT)
+            }).unwrap();
+            assert_eq!(result["status"],if transmitted {"unknown"} else {"notApplied"});drop(rpc);server.join().unwrap();
+            let state=connection.0.subagents.lock().unwrap();
+            if transmitted {assert_eq!(state.unresolved.as_deref(),Some(REQUEST));assert_eq!(state.previous(&send()).unwrap().unwrap()["status"],"unknown");}
+            else {assert!(state.unresolved.is_none());assert!(state.receipts.is_empty());}
+            drop(state);
+            if transmitted {
+                connection.0.stopped.store(true,Ordering::Release);
+                assert_eq!(connection.subagents_request(PARENT,Path::new("."),send()).unwrap()["status"],"unknown","연결 종료는 기존 송신 결과 불명을 미적용으로 바꾸면 안 됩니다.");
+            }
+        }
+    }
+    #[test]
+    fn subagents_open_failure_is_confirmed_not_applied_without_a_receipt() {
+        let connection=connection();
+        assert_eq!(connection.subagents_request(PARENT,Path::new("."),send()).unwrap()["status"],"notApplied");
+        let state=connection.0.subagents.lock().unwrap();assert!(state.receipts.is_empty());assert!(state.unresolved.is_none());assert!(state.in_flight.is_none());
+    }
+    #[test]
+    fn subagents_control_entry_cancellation_stop_or_deadline_writes_no_frame_or_receipt() {
+        for boundary in 0..3 {
+            let connection=connection();let (mut rpc,mut peer)=raw_rpc();
+            let server=thread::spawn(move||assert!(peer.read().is_err(),"이미 취소·종료·만료된 관리 요청은 프레임을 보내면 안 됩니다."));
+            let cancelled=Arc::new(AtomicBool::new(boundary==0));rpc.cancelled=Some(cancelled.clone());
+            if boundary==1 {connection.0.stopped.store(true,Ordering::Release);}
+            rpc.deadline=Some(if boundary==2 {Instant::now()-Duration::from_millis(1)} else {Instant::now()+RPC_TIMEOUT});
+            let result=with_request(&connection.0.subagents,&send(),|state| {
+                control_call(&connection.0,&mut rpc,json!({"parentThreadId":PARENT,"agentId":CHILD,"action":"send","requestId":REQUEST}),&cancelled,|| {
+                    state.receipts.insert(REQUEST.into(),Receipt {digest:digest(&send()).unwrap(),status:"unknown"});
+                    state.unresolved=Some(REQUEST.into());state.unresolved_runtime=Some(PARENT_RUNTIME.into());
+                })
+            }).unwrap();
+            assert_eq!(result["status"],"notApplied");
+            let state=connection.0.subagents.lock().unwrap();assert!(state.receipts.is_empty());assert!(state.unresolved.is_none());
+            drop(state);drop(rpc);server.join().unwrap();
+        }
+    }
+    #[test]
+    fn subagents_busy_same_request_is_unknown_and_new_request_is_not_applied() {
+        let shared=Mutex::new(State::default());
+        let result=with_request(&shared,&send(),|state| {
+            let duplicate=with_request(&shared,&send(),|_|panic!("같은 진행 요청을 실행하면 안 됩니다.")).unwrap();
+            assert_eq!(duplicate["status"],"unknown");
+            let fresh=SubagentRequest::Close {agent_id:CHILD.into(),request_id:Uuid::new_v4().to_string(),expected_parent_runtime_id:PARENT_RUNTIME.into(),expected_runtime_id:Some(RUNTIME.into())};
+            let rejected=with_request(&shared,&fresh,|_|panic!("다른 새 요청을 실행하면 안 됩니다.")).unwrap();assert_eq!(rejected["status"],"notApplied");
+            let changed=SubagentRequest::Send {agent_id:CHILD.into(),request_id:REQUEST.into(),text:"다른 내용".into(),expected_parent_runtime_id:PARENT_RUNTIME.into(),expected_runtime_id:Some(RUNTIME.into())};
+            assert!(with_request(&shared,&changed,|_|panic!("다른 내용을 실행하면 안 됩니다.")).is_err());
+            // 실제 송신을 시도한 뒤의 실패 상태와 같이 기록한다.
+            state.receipts.insert(REQUEST.into(),Receipt {digest:digest(&send())?,status:"unknown"});state.unresolved=Some(REQUEST.into());state.unresolved_runtime=Some(PARENT_RUNTIME.into());
+            Err("관리 응답 유실".into())
+        }).unwrap();
+        assert_eq!(result["status"],"unknown");
+        let repeated=with_request(&shared,&send(),|state|Ok(state.previous(&send())?.unwrap())).unwrap();assert_eq!(repeated["status"],"unknown");
+        assert!(shared.lock().unwrap().in_flight.is_none());
     }
     #[test]
     fn subagents_cancellation_and_deadline_abort_pending_io_without_late_management_send() {

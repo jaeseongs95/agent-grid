@@ -800,17 +800,27 @@ impl Engine {
     }
 
     pub fn subagents_request(&self, id: &str, generation: u64, request: codex::SubagentRequest) -> Result<serde_json::Value, String> {
-        request.validate()?;
-        if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 하위 에이전트 요청을 시작하지 않았습니다.".into()); }
-        let session = self.lookup(id, generation)?;
-        if session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) { return Err("실행 중인 세션에서만 하위 에이전트를 관리할 수 있습니다.".into()); }
-        let info = session.info.lock().map_err(|_| "하위 에이전트 부모 세션 상태 오류")?.clone();
-        let thread_id = info.thread_id.ok_or("부모 대화 식별자가 아직 확인되지 않았습니다.")?;
-        let process = session.process.lock().map_err(|_| "하위 에이전트 부모 프로세스 상태 오류")?.clone().ok_or("부모 프로세스를 확인할 수 없습니다.")?;
-        let connection = process.adapter.lock().map_err(|_| "하위 에이전트 연결 상태 오류")?.as_ref().and_then(CodexSession::conversation_connection).ok_or("이 세션은 하위 에이전트 관리 연결을 지원하지 않습니다.")?;
-        drop(process);
-        if self.inner.exiting.load(Ordering::Acquire) || session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) { return Err("세션이 종료 중이어서 하위 에이전트 요청을 시작하지 않았습니다.".into()); }
-        connection.subagents_request(&thread_id, Path::new(&info.cwd), request)
+        let mutation = !matches!(&request, codex::SubagentRequest::List { .. });
+        // 이 구간은 전송 전에 끝난다. 수락 실패를 송신 후 결과 불명으로 바꾸지 않는다.
+        let admitted = (|| {
+            request.validate()?;
+            if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 하위 에이전트 요청을 시작하지 않았습니다.".to_owned()); }
+            let session = self.lookup(id, generation)?;
+            if session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) { return Err("실행 중인 세션에서만 하위 에이전트를 관리할 수 있습니다.".into()); }
+            let info = session.info.lock().map_err(|_| "하위 에이전트 부모 세션 상태 오류")?.clone();
+            let thread_id = info.thread_id.ok_or("부모 대화 식별자가 아직 확인되지 않았습니다.")?;
+            let process = session.process.lock().map_err(|_| "하위 에이전트 부모 프로세스 상태 오류")?.clone().ok_or("부모 프로세스를 확인할 수 없습니다.")?;
+            let connection = process.adapter.lock().map_err(|_| "하위 에이전트 연결 상태 오류")?.as_ref().and_then(CodexSession::conversation_connection).ok_or("이 세션은 하위 에이전트 관리 연결을 지원하지 않습니다.")?;
+            drop(process);
+            if self.inner.exiting.load(Ordering::Acquire) || session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) { return Err("세션이 종료 중이어서 하위 에이전트 요청을 시작하지 않았습니다.".into()); }
+            Ok((connection, thread_id, info.cwd))
+        })();
+        let (connection, thread_id, cwd) = match admitted {
+            Ok(value) => value,
+            Err(reason) if mutation => return Ok(serde_json::json!({"status":"notApplied","reason":reason})),
+            Err(reason) => return Err(reason),
+        };
+        connection.subagents_request(&thread_id, Path::new(&cwd), request)
     }
 
     pub fn cron_request(&self,id: &str,generation: u64,request: codex::CronRequest) -> Result<serde_json::Value,String> {
@@ -1155,6 +1165,29 @@ mod lifecycle_tests {
         assert!(engine.subagents_request(&info.id, info.generation, list()).unwrap_err().contains("실행 중"));
         engine.inner.exiting.store(true, Ordering::Release);
         assert!(engine.subagents_request(&info.id, info.generation, list()).unwrap_err().contains("종료 중"));
+        assert!(session.process.lock().unwrap().is_none()); session.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn subagent_mutation_admission_is_known_not_applied_before_transport() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let session = engine.allocate(&request()).unwrap(); let info = session.info().unwrap();
+        let send = || codex::SubagentRequest::Send {
+            agent_id: Uuid::new_v4().to_string(), request_id: Uuid::new_v4().to_string(), text: "합성 지시".into(),
+            expected_parent_runtime_id: Uuid::new_v4().to_string(), expected_runtime_id: Some(Uuid::new_v4().to_string()),
+        };
+        for stage in 0..5 {
+            match stage {
+                1 => { session.phase.store(1, Ordering::Release); },
+                2 => { session.info.lock().unwrap().thread_id = Some(Uuid::new_v4().to_string()); },
+                3 => { session.stop_requested.store(true, Ordering::Release); },
+                4 => { engine.inner.exiting.store(true, Ordering::Release); },
+                _ => {},
+            }
+            let result = engine.subagents_request(&info.id, info.generation, send()).unwrap();
+            assert_eq!(result["status"], "notApplied"); assert!(result["reason"].is_string());
+        }
+        assert_eq!(engine.subagents_request(&info.id, info.generation + 1, send()).unwrap()["status"], "notApplied");
         assert!(session.process.lock().unwrap().is_none()); session.finish("stopped").unwrap();
     }
 

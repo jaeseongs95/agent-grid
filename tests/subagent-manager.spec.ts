@@ -207,6 +207,35 @@ test('종료는 두 단계 확인하고 취소·선택 변경은 확인을 해�
   expect((await mutations(page))[1].request).toMatchObject({ type: 'resume', agentId: 'agent-2' });
 });
 
+test('확정 미적용 응답은 초안을 보존하고 clear 목록 뒤 같은 세션의 새 요청을 허용한다', async ({ page }) => {
+  await fixture(page);
+  await page.evaluate(() => { (window as any).subagentFixture.reply = 'notApplied'; });
+  await page.locator('.subagent-prompt').fill('송신 전 거절 뒤 보존할 초안');
+  await page.locator('.subagent-send').click();
+  await expect.poll(async () => (await mutations(page)).length).toBe(1);
+  await expect(page.locator('.subagent-error')).toContainText('요청이 적용되지 않았습니다');
+  await expect(page.locator('.subagent-unknown')).toBeHidden();
+  await expect(page.locator('.subagent-remote-unknown')).toBeHidden();
+  await expect(page.locator('.subagent-prompt')).toHaveValue('송신 전 거절 뒤 보존할 초안');
+  await expect(page.locator('.subagent-send')).toBeDisabled();
+  await page.evaluate(() => {
+    const data = (window as any).subagentFixture;
+    data.reply = 'applied'; Object.assign(data.snapshot, { mutationState: 'clear', reconciledRequestId: null });
+  });
+  await refresh(page);
+  await expect(page.locator('.subagent-send')).toBeEnabled();
+  await expect(page.locator('.subagent-prompt')).toHaveValue('송신 전 거절 뒤 보존할 초안');
+  await page.locator('.subagent-send').click();
+  await expect.poll(async () => (await mutations(page)).length).toBe(2);
+  const calls = await mutations(page);
+  expect(calls.map((call: any) => ({ id: call.id, generation: call.generation, type: call.request.type, agentId: call.request.agentId, text: call.request.text }))).toEqual([
+    { id: 'session-a', generation: 9, type: 'send', agentId: 'agent-1', text: '송신 전 거절 뒤 보존할 초안' },
+    { id: 'session-a', generation: 9, type: 'send', agentId: 'agent-1', text: '송신 전 거절 뒤 보존할 초안' },
+  ]);
+  expect(calls[1].request.requestId).not.toBe(calls[0].request.requestId);
+  await expect(page.locator('.subagent-prompt')).toHaveValue('');
+});
+
 test('결과 미확인은 닫기·재열기 뒤에도 같은 요청의 정합화만 해제한다', async ({ page }) => {
   await fixture(page);
   await page.evaluate(() => { const data = (window as any).subagentFixture; data.reply = 'unknown'; data.holdMutation = true; });
