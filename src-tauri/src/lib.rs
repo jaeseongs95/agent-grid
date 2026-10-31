@@ -295,6 +295,9 @@ pub fn run() {
         std::process::exit(1);
     }
     let result = tauri::Builder::default()
+        // Claim the app before setup opens storage or restores any CLI sessions.
+        // A repeated launch only reveals the existing window, including from the tray.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .manage(ExitState::default())
         .manage(project::FolderPicker::default())
         .manage(executable_picker::ExecutablePicker::default())
