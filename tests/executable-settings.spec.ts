@@ -41,7 +41,7 @@ async function mockSettings(page: Page, options: { holdChoose?: boolean; unavail
     };
   }, { chosenPath, automaticPath, options });
   await page.goto('/');
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await page.locator('#settings-open').click();
   await page.locator('#codex-settings-open').click();
 }

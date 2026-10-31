@@ -58,6 +58,8 @@ struct ProcessControl {
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     job: Mutex<Option<ProcessJob>>,
     adapter: Mutex<Option<CodexSession>>,
+    #[cfg(windows)]
+    cron: Mutex<Option<codex::cron_control::CronConnection>>,
     termination: Mutex<()>,
     shared_cleanup_failed: AtomicBool,
     shared_stop_attempted: AtomicBool,
@@ -100,6 +102,18 @@ impl Drop for LaunchGuard {
     }
 }
 impl ProcessControl {
+    #[cfg(windows)]
+    fn cancel_cron(&self) {
+        if let Some(connection) = self.cron.lock().unwrap_or_else(|e|e.into_inner()).as_ref() { connection.cancel(); }
+    }
+
+    #[cfg(windows)]
+    fn finish_cron(&self,deadline: Instant) -> Result<(),String> {
+        let connection=self.cron.lock().map_err(|_|"예약 제어 종료 상태 오류")?.take();
+        if let Some(connection)=connection {connection.cancel();connection.wait_until(deadline)?;}
+        Ok(())
+    }
+
     fn close_io(&self) {
         let master = self.master.lock().unwrap_or_else(|e| e.into_inner()).take();
         drop(master); // Reader keeps draining during ClosePseudoConsole.
@@ -112,6 +126,7 @@ impl ProcessControl {
     }
     fn terminate_until(&self, deadline: Instant) -> Result<(), String> {
         let _termination = self.termination.lock().map_err(|_| "session termination lock poisoned")?;
+        #[cfg(windows)] self.cancel_cron();
         // adapter를 회수하는 PTY reaper와 경합하므로 먼저 해당 세션의 제어 핸들만
         // 복제한다. 외부 공유 서버의 프로세스 수명은 이 핸들이 소유하지 않는다.
         let shared = self.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().and_then(CodexSession::shared_control);
@@ -132,6 +147,7 @@ impl ProcessControl {
         #[cfg(windows)] let terminated = { let _ = kill_result; job_result };
         #[cfg(not(windows))] let terminated = { let _ = job_result; kill_result };
         terminated?;
+        #[cfg(windows)] self.finish_cron(deadline)?;
         // 원래 turn을 고정한 뒤 자기 TUI를 정리하고 정확한 ID만 중단한다.
         let result = stop.and_then(|stop| stop.map(|stop| stop.finish()).unwrap_or(Ok(())));
         self.shared_cleanup_failed.store(result.is_err(), Ordering::Release);
@@ -147,11 +163,16 @@ struct Session {
     stop_requested: Arc<AtomicBool>,
     cleanup_failed: AtomicBool,
     process: Mutex<Option<Arc<ProcessControl>>>,
+    // 프로세스가 정리돼도 같은 세대의 결과 불명을 확정 미적용으로 바꾸지 않는다.
+    // 복원 메타데이터(None)는 이전 실행의 영수증 유무를 증명하지 않는다.
+    subagent_receipts: Mutex<Option<HashMap<String, SubagentReceipt>>>,
     flow: OutputFlow,
     done: (Mutex<bool>, Condvar),
     sink: EventSink,
     store: Arc<Mutex<Store>>,
+    attachments: crate::conversation_attachments::ConversationAttachments,
 }
+struct SubagentReceipt { digest: [u8;32], status: &'static str }
 impl Session {
     fn info(&self) -> Result<SessionInfo, String> {
         let guard = self.info.lock().map_err(|_| "session metadata lock poisoned")?;
@@ -220,7 +241,9 @@ impl Session {
         let mut done = self.done.0.lock().map_err(|_| "session completion lock poisoned")?;
         *done = true;
         self.done.1.notify_all();
-        result
+        drop(done);
+        let id = self.info()?.id;
+        result.and(self.attachments.cleanup_session(&id))
     }
 
     fn request_stop(&self) -> Result<(), String> {
@@ -256,11 +279,28 @@ impl Session {
     }
 }
 
+#[derive(Default)]
+struct RuntimeSelection {
+    generation: u64,
+    preparation: u64,
+    executable: Option<std::ffi::OsString>,
+    ready: bool,
+    preparing: bool,
+    changing: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeSnapshot { generation: u64, executable: std::ffi::OsString }
+#[derive(Debug)]
+struct PreparedRuntime { selection: RuntimeSnapshot, preparation: u64 }
+
 struct EngineInner {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     store: Arc<Mutex<Store>>,
     sink: EventSink,
-    exiting: AtomicBool,
+    exiting: Arc<AtomicBool>,
+    attachments: crate::conversation_attachments::ConversationAttachments,
+    runtime: Mutex<RuntimeSelection>,
 }
 
 #[derive(Clone)]
@@ -273,11 +313,12 @@ impl Engine {
     pub fn new(database: &Path, sink: EventSink) -> Result<Self, String> {
         let store = Arc::new(Mutex::new(Store::open(database)?));
         let saved = store.lock().map_err(|_| "metadata store lock poisoned")?.sessions()?;
+        let attachments = crate::conversation_attachments::ConversationAttachments::default();
         let mut sessions = HashMap::new();
         for info in saved {
-            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone() }));
+            sessions.insert(info.id.clone(), Arc::new(Session { info: Mutex::new(info), phase: AtomicU8::new(3), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), subagent_receipts: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(true), Condvar::new()), sink: sink.clone(), store: store.clone(), attachments:attachments.clone() }));
         }
-        Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: AtomicBool::new(false) }) })
+        Ok(Self { inner: Arc::new(EngineInner { sessions: Mutex::new(sessions), store, sink, exiting: Arc::new(AtomicBool::new(false)), attachments, runtime: Mutex::new(RuntimeSelection::default()) }) })
     }
 
     fn allocate(&self, request: &StartRequest) -> Result<Arc<Session>, String> {
@@ -311,7 +352,7 @@ impl Engine {
             live_ids.push(info.id.clone());
             store.prune_sessions(&live_ids)?;
         }
-        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone() });
+        let session = Arc::new(Session { info: Mutex::new(info.clone()), phase: AtomicU8::new(0), stop_requested: Arc::new(AtomicBool::new(false)), cleanup_failed:AtomicBool::new(false), process: Mutex::new(None), subagent_receipts: Mutex::new(Some(HashMap::new())), flow: OutputFlow::default(), done: (Mutex::new(false), Condvar::new()), sink: self.inner.sink.clone(), store: self.inner.store.clone(),attachments:self.inner.attachments.clone() });
         if let Some(id) = retired_id { sessions.remove(&id); }
         sessions.insert(info.id.clone(), session.clone());
         drop(sessions);
@@ -327,7 +368,9 @@ impl Engine {
         let weak = Arc::downgrade(&session);
         let on_event = Arc::new(move |event| { if let Some(session) = weak.upgrade() { session.observe(event); } });
         let info = session.info()?;
-        let adapter = match self.codex_executable().and_then(|exe| codex::prepare_with_cancellation(&exe, Path::new(&info.cwd), info.thread_id.as_deref(), on_event, session.stop_requested.clone())) {
+        let adapter = match self.runtime_snapshot().and_then(|selected| self.prepare_start_with(selected, &session.stop_requested,
+            |exe| codex::prepare_runtime_with_executable(exe, &session.stop_requested),
+            |exe| codex::prepare_with_cancellation(exe, Path::new(&info.cwd), info.thread_id.as_deref(), on_event, session.stop_requested.clone()))) {
             Ok(adapter) => adapter,
             Err(error) => { session.finish("error")?; return Err(error); }
         };
@@ -349,6 +392,11 @@ impl Engine {
         let mut guard = LaunchGuard { session: session.clone(), armed: true };
         let launch = || -> Result<_, String> {
             if session.stop_requested.load(Ordering::Acquire) { return Err("session was stopped before launch".into()); }
+            #[cfg(windows)]
+            let cron = if adapter.is_some() {
+                let info=session.info()?;
+                codex::cron_control::CronPreparation::prepare(&mut command,&info.id,info.generation,session.stop_requested.clone())?
+            } else {None};
             let pair = native_pty_system().openpty(size(cols, rows)).map_err(|e| format!("open native PTY: {e}"))?;
             let reader = pair.master.try_clone_reader().map_err(|e| format!("open PTY reader: {e}"))?;
             let writer = pair.master.take_writer().map_err(|e| format!("open PTY writer: {e}"))?;
@@ -360,10 +408,25 @@ impl Engine {
                 Ok(job) => job,
                 Err(error) => return Err(error),
             };
-            gate.release()?;
             let killer = child.child.clone_killer();
-            let process = Arc::new(ProcessControl { master: Mutex::new(Some(pair.master)), writer: Mutex::new(Some(writer)), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter), termination:Mutex::new(()),shared_cleanup_failed:AtomicBool::new(false),shared_stop_attempted:AtomicBool::new(false), _gate: gate });
+            let process = Arc::new(ProcessControl { master: Mutex::new(Some(pair.master)), writer: Mutex::new(Some(writer)), killer: Mutex::new(killer), job: Mutex::new(Some(job)), adapter: Mutex::new(adapter),
+                #[cfg(windows)] cron:Mutex::new(None),
+                termination:Mutex::new(()),shared_cleanup_failed:AtomicBool::new(false),shared_stop_attempted:AtomicBool::new(false), _gate: gate });
             *session.process.lock().map_err(|_| "session process lock poisoned")? = Some(process.clone());
+            #[cfg(windows)]
+            if let Some(cron)=cron {
+                let weak=Arc::downgrade(&process);
+                let cancelled=session.stop_requested.clone();
+                let verify=Arc::new(move |pipe: &mut crate::owned_tui_control::OwnedTuiPipe| {
+                    if cancelled.load(Ordering::Acquire) {return Err("종료 중인 세션의 제어 연결을 허용하지 않았습니다.".into());}
+                    let process=weak.upgrade().ok_or("예약 대상 소유 프로세스가 종료됐습니다.")?;
+                    let job=process.job.lock().map_err(|_|"예약 대상 소유 Job 상태 오류")?;
+                    pipe.verify_peer(job.as_ref().ok_or("예약 대상 소유 Job이 종료됐습니다.")?).map_err(|_|"예약 제어 상대의 소유 신원을 확인하지 못했습니다.".into())
+                });
+                *process.cron.lock().map_err(|_|"예약 제어 설치 상태 오류")?=Some(cron.start(verify)?);
+            }
+            // 소유 Job·제어 연결·정리 경로를 모두 설치한 뒤 도우미를 실행한다.
+            process._gate.release()?;
             Ok((child, reader, process))
         };
         let (mut child, mut reader, process) = match launch() {
@@ -414,6 +477,9 @@ impl Engine {
             let adapter = process.adapter.lock().unwrap_or_else(|e| e.into_inner()).take();
             let shared = adapter.as_ref().and_then(CodexSession::shared_control).is_some();
             drop(termination);
+            #[cfg(windows)] {
+                if process.finish_cron(Instant::now()+Duration::from_secs(5)).is_err() {waiting.cleanup_failed.store(true,Ordering::Release);}
+            }
             // Kill any descendants retaining the terminal after their leader exits.
             let job = process.job.lock().unwrap_or_else(|e| e.into_inner()).take();
             drop(job);
@@ -452,9 +518,13 @@ impl Engine {
         let session = self.lookup(id, generation)?;
         if session.phase.load(Ordering::Acquire) != 1 { return Err("session is not live".into()); }
         let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone().ok_or("session has no PTY process")?;
-        let mut writer = process.writer.lock().map_err(|_| "PTY writer lock poisoned")?;
-        if session.phase.load(Ordering::Acquire) != 1 { return Err("session is stopping".into()); }
-        writer.as_mut().ok_or("session PTY has exited")?.write_all(data.as_bytes()).map_err(|e| format!("write owned PTY: {e}"))
+        let conversation = process.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().and_then(CodexSession::conversation_connection);
+        let write = || {
+            let mut writer = process.writer.lock().map_err(|_| "PTY writer lock poisoned")?;
+            if session.phase.load(Ordering::Acquire) != 1 { return Err("session is stopping".into()); }
+            writer.as_mut().ok_or("session PTY has exited")?.write_all(data.as_bytes()).map_err(|e| format!("write owned PTY: {e}"))
+        };
+        if let Some(conversation) = conversation { conversation.terminal_write(write) } else { write() }
     }
 
     pub fn resize(&self, id: &str, generation: u64, cols: u16, rows: u16) -> Result<(), String> {
@@ -569,13 +639,100 @@ impl Engine {
         // Validate before changing the existing value. Cancel and invalid saves
         // cannot discard a working configuration or restart live sessions.
         let selected = path.map(|path| crate::codex_settings::validate(Path::new(path))).transpose()?;
-        self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.set_codex_executable(selected.as_deref())?;
+        self.change_runtime_selection_with(|| self.inner.store.lock().map_err(|_| "metadata store lock poisoned")?.set_codex_executable(selected.as_deref()))?;
         // Reset is successful even when its environment/PATH fallback is absent.
         // Return that resolution failure as status, never as a failed save.
         Ok(crate::codex_settings::resolve(selected.as_deref()))
     }
 
     fn codex_executable(&self) -> Result<std::ffi::OsString, String> { self.get_codex_settings()?.executable() }
+
+    fn change_runtime_selection_with(&self, save: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        {
+            let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+            if runtime.changing { return Err("실행파일 설정을 저장 중입니다. 잠시 후 다시 시도하세요.".into()); }
+            if runtime.generation == u64::MAX { return Err("실행파일 선택 세대 한도에 도달했습니다.".into()); }
+            runtime.changing = true;
+        }
+        // 저장소 쓰기와 파일 확인은 선택 잠금 밖에서 수행한다. 실패한 저장은 캐시를 보존한다.
+        let result = save();
+        let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+        if result.is_ok() {
+            runtime.generation += 1;
+            runtime.executable = None;
+            runtime.ready = false;
+            runtime.preparing = false;
+        }
+        runtime.changing = false;
+        result
+    }
+
+    fn runtime_snapshot(&self) -> Result<RuntimeSnapshot, String> { self.runtime_snapshot_with(|| self.codex_executable()) }
+
+    fn runtime_snapshot_with(&self, resolve: impl FnOnce() -> Result<std::ffi::OsString, String>) -> Result<RuntimeSnapshot, String> {
+        let generation = {
+            let runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+            if runtime.changing { return Err("실행파일 설정을 저장 중입니다. 잠시 후 다시 시도하세요.".into()); }
+            runtime.generation
+        };
+        let executable = resolve()?;
+        let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+        if runtime.changing || runtime.generation != generation { return Err("실행파일 선택이 바뀌었습니다. 다시 시도하세요.".into()); }
+        if runtime.executable.as_ref() != Some(&executable) {
+            runtime.generation = runtime.generation.checked_add(1).ok_or("실행파일 선택 세대 한도에 도달했습니다.")?;
+            runtime.executable = Some(executable.clone());
+            runtime.ready = false;
+            runtime.preparing = false;
+        }
+        Ok(RuntimeSnapshot { generation: runtime.generation, executable })
+    }
+
+    fn verify_runtime_selection(&self, selected: &RuntimeSnapshot, runtime: &RuntimeSelection, cancelled: &AtomicBool) -> Result<(), String> {
+        if self.inner.exiting.load(Ordering::Acquire) || cancelled.load(Ordering::Acquire) { return Err("종료 또는 중단 요청으로 실행파일 준비 결과를 사용하지 않았습니다.".into()); }
+        if runtime.changing || runtime.generation != selected.generation || runtime.executable.as_ref() != Some(&selected.executable) { return Err("실행파일 선택이 바뀌었습니다. 다시 준비하세요.".into()); }
+        Ok(())
+    }
+
+    fn prepare_selected_runtime_with(&self, selected: RuntimeSnapshot, force: bool, cancelled: &AtomicBool, prepare: impl FnOnce(&std::ffi::OsString) -> Result<(), String>) -> Result<PreparedRuntime, String> {
+        let preparation = {
+            let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+            self.verify_runtime_selection(&selected, &runtime, cancelled)?;
+            if !force && runtime.ready { return Ok(PreparedRuntime { selection: selected, preparation: runtime.preparation }); }
+            if !force && runtime.preparing { return Err("선택한 실행파일을 준비 중입니다. 잠시 후 다시 시도하세요.".into()); }
+            runtime.preparation = runtime.preparation.checked_add(1).ok_or("실행파일 준비 세대 한도에 도달했습니다.")?;
+            runtime.ready = false;
+            runtime.preparing = true;
+            runtime.preparation
+        };
+        let result = prepare(&selected.executable);
+        let mut runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+        if runtime.generation == selected.generation && runtime.preparation == preparation { runtime.preparing = false; }
+        self.verify_runtime_selection(&selected, &runtime, cancelled)?;
+        if runtime.preparation != preparation { return Err("더 최근 실행파일 준비 요청이 있습니다. 이전 결과를 사용하지 않았습니다.".into()); }
+        result?;
+        runtime.ready = true;
+        Ok(PreparedRuntime { selection: selected, preparation })
+    }
+
+    fn verify_prepared_runtime(&self, prepared: &PreparedRuntime, cancelled: &AtomicBool) -> Result<(), String> {
+        let runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+        self.verify_runtime_selection(&prepared.selection, &runtime, cancelled)?;
+        if !runtime.ready || runtime.preparation != prepared.preparation { return Err("선택한 실행파일의 준비가 완료되지 않았습니다. 다시 준비하세요.".into()); }
+        Ok(())
+    }
+
+    fn prepare_start_with<T>(&self, selected: RuntimeSnapshot, cancelled: &AtomicBool, prepare: impl FnOnce(&std::ffi::OsString) -> Result<(), String>, connect: impl FnOnce(&std::ffi::OsString) -> Result<T, String>) -> Result<T, String> {
+        let prepared = self.prepare_selected_runtime_with(selected, false, cancelled, prepare)?;
+        let connection = connect(&prepared.selection.executable)?;
+        // 연결을 기다리는 사이 설정 또는 강제 준비가 바뀌었으면 연결을 해제하고 PTY를 만들지 않는다.
+        self.verify_prepared_runtime(&prepared, cancelled)?;
+        Ok(connection)
+    }
+
+    pub fn prepare_runtime(&self) -> Result<(), String> {
+        if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 공유 서버를 시작하지 않았습니다.".into()); }
+        self.prepare_selected_runtime_with(self.runtime_snapshot()?, true, &self.inner.exiting, |exe| codex::prepare_runtime_with_executable(exe, &self.inner.exiting)).map(|_| ())
+    }
 
     pub fn catalog_list(&self, request: codex::CatalogQuery) -> Result<codex::CatalogPage, String> {
         codex::catalog_list_with_executable(&self.codex_executable()?, request)
@@ -586,15 +743,24 @@ impl Engine {
     }
 
     fn with_extension_operation<T>(&self, operation: impl FnOnce(&std::ffi::OsString, &codex::ExtensionPermit) -> Result<T, String>) -> Result<T, String> {
+        self.with_extension_operation_ready(false, operation)
+    }
+
+    fn with_extension_operation_ready<T>(&self, require_ready: bool, operation: impl FnOnce(&std::ffi::OsString, &codex::ExtensionPermit) -> Result<T, String>) -> Result<T, String> {
         if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting; no extension operation was started".into()); }
         // Resolve one executable snapshot without holding the extension permit
         // or a metadata/session lock across admission or vendor I/O.
-        let exe = self.codex_executable()?;
+        let selected = self.runtime_snapshot()?;
         let permit = codex::extension_admission()?;
         // This check and shutdown's exiting.store share the same permit. A
         // pre-admission flag check alone would allow a late mutation to race exit.
         if self.inner.exiting.load(Ordering::Acquire) { return Err("application is exiting; no extension operation was started".into()); }
-        operation(&exe, &permit)
+        {
+            let runtime = self.inner.runtime.lock().map_err(|_| "실행파일 선택 잠금이 손상되었습니다.")?;
+            self.verify_runtime_selection(&selected, &runtime, &self.inner.exiting)?;
+            if require_ready && !runtime.ready { return Err("선택한 실행파일의 준비가 완료되지 않아 사용량을 조회하지 않았습니다.".into()); }
+        }
+        operation(&selected.executable, &permit)
     }
 
     pub fn extensions_list(&self, cwd: Option<String>) -> Result<codex::ExtensionsSnapshot, String> {
@@ -605,8 +771,8 @@ impl Engine {
         self.with_extension_operation(|exe, permit| codex::extensions_mutate_with_executable(exe, cwd, request, permit))
     }
 
-    pub fn weekly_usage(&self) -> Result<codex::WeeklyUsageSnapshot, String> {
-        self.with_extension_operation(|exe, _permit| codex::weekly_usage_with_executable(exe))
+    pub fn weekly_usage(&self, manual: bool) -> Result<codex::WeeklyUsageSnapshot, String> {
+        self.with_extension_operation_ready(true, |exe, _permit| codex::weekly_usage_with_executable(exe, manual))
     }
 
     pub fn mobile_control(&self, id: &str, generation: u64, action: codex::MobileAction) -> Result<codex::MobileReply, String> {
@@ -622,6 +788,138 @@ impl Engine {
         let connection = process.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().ok_or("session server is unavailable")?.mobile_connection();
         drop(process);
         connection.request(action)
+    }
+
+    pub fn conversation_request(&self, id: &str, generation: u64, request: codex::ConversationRequest) -> Result<serde_json::Value, String> {
+        request.validate()?;
+        if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 대화 요청을 시작하지 않았습니다.".into()); }
+        let session = self.lookup(id, generation)?;
+        if session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) { return Err("실행 중인 세션에서만 대화 요청을 사용할 수 있습니다.".into()); }
+        let info = session.info.lock().map_err(|_| "session metadata lock poisoned")?.clone();
+        let thread_id = info.thread_id.ok_or("원래 대화 식별자가 아직 확인되지 않았습니다. 잠시 후 다시 시도하세요.")?;
+        let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone().ok_or("session process is unavailable")?;
+        let connection = process.adapter.lock().map_err(|_| "session adapter lock poisoned")?.as_ref().and_then(CodexSession::conversation_connection).ok_or("이 세션은 구조화 대화 연결을 지원하지 않습니다.")?;
+        drop(process);
+        connection.request_for_session(&thread_id, Path::new(&info.cwd), request,id,self.inner.attachments.clone())
+    }
+
+    fn with_subagent_receipt(&self,id: &str,generation: u64,request: codex::SubagentRequest,execute: impl FnOnce(Arc<Session>,codex::SubagentRequest)->Result<serde_json::Value,String>) -> Result<serde_json::Value,String> {
+        // 찾을 수 없거나 교체된 세대의 영수증을 현재 세대의 미송신으로 단정하지 않는다.
+        let session=self.lookup(id,generation)?;
+        let Some((request_id,digest))=request.receipt_identity()? else {return execute(session,request);};
+        {
+            let mut receipts=session.subagent_receipts.lock().map_err(|_|"하위 에이전트 영수증 상태 오류")?;
+            let receipts=receipts.as_mut().ok_or("복원된 세션의 이전 하위 에이전트 요청 결과를 확인할 수 없습니다. 확정 미적용으로 처리하지 않았습니다.")?;
+            if let Some(receipt)=receipts.get(&request_id) {
+                if receipt.digest!=digest {return Err("동일 요청 식별자에 다른 하위 에이전트 변경을 지정할 수 없습니다.".into());}
+                return Ok(serde_json::json!({"status":receipt.status}));
+            }
+            if receipts.len()>=1024 {return Ok(serde_json::json!({"status":"notApplied","reason":"세션의 하위 에이전트 영수증 상한에 도달해 새 요청을 보내지 않았습니다."}));}
+            // 새 요청만 수락 검사로 들어간다. 동시 재조회는 이 진행 중 기록을 본다.
+            receipts.insert(request_id.clone(),SubagentReceipt {digest,status:"unknown"});
+        }
+        let result=execute(session.clone(),request);
+        let status=match result.as_ref().ok().and_then(|value|value["status"].as_str()) {
+            Some("applied")=>"applied",Some("notApplied")=>"notApplied",Some("unsupported")=>"unsupported",_=>"unknown",
+        };
+        let mut receipts=session.subagent_receipts.lock().map_err(|_|"하위 에이전트 영수증 상태 오류")?;
+        if let Some(receipt)=receipts.as_mut().and_then(|receipts|receipts.get_mut(&request_id)) {receipt.status=status;}
+        result
+    }
+
+    pub fn subagents_request(&self, id: &str, generation: u64, request: codex::SubagentRequest) -> Result<serde_json::Value, String> {
+        self.with_subagent_receipt(id,generation,request,|session,request| {
+        let mutation = !matches!(&request, codex::SubagentRequest::List { .. });
+        // 기존·진행 중 영수증 조회 뒤의 새 요청에만 확정 미송신 결과를 돌려준다.
+        let admitted = (|| {
+            request.validate()?;
+            if self.inner.exiting.load(Ordering::Acquire) { return Err("앱이 종료 중이어서 하위 에이전트 요청을 시작하지 않았습니다.".to_owned()); }
+            if session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) { return Err("실행 중인 세션에서만 하위 에이전트를 관리할 수 있습니다.".into()); }
+            let info = session.info.lock().map_err(|_| "하위 에이전트 부모 세션 상태 오류")?.clone();
+            let thread_id = info.thread_id.ok_or("부모 대화 식별자가 아직 확인되지 않았습니다.")?;
+            let process = session.process.lock().map_err(|_| "하위 에이전트 부모 프로세스 상태 오류")?.clone().ok_or("부모 프로세스를 확인할 수 없습니다.")?;
+            let connection = process.adapter.lock().map_err(|_| "하위 에이전트 연결 상태 오류")?.as_ref().and_then(CodexSession::conversation_connection).ok_or("이 세션은 하위 에이전트 관리 연결을 지원하지 않습니다.")?;
+            drop(process);
+            if self.inner.exiting.load(Ordering::Acquire) || session.phase.load(Ordering::Acquire) != 1 || session.stop_requested.load(Ordering::Acquire) { return Err("세션이 종료 중이어서 하위 에이전트 요청을 시작하지 않았습니다.".into()); }
+            Ok((connection, thread_id, info.cwd))
+        })();
+        let (connection, thread_id, cwd) = match admitted {
+            Ok(value) => value,
+            Err(reason) if mutation => return Ok(serde_json::json!({"status":"notApplied","reason":reason})),
+            Err(reason) => return Err(reason),
+        };
+        connection.subagents_request(&thread_id, Path::new(&cwd), request)
+        })
+    }
+
+    pub fn cron_request(&self,id: &str,generation: u64,request: codex::CronRequest) -> Result<serde_json::Value,String> {
+        request.validate()?;
+        if self.inner.exiting.load(Ordering::Acquire) {return Err("앱이 종료 중이어서 예약 요청을 시작하지 않았습니다.".into());}
+        let session=self.lookup(id,generation)?;
+        if session.phase.load(Ordering::Acquire)!=1 || session.stop_requested.load(Ordering::Acquire) {return Err("실행 중인 세션에서만 예약 요청을 사용할 수 있습니다.".into());}
+        let info=session.info.lock().map_err(|_| "예약 대상 세션 상태 오류")?.clone();
+        let thread_id=info.thread_id.ok_or("예약 대상 대화 식별자가 아직 확인되지 않았습니다.")?;
+        let process=session.process.lock().map_err(|_| "예약 대상 프로세스 상태 오류")?.clone().ok_or("예약 대상 프로세스를 확인할 수 없습니다.")?;
+        let adapter=process.adapter.lock().map_err(|_| "예약 제어 연결 상태 오류")?;
+        adapter.as_ref().ok_or("예약 대상 CLI를 확인할 수 없습니다.")?.cron_target_ready(&thread_id)?;
+        if self.inner.exiting.load(Ordering::Acquire) || session.phase.load(Ordering::Acquire)!=1 || session.stop_requested.load(Ordering::Acquire) {return Err("세션이 종료 중이어서 예약 요청을 시작하지 않았습니다.".into());}
+        #[cfg(windows)]
+        let connection=process.cron.lock().map_err(|_|"예약 제어 상태 오류")?.clone();
+        #[cfg(windows)]
+        if let Some(connection)=connection {
+            drop(adapter);
+            drop(process);
+            return connection.request(&thread_id,request);
+        }
+        adapter.as_ref().ok_or("예약 대상 CLI를 확인할 수 없습니다.")?.cron_request(&thread_id,request)
+    }
+
+    pub fn conversation_attachments(&self) -> crate::conversation_attachments::ConversationAttachments { self.inner.attachments.clone() }
+
+    pub fn stage_conversation_image(&self,id: &str,generation: u64,data_url: &str) -> Result<crate::conversation_attachments::ConversationAttachment,String> {
+        let session = self.lookup(id,generation)?;
+        if self.inner.exiting.load(Ordering::Acquire) || session.phase.load(Ordering::Acquire) != 1 {return Err("실행 중인 세션에만 이미지를 첨부할 수 있습니다.".into());}
+        let staged = self.inner.attachments.stage_image(id,data_url)?;
+        if session.phase.load(Ordering::Acquire) != 1 {
+            self.inner.attachments.cleanup_staged(id,&staged.path)?;
+            return Err("이미지 준비 중 세션이 종료되어 미전송 이미지를 정리했습니다.".into());
+        }
+        Ok(staged)
+    }
+
+    pub fn cleanup_conversation_attachment(&self,id: &str,generation: u64,path: &str) -> Result<(),String> {
+        self.lookup(id,generation)?;
+        self.inner.attachments.cleanup_staged(id,path)
+    }
+
+    pub fn list_pending_questions(&self) -> Result<serde_json::Value,String> {
+        let sessions: Vec<_> = self.inner.sessions.lock().map_err(|_| "session registry lock poisoned")?.values().cloned().collect();
+        let mut items = Vec::new();
+        for session in sessions {
+            let info = session.info()?;
+            let process = session.process.lock().map_err(|_| "session process lock poisoned")?.clone();
+            let connection = process.as_ref().map(|process|process.adapter.lock().map_err(|_| "session adapter lock poisoned").map(|adapter|adapter.as_ref().and_then(CodexSession::conversation_connection))).transpose()?.flatten();
+            if connection.as_ref().is_some_and(|connection|connection.is_deleted()) { continue; }
+            let (owned,connected,pending) = connection.as_ref().map(|connection|connection.pending_snapshot()).transpose()?.unwrap_or((false,false,Vec::new()));
+            for request in &pending {
+                let method = request["method"].as_str().unwrap_or("");
+                let kind = match method {"item/tool/requestUserInput" => "question","item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => "approval",_ => "unsupported"};
+                let request_id = request["requestId"].as_str().ok_or("대기 요청 식별자가 없습니다.")?;
+                let mut item = serde_json::json!({"id":format!("{}:{}:{}:{}",info.id,info.thread_id.as_deref().unwrap_or(""),info.generation,request_id),"threadId":info.thread_id,"sessionId":info.id,"generation":info.generation,"requestId":request_id,"kind":kind,"sessionTitle":info.title,"title":if kind=="question" {"사용자 답변 대기"} else if kind=="approval" {"사용자 승인 대기"} else {"터미널에서 확인할 요청"},"message":request["params"]["reason"].as_str().or_else(||request["params"]["command"].as_str()).unwrap_or(""),"canRespond":owned&&connected&&request["guiOwned"]==true&&kind!="unsupported"&&request["responded"]!=true,"responded":request["responded"]==true});
+                if kind=="question" {item["questions"]=request["params"]["questions"].clone();}
+                item["metadataAvailable"]=request["metadataAvailable"].clone();
+                if kind=="approval" {
+                    let options=codex::ConversationConnection::approval_decisions(&request["params"]).into_iter().map(|decision|serde_json::json!({"id":decision,"label":match decision {"accept"=>"승인","acceptForSession"=>"이 세션에서 승인","decline"=>"거절",_=>"취소"}})).collect::<Vec<_>>();
+                    if options.is_empty() {item["canRespond"]=serde_json::json!(false);}
+                    item["approval"]=serde_json::json!({"options":options});
+                }
+                items.push(item);
+            }
+            if pending.is_empty() && info.active && info.state=="waiting" {
+                items.push(serde_json::json!({"id":format!("{}:{}:{}:terminal",info.id,info.thread_id.as_deref().unwrap_or(""),info.generation),"threadId":info.thread_id,"sessionId":info.id,"generation":info.generation,"kind":"unsupported","title":"터미널에서 답변할 요청","message":"현재 연결에서 질문 원문을 확인할 수 없습니다. 원래 터미널에서 확인하세요.","sessionTitle":info.title,"canRespond":false}));
+            }
+        }
+        Ok(serde_json::json!({"items":items}))
     }
 
     pub fn list_external(&self) -> Result<Vec<codex::ExternalSession>, String> {
@@ -700,6 +998,155 @@ mod launch_guard_tests;
 mod shutdown_race_tests;
 
 #[cfg(test)]
+mod runtime_preparation_tests {
+    use super::*;
+
+    fn engine() -> Engine { Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap() }
+    fn select(engine: &Engine, executable: &str) -> RuntimeSnapshot {
+        engine.runtime_snapshot_with(|| Ok(executable.into())).unwrap()
+    }
+    fn unlocked(engine: &Engine) {
+        assert!(engine.inner.runtime.try_lock().is_ok(), "외부 작업 중 선택 잠금이 유지됨");
+        assert!(engine.inner.store.try_lock().is_ok(), "외부 작업 중 저장소 잠금이 유지됨");
+        assert!(engine.inner.sessions.try_lock().is_ok(), "외부 작업 중 세션 잠금이 유지됨");
+    }
+
+    #[test]
+    fn readiness_reuses_only_success_and_forced_failure_discards_the_old_ticket() {
+        let engine = engine();
+        let selected = select(&engine, "runtime-a.exe");
+        let cancelled = AtomicBool::new(false);
+        let first = engine.prepare_selected_runtime_with(selected.clone(), false, &cancelled, |_| { unlocked(&engine); Ok(()) }).unwrap();
+        let reused = engine.prepare_selected_runtime_with(selected.clone(), false, &cancelled, |_| panic!("성공 캐시를 재사용하지 않음")).unwrap();
+        assert_eq!(first.preparation, reused.preparation);
+        engine.verify_prepared_runtime(&first, &cancelled).unwrap();
+        assert_eq!(engine.prepare_selected_runtime_with(selected.clone(), true, &cancelled, |_| Err("준비 실패".into())).unwrap_err(), "준비 실패");
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+        assert!(engine.verify_prepared_runtime(&first, &cancelled).is_err());
+        let retried = engine.prepare_selected_runtime_with(selected, false, &cancelled, |_| Ok(())).unwrap();
+        assert!(retried.preparation > first.preparation);
+        engine.verify_prepared_runtime(&retried, &cancelled).unwrap();
+    }
+
+    #[test]
+    fn late_preparation_cannot_commit_over_a_new_selection_or_forced_request() {
+        for change_selection in [true, false] {
+            let engine = engine();
+            let selected = select(&engine, "runtime-a.exe");
+            let (entered, entry) = std::sync::mpsc::sync_channel(0);
+            let (release, released) = std::sync::mpsc::sync_channel(0);
+            let worker_engine = engine.clone();
+            let worker = thread::spawn(move || worker_engine.prepare_selected_runtime_with(selected, true, &AtomicBool::new(false), |_| {
+                unlocked(&worker_engine);
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            }));
+            entry.recv_timeout(Duration::from_secs(5)).unwrap();
+            let competing = select(&engine, "runtime-a.exe");
+            assert!(engine.prepare_selected_runtime_with(competing, false, &AtomicBool::new(false), |_| panic!("동시 시작이 준비 작업을 중복 실행함")).is_err());
+            if change_selection { engine.change_runtime_selection_with(|| { unlocked(&engine); Ok(()) }).unwrap(); }
+            let selected = select(&engine, if change_selection { "runtime-b.exe" } else { "runtime-a.exe" });
+            let latest = engine.prepare_selected_runtime_with(selected, true, &AtomicBool::new(false), |_| Ok(())).unwrap();
+            release.send(()).unwrap();
+            assert!(worker.join().unwrap().is_err(), "오래된 준비 결과가 확정됨");
+            engine.verify_prepared_runtime(&latest, &AtomicBool::new(false)).unwrap();
+            assert_eq!(engine.inner.runtime.lock().unwrap().preparation, latest.preparation);
+        }
+    }
+
+    #[test]
+    fn selection_save_and_resolution_are_fenced_without_holding_io_locks() {
+        let engine = engine();
+        let selected = select(&engine, "runtime-a.exe");
+        let prepared = engine.prepare_selected_runtime_with(selected, false, &AtomicBool::new(false), |_| Ok(())).unwrap();
+        assert_eq!(engine.change_runtime_selection_with(|| { unlocked(&engine); Err("저장 실패".into()) }).unwrap_err(), "저장 실패");
+        engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).unwrap();
+        engine.change_runtime_selection_with(|| {
+            unlocked(&engine);
+            assert!(engine.runtime_snapshot_with(|| panic!("저장 중 실행파일을 해석함")).is_err());
+            assert!(engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).is_err());
+            Ok(())
+        }).unwrap();
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+        assert!(engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).is_err());
+        let resolved = engine.runtime_snapshot_with(|| {
+            unlocked(&engine);
+            engine.change_runtime_selection_with(|| Ok(())).unwrap();
+            Ok("runtime-b.exe".into())
+        });
+        assert!(resolved.is_err(), "해석 중 선택이 바뀐 결과를 채택함");
+        assert!(engine.inner.runtime.lock().unwrap().executable.is_none());
+    }
+
+    #[test]
+    fn start_rejects_selection_changes_during_preparation_or_connection_and_drops_the_connection() {
+        let engine = engine();
+        let selected = select(&engine, "runtime-a.exe");
+        let cancelled = AtomicBool::new(false);
+        assert!(engine.prepare_start_with::<()>(selected, &cancelled, |_| {
+            engine.change_runtime_selection_with(|| Ok(())).unwrap();
+            Ok(())
+        }, |_| panic!("선택이 바뀐 준비 결과로 연결을 시작함")).is_err());
+        let selected = select(&engine, "runtime-b.exe");
+        struct Connection(Arc<AtomicBool>);
+        impl Drop for Connection { fn drop(&mut self) { self.0.store(true, Ordering::Release); } }
+        let dropped = Arc::new(AtomicBool::new(false));
+        assert!(engine.prepare_start_with(selected, &cancelled, |exe| { assert_eq!(exe, &std::ffi::OsString::from("runtime-b.exe")); Ok(()) }, |exe| {
+            unlocked(&engine);
+            assert_eq!(exe, &std::ffi::OsString::from("runtime-b.exe"));
+            engine.change_runtime_selection_with(|| Ok(())).unwrap();
+            Ok(Connection(dropped.clone()))
+        }).is_err());
+        assert!(dropped.load(Ordering::Acquire), "거절한 연결의 소유권이 해제되지 않음");
+    }
+
+    #[test]
+    fn stop_and_exit_prevent_preparation_admission_and_result_commit() {
+        let engine = engine();
+        let selected = select(&engine, "runtime-a.exe");
+        let stopped = AtomicBool::new(true);
+        assert!(engine.prepare_selected_runtime_with(selected.clone(), false, &stopped, |_| panic!("중단 이후 준비가 시작됨")).is_err());
+        stopped.store(false, Ordering::Release);
+        assert!(engine.prepare_selected_runtime_with(selected.clone(), false, &stopped, |_| { stopped.store(true, Ordering::Release); Ok(()) }).is_err());
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+        stopped.store(false, Ordering::Release);
+        let prepared = engine.prepare_selected_runtime_with(selected.clone(), false, &stopped, |_| Ok(())).unwrap();
+        stopped.store(true, Ordering::Release);
+        assert!(engine.verify_prepared_runtime(&prepared, &stopped).is_err());
+        stopped.store(false, Ordering::Release);
+        assert!(engine.prepare_selected_runtime_with(selected.clone(), true, &stopped, |_| {
+            unlocked(&engine);
+            engine.inner.exiting.store(true, Ordering::Release);
+            Ok(())
+        }).is_err());
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+        assert!(engine.prepare_selected_runtime_with(selected, true, &stopped, |_| panic!("종료 이후 준비가 시작됨")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_save_preserves_readiness_but_successful_save_and_reset_require_preparation() {
+        let _admission = super::lifecycle_tests::EXTENSION_ADMISSION_TEST.lock().unwrap();
+        let engine = engine();
+        let executable = std::env::current_exe().unwrap();
+        engine.set_codex_executable(Some(executable.to_str().unwrap())).unwrap();
+        let selected = engine.runtime_snapshot().unwrap();
+        let prepared = engine.prepare_selected_runtime_with(selected, false, &AtomicBool::new(false), |_| Ok(())).unwrap();
+        assert!(engine.set_codex_executable(Some("relative.cmd")).is_err());
+        engine.verify_prepared_runtime(&prepared, &AtomicBool::new(false)).unwrap();
+        engine.with_extension_operation_ready(true, |exe, _| { assert_eq!(exe, &prepared.selection.executable); unlocked(&engine); Ok(()) }).unwrap();
+        engine.set_codex_executable(Some(executable.to_str().unwrap())).unwrap();
+        assert!(engine.with_extension_operation_ready::<()>(true, |_, _| panic!("미준비 실행파일로 사용량을 조회함")).is_err());
+        let selected = engine.runtime_snapshot().unwrap();
+        let selected = engine.prepare_selected_runtime_with(selected, false, &AtomicBool::new(false), |_| Ok(())).unwrap();
+        engine.set_codex_executable(None).unwrap();
+        assert!(engine.verify_prepared_runtime(&selected, &AtomicBool::new(false)).is_err());
+        assert!(!engine.inner.runtime.lock().unwrap().ready);
+    }
+}
+
+#[cfg(test)]
 mod lifecycle_tests {
     use super::*;
     #[test]
@@ -719,6 +1166,151 @@ mod lifecycle_tests {
 
     fn request() -> StartRequest {
         StartRequest { cwd: std::env::current_dir().unwrap().to_string_lossy().into_owned(), title: "lifetime fixture".into(), project_id: None, project_assigned: false, thread_id: None, cols: 80, rows: 24 }
+    }
+
+    #[test]
+    fn conversation_and_attachment_admission_reject_stale_generations_without_a_transport() {
+        let engine = Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
+        let session = engine.allocate(&request()).unwrap(); let info = session.info().unwrap();
+        assert!(engine.conversation_request(&info.id,info.generation+1,codex::ConversationRequest::Attach).unwrap_err().contains("stale"));
+        assert!(engine.stage_conversation_image(&info.id,info.generation+1,"data:image/png;base64,").unwrap_err().contains("stale"));
+        assert!(engine.cleanup_conversation_attachment(&info.id,info.generation+1,"external-file").unwrap_err().contains("stale"));
+        assert!(session.process.lock().unwrap().is_none());
+        session.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn subagent_admission_rejects_stale_stopped_or_unowned_parent_before_transport() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let session = engine.allocate(&request()).unwrap(); let info = session.info().unwrap();
+        let list = || codex::SubagentRequest::List { cursor: None };
+        assert!(engine.subagents_request(&info.id, info.generation + 1, list()).unwrap_err().contains("stale"));
+        assert!(engine.subagents_request(&info.id, info.generation, list()).unwrap_err().contains("실행 중"));
+        session.phase.store(1, Ordering::Release);
+        assert!(engine.subagents_request(&info.id, info.generation, list()).unwrap_err().contains("대화 식별자"));
+        session.info.lock().unwrap().thread_id = Some(Uuid::new_v4().to_string());
+        assert!(engine.subagents_request(&info.id, info.generation, list()).unwrap_err().contains("프로세스"));
+        session.stop_requested.store(true, Ordering::Release);
+        assert!(engine.subagents_request(&info.id, info.generation, list()).unwrap_err().contains("실행 중"));
+        engine.inner.exiting.store(true, Ordering::Release);
+        assert!(engine.subagents_request(&info.id, info.generation, list()).unwrap_err().contains("종료 중"));
+        assert!(session.process.lock().unwrap().is_none()); session.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn subagent_mutation_admission_is_known_not_applied_before_transport() {
+        let engine = Engine::new(Path::new(":memory:"), Arc::new(|_| Ok(()))).unwrap();
+        let session = engine.allocate(&request()).unwrap(); let info = session.info().unwrap();
+        let send = || codex::SubagentRequest::Send {
+            agent_id: Uuid::new_v4().to_string(), request_id: Uuid::new_v4().to_string(), text: "합성 지시".into(),
+            expected_parent_runtime_id: Uuid::new_v4().to_string(), expected_runtime_id: Some(Uuid::new_v4().to_string()),
+        };
+        for stage in 0..5 {
+            match stage {
+                1 => { session.phase.store(1, Ordering::Release); },
+                2 => { session.info.lock().unwrap().thread_id = Some(Uuid::new_v4().to_string()); },
+                3 => { session.stop_requested.store(true, Ordering::Release); },
+                4 => { engine.inner.exiting.store(true, Ordering::Release); },
+                _ => {},
+            }
+            let result = engine.subagents_request(&info.id, info.generation, send()).unwrap();
+            assert_eq!(result["status"], "notApplied"); assert!(result["reason"].is_string());
+        }
+        assert!(engine.subagents_request(&info.id, info.generation + 1, send()).unwrap_err().contains("stale"));
+        assert!(session.process.lock().unwrap().is_none()); session.finish("stopped").unwrap();
+    }
+
+    fn subagent_send_value() -> serde_json::Value {
+        serde_json::json!({"type":"send","agentId":Uuid::new_v4().to_string(),"requestId":Uuid::new_v4().to_string(),"text":"합성 지시",
+            "expectedParentRuntimeId":Uuid::new_v4().to_string(),"expectedRuntimeId":Uuid::new_v4().to_string()})
+    }
+
+    #[test]
+    fn subagent_engine_preserves_sent_unknown_across_stop_exit_phase_process_and_stale_lookup() {
+        for boundary in 0..4 {
+            let engine=Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
+            let session=engine.allocate(&request()).unwrap();let info=session.info().unwrap();let parent=Uuid::new_v4().to_string();
+            session.phase.store(1,Ordering::Release);session.info.lock().unwrap().thread_id=Some(parent.clone());
+            let value=subagent_send_value();let send=||serde_json::from_value::<codex::SubagentRequest>(value.clone()).unwrap();
+            let connection=codex::ConversationConnection::fixture_subagent_connection();
+            let first=engine.with_subagent_receipt(&info.id,info.generation,send(),|_,request|connection.fixture_subagent_lost_reply(&parent,request)).unwrap();
+            assert_eq!(first["status"],"unknown","실제 CONTROL 송신 후 응답 유실을 먼저 확인합니다.");
+            match boundary {
+                0=>session.stop_requested.store(true,Ordering::Release),
+                1=>engine.inner.exiting.store(true,Ordering::Release),
+                2=>session.phase.store(2,Ordering::Release),
+                _=>{assert!(session.process.lock().unwrap().is_none());},
+            }
+            let repeated=engine.subagents_request(&info.id,info.generation,send()).unwrap();
+            assert_eq!(repeated["status"],"unknown","종료·프로세스 소실 뒤 기존 요청을 미적용으로 바꾸면 안 됩니다.");
+            let fresh=serde_json::from_value(subagent_send_value()).unwrap();
+            assert_eq!(engine.subagents_request(&info.id,info.generation,fresh).unwrap()["status"],"notApplied");
+            assert!(engine.subagents_request(&info.id,info.generation+1,send()).unwrap_err().contains("stale"));
+            assert_eq!(engine.subagents_request(&info.id,info.generation,send()).unwrap()["status"],"unknown");
+            let mut different=value.clone();different["text"]=serde_json::json!("다른 내용");
+            assert!(engine.subagents_request(&info.id,info.generation,serde_json::from_value(different).unwrap()).is_err());
+            assert!(session.process.lock().unwrap().is_none(),"추가 송신을 위한 프로세스·통로를 만들지 않습니다.");
+            session.finish("stopped").unwrap();
+        }
+    }
+
+    #[test]
+    fn subagent_engine_reads_inflight_receipt_before_shutdown_admission() {
+        let engine=Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();let session=engine.allocate(&request()).unwrap();let info=session.info().unwrap();
+        let value=subagent_send_value();let send=||serde_json::from_value::<codex::SubagentRequest>(value.clone()).unwrap();
+        let result=engine.with_subagent_receipt(&info.id,info.generation,send(),|session,_| {
+            session.stop_requested.store(true,Ordering::Release);engine.inner.exiting.store(true,Ordering::Release);
+            assert_eq!(engine.subagents_request(&info.id,info.generation,send()).unwrap()["status"],"unknown");
+            let fresh=serde_json::from_value(subagent_send_value()).unwrap();
+            assert_eq!(engine.subagents_request(&info.id,info.generation,fresh).unwrap()["status"],"notApplied");
+            Err("진행 중 요청의 최종 결과 미확인".into())
+        });
+        assert!(result.is_err());assert_eq!(engine.subagents_request(&info.id,info.generation,send()).unwrap()["status"],"unknown");session.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn subagent_engine_receipts_bound_new_admission_and_restored_state_is_unconfirmed() {
+        let engine=Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();let session=engine.allocate(&request()).unwrap();let info=session.info().unwrap();
+        let value=subagent_send_value();let send=||serde_json::from_value::<codex::SubagentRequest>(value.clone()).unwrap();
+        let (id,digest)=send().receipt_identity().unwrap().unwrap();
+        {
+            let mut ledger=session.subagent_receipts.lock().unwrap();let ledger=ledger.as_mut().unwrap();
+            ledger.insert(id,SubagentReceipt {digest,status:"unknown"});
+            for _ in 1..1024 {ledger.insert(Uuid::new_v4().to_string(),SubagentReceipt {digest:[0;32],status:"applied"});}
+        }
+        assert_eq!(engine.subagents_request(&info.id,info.generation,send()).unwrap()["status"],"unknown");
+        let fresh=serde_json::from_value(subagent_send_value()).unwrap();
+        assert_eq!(engine.subagents_request(&info.id,info.generation,fresh).unwrap()["status"],"notApplied");
+        *session.subagent_receipts.lock().unwrap()=None;
+        assert!(engine.subagents_request(&info.id,info.generation,send()).unwrap_err().contains("이전 하위 에이전트 요청 결과를 확인할 수 없습니다"));
+        assert!(engine.subagents_request("확인할 수 없는 세션",info.generation,send()).is_err());session.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn cron_admission_checks_generation_lifetime_and_current_thread_before_transport() {
+        let engine=Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
+        let session=engine.allocate(&request()).unwrap();let info=session.info().unwrap();
+        assert!(engine.cron_request(&info.id,info.generation+1,codex::CronRequest::List{}).unwrap_err().contains("stale"));
+        assert!(engine.cron_request(&info.id,info.generation,codex::CronRequest::List{}).unwrap_err().contains("실행 중"));
+        session.phase.store(1,Ordering::Release);
+        assert!(engine.cron_request(&info.id,info.generation,codex::CronRequest::List{}).unwrap_err().contains("대화 식별자"));
+        session.info.lock().unwrap().thread_id=Some(Uuid::new_v4().to_string());
+        assert!(engine.cron_request(&info.id,info.generation,codex::CronRequest::List{}).unwrap_err().contains("프로세스"));
+        session.stop_requested.store(true,Ordering::Release);
+        assert!(engine.cron_request(&info.id,info.generation,codex::CronRequest::List{}).unwrap_err().contains("실행 중"));
+        assert!(session.process.lock().unwrap().is_none());session.finish("stopped").unwrap();
+    }
+
+    #[test]
+    fn waiting_terminal_inbox_is_a_read_only_fallback_without_inventing_question_metadata() {
+        let engine = Engine::new(Path::new(":memory:"),Arc::new(|_|Ok(()))).unwrap();
+        let session = engine.allocate(&request()).unwrap();
+        session.update(|info|info.state="waiting".into(),true).unwrap();
+        let inbox = engine.list_pending_questions().unwrap(); let items = inbox["items"].as_array().unwrap();
+        assert_eq!(items.len(),1); assert_eq!(items[0]["kind"],"unsupported"); assert_eq!(items[0]["canRespond"],false);
+        assert!(items[0].get("requestId").is_none()); assert!(items[0].get("questions").is_none());
+        assert!(session.process.lock().unwrap().is_none(),"질문함 조회가 서버나 연결을 만들면 안 된다");
+        session.finish("stopped").unwrap(); assert!(engine.list_pending_questions().unwrap()["items"].as_array().unwrap().is_empty());
     }
 
     #[test]

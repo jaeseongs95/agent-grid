@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { writeFile } from 'node:fs/promises';
 
 const sessions = [
   { id: 'flow-a', title: 'Flow Alpha', cwd: 'D:\\Work\\Alpha', generation: 7, state: 'idle', active: true, threadId: 'flow-thread-a' },
@@ -7,7 +8,13 @@ const sessions = [
 const card = (page: Page, id = 'flow-a') => page.locator(`.terminal-card[data-id="${id}"]`);
 const input = (page: Page) => card(page).locator('.xterm-helper-textarea');
 
-async function workspace(page: Page) {
+function directAcknowledgements(body: string) {
+  const start = body.indexOf('function ack(output)'); const end = body.indexOf('async function resolveOrphan', start);
+  if (start < 0 || end < 0) throw new Error('기준판 ACK 함수 경계를 찾지 못했습니다.');
+  return body.slice(0, start) + `function ack(output) { if (native) void call('session_output_ack', { id: output.id, generation: output.generation, seq: output.seq }).catch(error => notifyError('출력 확인 전송 실패', 'Could not acknowledge output', error)); }\n` + body.slice(end);
+}
+
+async function workspace(page: Page, fixtureSessions = sessions) {
   await page.addInitScript(sessions => {
     const state = window as any; state.isTauri = true;
     let callback = 0;
@@ -18,6 +25,7 @@ async function workspace(page: Page) {
       releaseWrites() { this.holdWrites = false; for (const release of writes.splice(0)) release(); },
       releaseResize() { this.holdResize = false; for (const release of resizes.splice(0)) release(); },
       emit(info: any) { Object.assign(sessions.find(item => item.id === info.id)!, info); listeners.get('session-changed')!({ event: 'session-changed', id: 1, payload: sessions.find(item => item.id === info.id) }); },
+      output(info: any) { listeners.get('terminal-output')!({ event: 'terminal-output', id: 1, payload: info }); },
     };
     state.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener() {} };
     state.__TAURI_INTERNALS__ = {
@@ -46,9 +54,9 @@ async function workspace(page: Page) {
         return null;
       },
     };
-  }, sessions);
+  }, fixtureSessions);
   await page.goto('/');
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect(card(page)).toBeVisible();
   await input(page).focus();
 }
@@ -221,4 +229,172 @@ test('queue disposal releases cancelled payload objects before its inflight requ
   expect(await page.evaluate(() => (window as any).queueLifetime.sent)).toEqual(['inflight']);
   expect(await page.evaluate(() => (window as any).queueLifetime.resized)).toEqual([{ cols: 80, rows: 24 }]);
   await cdp.detach();
+});
+
+test('cumulative output acknowledgements follow parse completion, preserve generations and retain no payload', async ({ page }) => {
+  await workspace(page);
+  expect(await page.evaluate(async () => {
+    const modulePath = '/src/terminal-flow.ts';
+    const { TerminalOutputAcknowledgements } = await import(modulePath);
+    const sent: any[] = [];
+    const queue = new TerminalOutputAcknowledgements((value: any) => sent.push(value));
+    queue.enqueue({ id: 'a', generation: 7, seq: 1, data: 'not retained' });
+    queue.enqueue({ id: 'a', generation: 7, seq: 128 });
+    queue.enqueue({ id: 'a', generation: 7, seq: 2 });
+    queue.enqueue({ id: 'a', generation: 8, seq: 1 });
+    queue.enqueue({ id: 'b', generation: 7, seq: 5 });
+    const before = sent.length;
+    await Promise.resolve();
+    const first = [...sent];
+    queue.enqueue({ id: 'a', generation: 8, seq: 2 });
+    await Promise.resolve();
+    return { before, first, last: sent.at(-1) };
+  })).toEqual({ before: 0, first: [{ id: 'a', generation: 7, seq: 128 }, { id: 'a', generation: 8, seq: 1 }, { id: 'b', generation: 7, seq: 5 }], last: { id: 'a', generation: 8, seq: 2 } });
+});
+
+test('parsed output acknowledges the final sequence without releasing a held later frame', async ({ page }) => {
+  await page.route('**/src/main.ts*', async route => {
+    const response = await route.fetch();
+    let body = await response.text();
+    if (process.env.TERMINAL_ACK_BASELINE === '1') body = directAcknowledgements(body);
+    await route.fulfill({ response, body: body + '\nwindow.__flowTerminals = terminals;\n' });
+  });
+  await workspace(page);
+  await page.evaluate(() => {
+    const state = window as any; const terminal = state.__flowTerminals.get('flow-a').terminal;
+    const write = terminal.write.bind(terminal);
+    state.heldOutput = [];
+    terminal.write = (data: string, parsed: () => void) => data === 'held-later' ? state.heldOutput.push(() => write(data, parsed)) : write(data, parsed);
+    for (let seq = 1; seq <= 128; seq++) state.flow.output({ id: 'flow-a', generation: 7, seq, data: seq === 128 ? 'held-later' : `row-${seq}\r\n` });
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_output_ack').at(-1)?.args.seq)).toBe(127);
+  expect(await page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_output_ack').length)).toBeLessThan(127);
+  expect(await page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_output_ack').some((call: any) => call.args.seq === 128))).toBe(false);
+  await page.evaluate(() => { for (const release of (window as any).heldOutput) release(); });
+  await expect.poll(() => page.evaluate(() => (window as any).flow.calls.filter((call: any) => call.command === 'session_output_ack').at(-1)?.args.seq)).toBe(128);
+});
+
+test('replacement generation clears already queued parser output before rendering new output', async ({ page }) => {
+  await page.route('**/src/main.ts*', async route => {
+    const response = await route.fetch();
+    await route.fulfill({ response, body: (await response.text()) + '\nwindow.__flowTerminals = terminals;\n' });
+  });
+  await workspace(page);
+  const lines = await page.evaluate(async () => {
+    const state = window as any;
+    state.flow.output({ id: 'flow-a', generation: 7, seq: 1, data: 'obsolete-generation\r\n' });
+    state.flow.emit({ id: 'flow-a', generation: 8 });
+    state.flow.output({ id: 'flow-a', generation: 8, seq: 1, data: 'current-generation\r\n' });
+    const terminal = state.__flowTerminals.get('flow-a').terminal;
+    await new Promise<void>(resolve => terminal.write('', resolve));
+    return Array.from({ length: terminal.buffer.active.length }, (_, index) => terminal.buffer.active.getLine(index)?.translateToString(true)).join('\n');
+  });
+  expect(lines).toContain('current-generation');
+  expect(lines).not.toContain('obsolete-generation');
+});
+
+// Optional comparison uses the real app and xterm in Chromium, with a bounded
+// synthetic native transport. It does not represent Windows WebView or real IME.
+test('terminal replay comparison', async ({ browser }, testInfo) => {
+  test.skip(process.env.TERMINAL_PERF_REPLAY !== '1', '명시적으로 켜는 비교 측정입니다.');
+  test.setTimeout(180000);
+  const results = [];
+  for (const count of [1, 8]) for (let repeat = 0; repeat < 3; repeat++) for (const variant of repeat % 2 ? ['candidate', 'baseline'] : ['baseline', 'candidate']) {
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+    // Other agents may edit this checkout while measuring. A Vite hot reload
+    // would replace the measured document midway through a sample.
+    await page.routeWebSocket('**', () => {});
+    await page.route('**/src/main.ts*', async route => {
+      const response = await route.fetch(); let body = await response.text();
+      if (variant === 'baseline') body = directAcknowledgements(body);
+      await route.fulfill({ response, body: body + '\nwindow.__flowTerminals = terminals;\n' });
+    });
+    const fixture = Array.from({ length: count }, (_, index) => ({ ...sessions[0], id: index ? `flow-${index}` : 'flow-a', title: `부하 ${index}`, threadId: `flow-thread-${index}` }));
+    await workspace(page, fixture);
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Performance.enable');
+    await cdp.send('HeapProfiler.collectGarbage');
+    const beforeMetrics = await cdp.send('Performance.getMetrics');
+    const heapBefore = beforeMetrics.metrics.find(metric => metric.name === 'JSHeapUsedSize')!.value;
+    const result = await page.evaluate(async ({ count }) => {
+      const state = window as any; const flow = state.flow;
+      const views = [...state.__flowTerminals.values()] as any[];
+      const ids = [...state.__flowTerminals.keys()] as string[];
+      const textarea = views[0].terminal.textarea as HTMLTextAreaElement;
+      const seq = new Map(ids.map(id => [id, 0]));
+      // Give scrolling real history in every terminal, using parsed completion.
+      await Promise.all(views.map(view => new Promise<void>(resolve => view.terminal.write(('초기 줄 ' + 'x'.repeat(100) + '\r\n').repeat(1200), resolve))));
+      await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      flow.calls = { push() {} }; flow.sent.length = 0;
+      const original = state.__TAURI_INTERNALS__.invoke;
+      const outstanding = new Map(ids.map(id => [id, 0]));
+      const acknowledged = new Map(ids.map(id => [id, 0]));
+      const inputTimes: number[] = []; const inputDelay: number[] = []; const ackDelay: number[] = []; const emitted = new Map<string, Map<number, number>>();
+      let acknowledgements = 0; let maxOutstanding = 0;
+      state.__TAURI_INTERNALS__.invoke = async (command: string, args: any = {}) => {
+        if (command === 'session_write' && args.id === ids[0]) inputDelay.push(performance.now() - inputTimes.shift()!);
+        if (command === 'session_output_ack') {
+          acknowledgements++;
+          const times = emitted.get(args.id)!;
+          const before = acknowledged.get(args.id)!;
+          for (let number = before + 1; number <= args.seq; number++) { ackDelay.push(performance.now() - times.get(number)!); times.delete(number); }
+          acknowledged.set(args.id, args.seq); outstanding.set(args.id, seq.get(args.id)! - args.seq);
+        }
+        return original(command, args);
+      };
+      const frames: number[] = []; let running = true; let last = performance.now();
+      const frame = (now: number) => { frames.push(now - last); last = now; if (running) requestAnimationFrame(frame); };
+      requestAnimationFrame(frame);
+      const started = performance.now();
+      let chunks = 0; let typed = 0; let scrolls = 0; let maxInputPending = 0;
+      const line = '\x1b[32m출력 ' + 'x'.repeat(70) + '\x1b[0m\r\n';
+      const targetChunks = 128 * 96; const targetInputs = 128; const targetScrolls = 96;
+      const outputTimer = setInterval(() => {
+        for (const id of ids) {
+          const remaining = Math.min(128 - outstanding.get(id)!, targetChunks - seq.get(id)!);
+          const times = emitted.get(id) ?? new Map(); emitted.set(id, times);
+          for (let index = 0; index < remaining; index++) {
+            const next = seq.get(id)! + 1; seq.set(id, next); outstanding.set(id, outstanding.get(id)! + 1);
+            times.set(next, performance.now()); chunks++;
+            flow.output({ id, generation: 7, seq: next, data: line });
+          }
+          maxOutstanding = Math.max(maxOutstanding, outstanding.get(id)!);
+        }
+      }, 8);
+      const typingTimer = setInterval(() => {
+        if (typed >= targetInputs) return;
+        textarea.focus(); inputTimes.push(performance.now());
+        textarea.value = String.fromCharCode(97 + (typed++ % 26));
+        textarea.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: textarea.value }));
+        maxInputPending = Math.max(maxInputPending, Number(views[0].card.dataset.inputPending));
+      }, 12);
+      const scrollTimer = setInterval(() => { if (scrolls < targetScrolls) views[0].terminal.scrollLines(scrolls++ % 2 ? 3 : -3); }, 16);
+      while (chunks < count * targetChunks || typed < targetInputs || scrolls < targetScrolls) {
+        if (performance.now() - started > 15000) throw new Error('고정량 replay 완료 제한 시간을 초과했습니다.');
+        await new Promise(resolve => setTimeout(resolve, 16));
+      }
+      clearInterval(outputTimer); clearInterval(typingTimer); clearInterval(scrollTimer);
+      const produceMs = performance.now() - started;
+      await Promise.all(views.map(view => new Promise<void>(resolve => view.terminal.write('', resolve))));
+      await Promise.resolve(); running = false;
+      const sorted = (values: number[]) => values.filter(Number.isFinite).sort((a, b) => a - b);
+      const stats = (values: number[]) => { const ordered = sorted(values); return { samples: ordered.length, p50: ordered[Math.floor(ordered.length * .5)] ?? 0, p95: ordered[Math.floor(ordered.length * .95)] ?? 0, max: ordered.at(-1) ?? 0 }; };
+      return { count, produceMs, completeMs: performance.now() - started, chunks, bytes: chunks * new TextEncoder().encode(line).length, acknowledgements, maxOutstanding, typed, sent: flow.sent.length, scrolls, maxInputPending, inputMs: stats(inputDelay), frameMs: stats(frames), parsedAckMs: stats(ackDelay), remaining: [...outstanding.values()], heapBytes: (performance as any).memory?.usedJSHeapSize ?? null, raw: { inputMs: inputDelay, frameMs: frames } };
+    }, { count });
+    expect(result.remaining).toEqual(Array(count).fill(0));
+    expect(result.sent).toBe(result.typed);
+    expect(result.maxOutstanding).toBeLessThanOrEqual(128);
+    await cdp.send('HeapProfiler.collectGarbage');
+    const afterMetrics = await cdp.send('Performance.getMetrics');
+    const heapAfter = afterMetrics.metrics.find(metric => metric.name === 'JSHeapUsedSize')!.value;
+    results.push({ variant, repeat, ...result, heapBeforeGcBytes: heapBefore, heapAfterGcBytes: heapAfter, retainedHeapDeltaBytes: heapAfter - heapBefore });
+    await writeFile(testInfo.outputPath(`${count}-${repeat}-${variant}.json`), JSON.stringify(results.at(-1), null, 2), 'utf8');
+    const { raw: _raw, ...summary } = results.at(-1)!;
+    console.log(JSON.stringify({ terminalReplaySample: summary }));
+    await cdp.detach();
+    await page.close();
+  }
+  const reportPath = testInfo.outputPath('terminal-replay.json');
+  await writeFile(reportPath, JSON.stringify({ schema: 'terminal-replay-v1', browser: browser.version(), platform: process.platform, scope: 'Chromium synthetic native IPC; real app and xterm; ACK baseline only; no WebView, actual CLI or physical IME claim', results }, null, 2), 'utf8');
+  await testInfo.attach('terminal-replay.json', { path: reportPath, contentType: 'application/json' });
 });

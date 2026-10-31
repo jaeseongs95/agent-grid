@@ -122,14 +122,24 @@ pub(super) fn command_stdout(exe: &OsString, cwd: &Path, args: &[String], timeou
     command_stdout_until(exe, cwd, args, Instant::now() + timeout, None)
 }
 pub(super) fn command_stdout_until(exe: &OsString, cwd: &Path, args: &[String], deadline: Instant, cancelled: Option<&Arc<AtomicBool>>) -> Result<Vec<u8>, String> {
+    command_stdout_with_job(exe, cwd, args, deadline, cancelled, false)
+}
+// 명시적인 서버 시작 명령만 공유 서버가 launcher의 Job 밖에서 살아남도록 허용한다.
+// 조회·설치·업데이트·일반 PTY에는 이 정책을 사용할 수 없다.
+pub(super) fn start_daemon_stdout_until(exe: &OsString, cwd: &Path, deadline: Instant, cancelled: Option<&Arc<AtomicBool>>) -> Result<Vec<u8>, String> {
+    command_stdout_with_job(exe, cwd, &["app-server".into(), "daemon".into(), "start".into(), "--existing-installation".into()], deadline, cancelled, true)
+}
+fn command_stdout_with_job(exe: &OsString, cwd: &Path, args: &[String], deadline: Instant, cancelled: Option<&Arc<AtomicBool>>, daemon_launcher: bool) -> Result<Vec<u8>, String> {
     check_cancelled(cancelled)?;
     if Instant::now() >= deadline { return Err("Codex command timed out; its result is unknown. Refresh before retrying".into()); }
     let (mut command, gate) = LaunchGate::wrap_std(exe.as_os_str())?;
+    // 조회용 CLI에는 TUI의 일회 제어 자격을 상속하지 않는다.
+    command.env_remove("CODEX_DESKTOP_CRON_BOOTSTRAP").env_remove("CODEX_DESKTOP_CRON_TOKEN");
     command.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     hidden(&mut command);
     let child = command.spawn().map_err(|e| format!("Start Codex command: {e}"))?;
     let mut process = CliProcess { child, job: None, _gate: gate, readers: Vec::new() };
-    process.job = Some(ProcessJob::assign_std(&process.child)?);
+    process.job = Some(if daemon_launcher { ProcessJob::assign_daemon_launcher(&process.child)? } else { ProcessJob::assign_std(&process.child)? });
     let overflow = Arc::new(AtomicBool::new(false));
     process.readers.push(capture(process.child.stdout.take().ok_or("Codex stdout pipe is missing")?, overflow.clone()));
     process.readers.push(capture(process.child.stderr.take().ok_or("Codex stderr pipe is missing")?, overflow.clone()));

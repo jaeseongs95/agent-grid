@@ -14,7 +14,12 @@ import { createExtensionsManager } from './extensions';
 import { createMobileControl } from './mobile-control';
 import { createWeeklyUsage } from './weekly-usage';
 import './weekly-usage.css';
-import { InputQueueError, TerminalInputQueue, TerminalResizeQueue } from './terminal-flow';
+import { createConversation } from './conversation';
+import { createContextControls } from './context-controls';
+import { createCronManager } from './cron-manager';
+import { createSubagentManager } from './subagent-manager';
+import { createQuestionCenter } from './question-center';
+import { InputQueueError, TerminalInputQueue, TerminalResizeQueue, TerminalOutputAcknowledgements } from './terminal-flow';
 import { bindAttribute, bindText, getLanguage, languageStorageError, onLanguageChange, setLanguage, t } from './i18n';
 
 const native = isTauri();
@@ -26,6 +31,9 @@ const sessions = new Map<string, Session>();
 interface QueuedInput { data: string; generation: number; selectionVersion: number }
 interface QueuedResize { generation: number; selectionVersion: number; cols: number; rows: number }
 const terminals = new Map<string, { terminal: Terminal; fit: FitAddon; search: SearchAddon; card: HTMLElement; observer: ResizeObserver; input: TerminalInputQueue<QueuedInput>; resize: TerminalResizeQueue<QueuedResize>; inputWarning: boolean; resizeTimer?: ReturnType<typeof setTimeout> }>();
+const conversations = new Map<string, ReturnType<typeof createConversation>>();
+const conversationOwners = new Set<string>();
+const contextControls = new Map<string, ReturnType<typeof createContextControls>>();
 const pending = new Map<string, Output[]>();
 const resolving = new Set<string>();
 const unlisteners: UnlistenFn[] = [];
@@ -42,6 +50,13 @@ let workspaceReady = !native;
 let restoringWorkspace = native;
 let exitInProgress = false;
 let initialization: Promise<void> = Promise.resolve();
+let runtimePreparation: Promise<void> | undefined;
+let runtimeRestoration: Promise<void> | undefined;
+let runtimeReady = !native;
+let runtimeGeneration = 0;
+let runtimeCommand: Promise<void> | undefined;
+let runtimeCommandGeneration = 0;
+let executableMutation: Promise<unknown> | undefined;
 const restoringRequests = new Map<SavedSession, Promise<SessionInfo>>();
 const startOperations = new Set<Promise<SessionInfo>>();
 // Failed shutdown events must not erase the restart intent saved before stopping.
@@ -51,7 +66,6 @@ const explicitlyStoppedSessions = new Set<string>();
 const cancelledRestores = new Set<SavedSession>();
 let saveTimer: ReturnType<typeof setTimeout>;
 let saveQueue = Promise.resolve();
-let notificationCount = 0;
 let dragging = '';
 let searchVisible = false;
 let pendingStarts = 0;
@@ -59,13 +73,13 @@ const pendingThreads = new Map<string, Promise<SessionInfo>>();
 let importedProjects: ProjectInfo[] = [];
 let selectedProject = '';
 let projectSelectionVersion = 0;
+let nativeWindowVisible = true;
 
 if (native) $('#app').hidden = true;
+$('#app').setAttribute('aria-busy', 'true');
 $('#app').innerHTML = `
   <aside class="sidebar">
     <a class="brand" href="#" aria-label="OpenDIY Desktop 홈"><span class="brand-mark"><i></i><i></i><i></i><i></i></span><span class="brand-name">OpenDIY <small>Desktop</small></span><span class="version">${version}</span></a>
-    <div class="workspace-label">WORKSPACE <span class="local-pill">LOCAL</span></div>
-    <button class="workspace-choice"><span class="folder-icon">▤</span><span>나의 작업 공간<small>독립된 터미널, 하나의 화면</small></span></button>
     <div class="sidebar-lists">
       <section class="sidebar-projects" aria-labelledby="projects-heading">
         <div id="projects-heading" class="side-heading">프로젝트 <span id="project-count">0</span></div>
@@ -77,35 +91,29 @@ $('#app').innerHTML = `
         <nav id="session-list" aria-label="세션 목록"></nav>
       </section>
     </div>
-    <button id="external-toggle" class="side-link"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button>
-    <div class="sidebar-bottom"><span class="connection-dot"></span><span id="connection">연결 확인 중</span><small>Windows · 로컬 실행</small></div>
+
   </aside>
   <main>
-    <header class="topbar"><div class="workspace-actions"><h1 class="workspace-title">OpenDIY Desktop</h1><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="알림 보기">♧<span id="notification-count" hidden></span></button><button id="settings-open" class="icon-button" aria-label="설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" title="설정">⚙</button><button id="exit" class="quiet-button">앱 종료</button></div></header>
+    <header class="topbar"><div class="workspace-actions"><button id="catalog-open" class="quiet-button">세션 불러오기</button><button id="new-session" class="primary-button"><span>+</span> 새 세션</button></div><div class="top-actions"><span id="mode-label" class="mode-label">LOCAL WORKSPACE</span><button id="notifications" class="icon-button" aria-label="질문함">?<span id="notification-count" hidden></span></button><button id="settings-open" class="icon-button" aria-label="설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" title="설정">⚙</button><button id="exit" class="quiet-button">앱 종료</button></div></header>
     <div id="project-tabs" class="project-tabs" role="tablist" aria-label="프로젝트별 세션"></div>
     <section class="toolbar" aria-label="그리드 도구"><div class="session-summary"><span class="connection-dot"></span><strong id="running-count">0</strong> 실행 중 <span class="divider"></span><span id="total-count">0개 세션</span></div><div class="layout-tools"><button id="search-toggle" class="quiet-button" title="활성 터미널 검색 (Ctrl+Shift+F)">⌕ <span>검색</span></button><span class="divider"></span><span class="layout-label">열</span><div id="column-options" class="segmented" role="group" aria-label="그리드 열 수"><button data-columns="1" aria-label="1열">▯</button><button data-columns="2" class="active" aria-label="2열">▥</button><button data-columns="3" aria-label="3열">▥▯</button><button data-columns="4" aria-label="4열">▥▥</button></div></div></section>
-    <div id="runtime-banner" class="runtime-banner" hidden></div>
+    <div id="runtime-banner" class="runtime-banner" role="status" hidden><span id="runtime-status"></span> <button id="runtime-retry" class="quiet-button" hidden>다시 시도</button></div>
     <div id="restore-banner" class="restore-banner" hidden><span>자동으로 연결하지 못한 저장 세션이 있습니다. 목록에서 다시 연결하거나 제거할 수 있습니다.</span><button id="restore-open" class="quiet-button">저장 세션 보기 →</button></div>
     <section id="search-bar" class="search-bar" hidden><label for="terminal-search">활성 터미널 검색</label><input id="terminal-search" placeholder="검색어 입력"/><button id="search-prev" class="quiet-button" aria-label="이전 검색 결과">↑</button><button id="search-next" class="quiet-button" aria-label="다음 검색 결과">↓</button><span id="search-result" role="status"></span><button id="search-close" class="icon-button" aria-label="검색 닫기">×</button></section>
     <section id="grid-area" class="grid-area" role="tabpanel"><div id="grid" class="terminal-grid"></div><div id="grid-handles"></div><div id="empty" class="empty"><div class="empty-grid">▦</div><h2>다음 작업을 펼쳐 보세요</h2><p>프로젝트 경로를 선택해 첫 세션을 시작하세요.<br>각 세션은 독립된 터미널에서 실행됩니다.</p><button id="empty-add" class="primary-button">+ 첫 세션 만들기</button><small>Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션</small></div></section>
-    <footer><span><span class="connection-dot"></span> <span id="footer-state">로컬 세션만 제어합니다</span></span><span>드래그로 순서 변경 <i>·</i> 경계선으로 크기 조절 <i>·</i> Alt + 1–9</span><span id="save-status">레이아웃 자동 저장</span></footer>
+    <footer><span class="footer-hints">드래그로 순서 변경 <i>·</i> 경계선으로 크기 조절 <i>·</i> Alt + 1–9</span><span id="save-status">레이아웃 자동 저장</span></footer>
   </main>
   <div id="toast-area" class="toast-area" role="status" aria-live="polite"></div>
-  <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">설정</h2><button id="settings-close" class="icon-button" data-close aria-label="설정 닫기" autofocus>×</button></div><div class="settings-options"><button id="codex-settings-open" class="side-link" aria-haspopup="dialog" aria-controls="codex-settings-dialog"><span>⚙</span> 실행 파일 설정</button><button id="extensions-open" class="side-link" aria-haspopup="dialog" aria-controls="extensions-dialog"><span>◇</span> <span id="extensions-open-label">플러그인·스킬</span></button></div><div class="language-setting"><label for="language-select">언어</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div></dialog>
+  <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-heading"><h2 id="settings-title">설정</h2><button id="settings-close" class="icon-button" data-close aria-label="설정 닫기" autofocus>×</button></div><div class="settings-options"><button id="codex-settings-open" class="side-link" aria-haspopup="dialog" aria-controls="codex-settings-dialog"><span>⚙</span> 실행 파일 설정</button><button id="extensions-open" class="side-link" aria-haspopup="dialog" aria-controls="extensions-dialog"><span>◇</span> <span id="extensions-open-label">플러그인·스킬</span></button><button id="external-toggle" class="side-link" aria-haspopup="dialog" aria-controls="external-dialog"><span>◉</span> 외부 세션 <span class="readonly">읽기 전용</span></button></div><div class="language-setting"><label for="language-select">언어</label><select id="language-select"><option value="ko">한국어</option><option value="en">English</option></select><small id="language-error" role="alert" hidden></small></div></dialog>
   <dialog id="create-dialog"><form id="create-form"><div class="dialog-heading"><span class="eyebrow">NEW SESSION</span><button type="button" class="icon-button" data-close aria-label="닫기">×</button></div><h2>새 세션 만들기</h2><p>선택한 프로젝트에서 로컬 에이전트를 시작합니다.</p><label for="session-title">세션 이름</label><input id="session-title" name="title" placeholder="예: API 개선" required maxlength="120"/><label for="session-cwd">프로젝트 경로</label><input id="session-cwd" name="cwd" placeholder="C:\\work\\my-project" required/><small>실제로 존재하는 로컬 디렉터리의 절대 경로를 입력하세요.</small><label for="session-thread">이어갈 스레드 ID <span class="optional">선택</span></label><input id="session-thread" name="thread" placeholder="비워 두면 새 대화로 시작합니다"/><div id="create-error" class="inline-error" role="alert" hidden></div><div class="dialog-actions"><button type="button" class="quiet-button" data-close>취소</button><button id="create-submit" class="primary-button" type="submit">세션 시작 →</button></div></form></dialog>
   <dialog id="restore-dialog"><div class="dialog-heading"><span class="eyebrow">SAVED WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>저장된 세션</h2><p>이전에 실행 중이던 대화는 자동으로 연결합니다. 남은 항목은 선택해서 다시 연결할 수 있습니다.</p><div id="restore-list" class="restore-list"></div></dialog>
   <dialog id="external-dialog"><div class="dialog-heading"><span class="eyebrow">READ ONLY</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>외부 세션</h2><p>다른 앱에서 발견한 기록입니다. 관측 정보이며 현재 실행 상태는 미확인입니다. 입력하거나 종료할 수 없습니다.</p><button id="external-refresh" class="quiet-button">새로 고침</button><div id="external-list" class="external-list"></div></dialog>
-  <dialog id="notification-dialog"><div class="dialog-heading"><span class="eyebrow">ACTIVITY</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>알림</h2><div id="notification-list" class="notification-list"><p class="muted">새로운 알림이 없습니다.</p></div></dialog>
   <dialog id="exit-dialog"><div class="dialog-heading"><span class="eyebrow">EXIT WORKSPACE</span><button class="icon-button" data-close aria-label="닫기">×</button></div><h2>OpenDIY Desktop를 종료할까요?</h2><p>앱이 소유한 모든 실행 세션이 종료됩니다. 다른 앱의 세션은 제어하지 않습니다. 창의 닫기 버튼은 트레이로 숨깁니다.</p><p id="unconfirmed-exit-warning" class="inline-error" role="alert" hidden>원격 작업의 중단을 확인하지 못했습니다. 앱을 닫아도 원격 작업이 계속 실행될 수 있습니다. 로컬 자원은 정리되었습니다.</p><div class="dialog-actions"><button class="quiet-button" data-close>계속 작업</button><button id="confirm-unconfirmed-exit" class="danger-button" aria-describedby="unconfirmed-exit-warning" hidden>중단 미확인 상태로 앱 닫기</button><button id="confirm-exit" class="danger-button">세션 종료 후 앱 닫기</button></div></dialog>
 `;
 
 // Register only app-owned templates, before any terminal or user content is inserted.
 const markupLabels: Record<string, [string, string]> = {
   "OpenDIY Desktop 홈": ["OpenDIY Desktop 홈", "OpenDIY Desktop home"],
-  "WORKSPACE": ["작업 공간", "WORKSPACE"],
-  "LOCAL": ["로컬", "LOCAL"],
-  "나의 작업 공간": ["나의 작업 공간", "My workspace"],
-  "독립된 터미널, 하나의 화면": ["독립된 터미널, 하나의 화면", "Independent terminals, one view"],
   "프로젝트": ["프로젝트", "Projects"],
   "+ 새 프로젝트": ["+ 새 프로젝트", "+ New project"],
   "+ 프로젝트 가져오기": ["+ 프로젝트 가져오기", "+ Import project"],
@@ -119,8 +127,6 @@ const markupLabels: Record<string, [string, string]> = {
   "설정 열기": ["설정 열기", "Open settings"],
   "설정 닫기": ["설정 닫기", "Close settings"],
   "언어": ["언어", "Language"],
-  "연결 확인 중": ["연결 확인 중", "Checking connection"],
-  "Windows · 로컬 실행": ["Windows · 로컬 실행", "Windows · local execution"],
   "LOCAL WORKSPACE": ["로컬 작업 공간", "LOCAL WORKSPACE"],
   "알림 보기": ["알림 보기", "View notifications"],
   "앱 종료": ["앱 종료", "Exit app"],
@@ -150,7 +156,6 @@ const markupLabels: Record<string, [string, string]> = {
   "각 세션은 독립된 터미널에서 실행됩니다.": ["각 세션은 독립된 터미널에서 실행됩니다.", "Each session runs in its own terminal."],
   "+ 첫 세션 만들기": ["+ 첫 세션 만들기", "+ Create first session"],
   "Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션": ["Alt + 1–9 세션 전환 · Ctrl + Tab 다음 세션", "Alt + 1–9 switch sessions · Ctrl + Tab next session"],
-  "로컬 세션만 제어합니다": ["로컬 세션만 제어합니다", "Controlling local sessions only"],
   "드래그로 순서 변경": ["드래그로 순서 변경", "Drag to reorder"],
   "경계선으로 크기 조절": ["경계선으로 크기 조절", "Drag borders to resize"],
   "레이아웃 자동 저장": ["레이아웃 자동 저장", "Layout autosave"],
@@ -309,16 +314,74 @@ function notify(text: string, error = false, english = text) {
   bindText(toast, text, english);
   $('#toast-area').append(toast);
   setTimeout(() => toast.remove(), error ? 12000 : 6000);
-  const item = document.createElement('p'); const time = new Date(); const stamp = (language: string) => time.toLocaleTimeString(language, { hour: '2-digit', minute: '2-digit' }); bindText(item, `${stamp('ko-KR')}  ${text}`, `${stamp('en-US')}  ${english}`);
-  const list = $('#notification-list'); list.querySelector('.muted')?.remove(); list.prepend(item);
-  while (list.children.length > 100) list.lastElementChild?.remove();
-  $('#notification-count').hidden = false; $('#notification-count').textContent = String(++notificationCount);
+
 }
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (!native) throw new UiError(demo ? '디자인 데모에서는 프로세스를 실행하거나 입력할 수 없습니다.' : '데스크톱 앱에서 사용할 수 있는 기능입니다.', demo ? 'The design demo cannot run processes or accept input.' : 'This feature is available in the desktop app.');
   return invoke<T>(command, args);
 }
+
+function prepareRuntime(): Promise<void> {
+  if (!native || exitInProgress) return Promise.resolve();
+  if (runtimePreparation) return runtimePreparation;
+  const generation = runtimeGeneration;
+  const mutation = executableMutation;
+  $('#runtime-banner').hidden = false;
+  const retry = $<HTMLButtonElement>('#runtime-retry'); retry.hidden = true; retry.disabled = true;
+  bindText($('#runtime-status'), '공유서버를 준비하는 중… 준비되면 이전 세션을 복원합니다.', 'Preparing the shared server… Saved sessions will resume when it is ready.');
+  const operation = Promise.resolve().then(async () => {
+    // A settings command can save its selection before its IPC response arrives.
+    if (mutation) await mutation.catch(() => {});
+    // The native startup operation has one owner; invalidation is not cancellation.
+    if (runtimeCommand) await runtimeCommand.catch(() => {});
+    if (generation !== runtimeGeneration || exitInProgress) return false;
+    const command = call<void>('prepare_runtime'); runtimeCommand = command; runtimeCommandGeneration = generation;
+    try { await command; }
+    finally { if (runtimeCommand === command) runtimeCommand = undefined; }
+    return true;
+  });
+  runtimePreparation = operation.then(prepared => {
+    if (generation !== runtimeGeneration) return prepareRuntime();
+    if (!prepared) { runtimePreparation = undefined; return; }
+    $('#runtime-banner').hidden = true;
+    runtimeReady = true;
+    weeklyUsage.setVisible(nativeWindowVisible);
+  }, error => {
+    if (generation !== runtimeGeneration) return prepareRuntime();
+    bindText($('#runtime-status'), `공유서버 준비 실패: ${message(error, 'ko')}`, `Could not prepare the shared server: ${message(error, 'en')}`);
+    bindText(retry, '다시 시도', 'Retry'); retry.hidden = false; retry.disabled = false;
+    throw error;
+  });
+  return runtimePreparation;
+}
+
+function resumeWorkspace(): Promise<void> {
+  if (runtimeRestoration) return runtimeRestoration;
+  if (exitInProgress) return Promise.resolve();
+  restoringWorkspace = true; updateRestoreBanner();
+  const operation = (async () => {
+    try {
+      await prepareRuntime();
+      for (const request of [...saved]) {
+        if (exitInProgress || sessions.size + pendingStarts >= MAX_WORKSPACE_SESSIONS) break;
+        if (!saved.includes(request) || request.resumeOnStartup !== true || !request.threadId) continue;
+        try { await restoreSaved(request, false); } catch (error) { notifyError('자동 복원 실패', 'Could not automatically restore session', error); }
+      }
+    } finally {
+      restoringWorkspace = false; updateRestoreBanner(); scheduleSave(); renderAll();
+    }
+  })();
+  runtimeRestoration = operation;
+  void operation.finally(() => { runtimeRestoration = undefined; }).catch(() => {});
+  return operation;
+}
+$('#runtime-retry').onclick = () => {
+  if (exitInProgress || runtimeRestoration) return;
+  runtimePreparation = undefined;
+  weeklyUsage.refresh();
+  void resumeWorkspace().catch(error => notifyError('공유서버 준비 실패', 'Could not prepare the shared server', error));
+};
 
 function pendingRestoreOwnerIds() {
   return new Set([...failedRestoreCards].filter(id => saved.some(request => request.threadId && sessions.get(id)?.threadId === request.threadId)));
@@ -397,7 +460,7 @@ function setActive(id: string, focus = true) {
   active = id;
   for (const [key, view] of terminals) view.card.classList.toggle('focused', key === id);
   for (const element of document.querySelectorAll<HTMLElement>('[data-session-link]')) element.classList.toggle('active', element.dataset.sessionLink === id);
-  if (focus) terminals.get(id)?.terminal.focus();
+  if (focus) { const view = terminals.get(id); if (view && !view.card.querySelector<HTMLElement>('.conversation-host')?.hidden) view.card.querySelector<HTMLTextAreaElement>('.conversation-input')?.focus(); else view?.terminal.focus(); }
 }
 
 function canType(id: string) {
@@ -406,7 +469,7 @@ function canType(id: string) {
 }
 function refreshInputState(id: string) {
   const view = terminals.get(id); if (!view) return;
-  view.terminal.options.disableStdin = !canType(id) || view.input.paused || view.input.disposed;
+  view.terminal.options.disableStdin = !canType(id) || conversationOwners.has(id) || view.input.paused || view.input.disposed;
   view.card.dataset.inputPending = String(view.input.size); view.card.dataset.inputBytes = String(view.input.byteLength);
   const paused = String(view.input.paused);
   if (view.card.dataset.inputPaused !== paused) {
@@ -420,7 +483,7 @@ function inputError(error: unknown) {
 }
 function sendInput(id: string, data: string) {
   const session = sessions.get(id); const view = terminals.get(id);
-  if (!session || !view || !canType(id)) return;
+  if (!session || !view || !canType(id) || conversationOwners.has(id)) return;
   void view.input.enqueue({ data, generation: session.generation, selectionVersion: projectSelectionVersion }).catch(error => {
     if (error instanceof InputQueueError && error.reason === 'cancelled') return;
     if (error instanceof InputQueueError && view.inputWarning) return;
@@ -436,9 +499,69 @@ function queueResize(id: string) {
   view.resizeTimer = setTimeout(() => view.resize.enqueue({ generation, selectionVersion, cols: view.terminal.cols, rows: view.terminal.rows }), 60);
 }
 
+function mountConversation(session: Session) {
+  const view = terminals.get(session.id)!;
+  const { card, terminal, fit, input } = view;
+  card.querySelector('.conversation-host')?.remove();
+  const conversationHost = document.createElement('div');
+  card.querySelector('.terminal-host')!.after(conversationHost);
+  conversationHost.hidden = true;
+  let conversation: ReturnType<typeof createConversation> | undefined;
+  const toggle = card.querySelector<HTMLButtonElement>('.conversation-toggle')!;
+  function getConversation() {
+    if (!conversation) {
+      conversation = createConversation({ sessionId: session.id, generation: session.generation, host: conversationHost, call,
+        ownerChanged(owned) { if (conversations.get(session.id) !== conversation) return; if (owned) { conversationOwners.add(session.id); input.cancelPending(); } else conversationOwners.delete(session.id); refreshInputState(session.id); },
+      });
+      conversations.set(session.id, conversation);
+    }
+    return conversation!;
+  }
+  toggle.onclick = async () => {
+    toggle.disabled = true;
+    try {
+      getConversation();
+      const show = conversationHost.hidden;
+      if (show) await conversation!.setVisible(true);
+      else await conversation!.handoffToTerminal();
+      await conversation!.setForeground(!card.hidden && !document.hidden && nativeWindowVisible);
+      card.querySelector<HTMLElement>('.terminal-host')!.hidden = show;
+      toggle.setAttribute('aria-pressed', String(show));
+      if (!show) { fit.fit(); terminal.focus(); }
+    } catch (error) {
+      const showingConversation = !conversationHost.hidden;
+      card.querySelector<HTMLElement>('.terminal-host')!.hidden = showingConversation;
+      toggle.setAttribute('aria-pressed', String(showingConversation));
+      notify('보기를 전환하지 못했습니다. 현재 화면과 작성 중인 내용을 확인한 뒤 다시 시도하세요.', true, 'Could not switch views. Check the current view and your draft before trying again.');
+    }
+    finally { toggle.disabled = false; }
+  };
+  contextControls.get(session.id)?.dispose();
+  contextControls.set(session.id, createContextControls({
+    host: card.querySelector<HTMLElement>('.context-controls')!, statusHost: card.querySelector<HTMLElement>('.session-compaction')!, sessionId: session.id, generation: session.generation, call, notify,
+    async prepare() {
+      if (toggle.disabled) throw new Error('대화 화면 전환 중');
+      toggle.disabled = true;
+      try {
+        const controller = getConversation();
+        await controller.setVisible(true);
+        await controller.setForeground(!card.hidden && !document.hidden && nativeWindowVisible);
+        card.querySelector<HTMLElement>('.terminal-host')!.hidden = true;
+        toggle.setAttribute('aria-pressed', 'true');
+      } catch (error) {
+        const showingConversation = !conversationHost.hidden;
+        card.querySelector<HTMLElement>('.terminal-host')!.hidden = showingConversation;
+        toggle.setAttribute('aria-pressed', String(showingConversation));
+        throw error;
+      } finally { toggle.disabled = false; }
+    },
+    compact: () => getConversation().compact(),
+  }));
+}
+
 function createTerminal(session: Session) {
   const card = document.createElement('article'); card.className = 'terminal-card'; card.dataset.id = session.id;
-  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-state"></span><div class="card-actions"><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">직접 입력 · IME · 붙여넣기</span></div>`;
+  card.innerHTML = `<header class="terminal-header"><span class="drag-handle" draggable="true" title="드래그로 순서 변경" aria-hidden="true">⠿</span><span class="terminal-title"></span><span class="session-compaction" role="status" hidden></span><span class="session-state"></span><div class="card-actions"><button class="session-id-copy icon-button" type="button" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg></button><span class="context-controls"></span><button class="subagents-open icon-button" type="button" aria-haspopup="dialog" aria-controls="subagents-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M12 8v4M5 16v-4h14v4"/></svg></button><button class="cron-open icon-button" type="button" aria-haspopup="dialog" aria-controls="cron-dialog"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></svg></button><button class="move-left icon-button" aria-label="앞으로 이동" title="앞으로 이동">‹</button><button class="move-right icon-button" aria-label="뒤로 이동" title="뒤로 이동">›</button><button class="conversation-toggle icon-button" type="button" aria-label="대화 보기" title="대화 / 터미널">☷</button><button class="maximize icon-button" aria-label="세션 최대화" title="세션 최대화">⛶</button><button class="stop icon-button" aria-label="이 세션 종료" title="이 세션 종료">×</button></div></header><div class="terminal-path"></div><div class="terminal-host"></div><div class="terminal-footer"><span class="terminal-identity"></span><span class="terminal-hint">직접 입력 · IME · 붙여넣기</span></div>`;
   localizeMarkup(card);
   const terminal = new Terminal({ fontFamily: '"Cascadia Code", "Cascadia Mono", Consolas, monospace', fontSize: 12, lineHeight: 1.45, cursorBlink: true, scrollback: 10000, disableStdin: !native, allowProposedApi: false, theme: { background: '#141820', foreground: '#ced5e3', cursor: '#a5b4fc', selectionBackground: '#3b4567', black: '#212735', red: '#f78b99', green: '#91d6ad', yellow: '#eac184', blue: '#8eaafb', magenta: '#c4a4f3', cyan: '#87cfd9', white: '#e3e8f0' } });
   const fit = new FitAddon(); const search = new SearchAddon(); terminal.loadAddon(fit); terminal.loadAddon(search);
@@ -448,7 +571,7 @@ function createTerminal(session: Session) {
   observer.observe(card.querySelector('.terminal-host')!);
   const input = new TerminalInputQueue<QueuedInput>(async value => {
     const current = sessions.get(session.id);
-    if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || !canType(session.id)) throw new InputQueueError('cancelled');
+    if (!current || value.selectionVersion !== projectSelectionVersion || current.generation !== value.generation || (!canType(session.id) || conversationOwners.has(session.id))) throw new InputQueueError('cancelled');
     await call<void>('session_write', { id: session.id, generation: value.generation, data: value.data });
   }, () => refreshInputState(session.id));
   const resize = new TerminalResizeQueue<QueuedResize>(async value => {
@@ -458,6 +581,7 @@ function createTerminal(session: Session) {
   }, error => notifyError('터미널 크기 변경 실패', 'Could not resize terminal', error));
   terminals.set(session.id, { terminal, fit, search, card, observer, input, resize, inputWarning: false });
   refreshInputState(session.id);
+  mountConversation(session);
   terminal.onData(data => sendInput(session.id, data));
   terminal.onResize(() => queueResize(session.id));
   terminal.attachCustomKeyEventHandler(event => {
@@ -485,6 +609,20 @@ function createTerminal(session: Session) {
       }).catch(error => notifyError('종료 실패', 'Could not stop session', error));
     }
   });
+  const copyIdButton = card.querySelector<HTMLButtonElement>('.session-id-copy')!;
+  bindAttribute(copyIdButton, 'aria-label', '세션 ID 복사', 'Copy session ID'); bindAttribute(copyIdButton, 'title', '세션 ID 복사', 'Copy session ID');
+  copyIdButton.onclick = async () => {
+    const threadId = sessions.get(session.id)?.threadId;
+    if (!threadId || demo) return;
+    try { await navigator.clipboard.writeText(threadId); notify('세션 ID를 복사했습니다.', false, 'Session ID copied.'); }
+    catch { notify('세션 ID를 복사하지 못했습니다. 다시 시도하세요.', true, 'Could not copy the session ID. Try again.'); }
+  };
+  const subagentsButton = card.querySelector<HTMLButtonElement>('.subagents-open')!;
+  bindAttribute(subagentsButton, 'aria-label', '서브에이전트 관리', 'Manage subagents'); bindAttribute(subagentsButton, 'title', '서브에이전트 관리', 'Manage subagents');
+  subagentsButton.onclick = () => { const current = sessions.get(session.id); if (current?.active && current.threadId && !exitInProgress) void subagentManager.open(current); };
+  const cronButton = card.querySelector<HTMLButtonElement>('.cron-open')!;
+  bindAttribute(cronButton, 'aria-label', '예약 작업', 'Scheduled jobs'); bindAttribute(cronButton, 'title', '예약 작업', 'Scheduled jobs');
+  cronButton.onclick = () => { const current = sessions.get(session.id); if (current?.active && !exitInProgress) void cronManager.open(current); };
   const projectMove = document.createElement('button'); projectMove.className = 'project-move icon-button'; projectMove.textContent = '▱'; bindAttribute(projectMove, 'aria-label', '프로젝트로 이동', 'Move to project'); bindAttribute(projectMove, 'title', '프로젝트로 이동', 'Move to project'); projectMove.onclick = () => projectManager.move(sessions.get(session.id)!); card.querySelector('.card-actions')!.prepend(projectMove);
   card.querySelector('.move-left')!.addEventListener('click', () => move(session.id, -1));
   card.querySelector('.move-right')!.addEventListener('click', () => move(session.id, 1));
@@ -513,7 +651,7 @@ function removeSession(id: string, preserveRestore = false) {
     workspaceSlots = workspaceSlots.filter(slot => typeof slot === 'string' || !removed.includes(slot));
     updateRestoreBanner();
   }
-  workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); explicitlyStoppedSessions.delete(id); const view = terminals.get(id); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
+  contextControls.get(id)?.dispose(); contextControls.delete(id); workspaceSlots = workspaceSlots.filter(slot => slot !== id); exitResumeIntents.delete(id); failedRestoreCards.delete(id); explicitlyStoppedSessions.delete(id); const view = terminals.get(id); const conversation = conversations.get(id); conversations.delete(id); conversationOwners.delete(id); if (conversation) void conversation.dispose({ sessionEnded: true }).catch(error => notify('대화 연결 정리를 확인하지 못했습니다. 세션 상태를 확인하세요.', true, 'Conversation cleanup could not be confirmed. Check the session status.')); clearTimeout(view?.resizeTimer); view?.input.dispose(); view?.resize.dispose(); view?.observer.disconnect(); view?.terminal.dispose(); view?.card.remove(); terminals.delete(id); sessions.delete(id); order = order.filter(item => item !== id); if (maximized === id) maximized = ''; if (active === id) active = visibleOrder()[0] ?? ''; renderAll(); scheduleSave(); }
 
 function receiveSession(info: SessionInfo, persist = true) {
   const previous = sessions.get(info.id); const session = updateSession(previous, info);
@@ -525,7 +663,7 @@ function receiveSession(info: SessionInfo, persist = true) {
   }
   if (!order.includes(session.id)) order.push(session.id);
   const terminal = terminals.get(session.id)?.terminal ?? createTerminal(session);
-  if (previous && previous.generation !== session.generation) { const view = terminals.get(session.id)!; view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); terminal.reset(); }
+  if (previous && previous.generation !== session.generation) { const view = terminals.get(session.id)!; view.input.cancelPending(); view.resize.cancelPending(); clearTimeout(view.resizeTimer); terminal.write('', () => terminal.reset()); const oldConversation = conversations.get(session.id); conversations.delete(session.id); conversationOwners.delete(session.id); if (oldConversation) void oldConversation.dispose({ sessionEnded: true }).catch(error => notify('이전 대화 연결 정리를 확인하지 못했습니다. 세션 상태를 확인하세요.', true, 'Previous conversation cleanup could not be confirmed. Check the session status.')); mountConversation(session); }
   if (previous && previous.state !== session.state) notify(`${session.title} · ${stateLabels(session.state)[0]}`, false, `${session.title} · ${stateLabels(session.state)[1]}`);
   renderAll();
   if (!previous || previous.state === 'starting') queueResize(session.id);
@@ -534,7 +672,8 @@ function receiveSession(info: SessionInfo, persist = true) {
   if (persist) scheduleSave();
 }
 
-function ack(output: Output) { if (native) void call('session_output_ack', { id: output.id, generation: output.generation, seq: output.seq }).catch(error => notifyError('출력 확인 전송 실패', 'Could not acknowledge output', error)); }
+const outputAcknowledgements = new TerminalOutputAcknowledgements(output => { if (native) void call('session_output_ack', { id: output.id, generation: output.generation, seq: output.seq }).catch(error => notifyError('출력 확인 전송 실패', 'Could not acknowledge output', error)); });
+function ack(output: Output) { outputAcknowledgements.enqueue(output); }
 async function resolveOrphan(id: string) {
   if (!native || resolving.has(id)) return;
   resolving.add(id);
@@ -587,13 +726,16 @@ function renderSide() {
     $('#projects').append(container);
   }
   if (!projects.length) { const p = document.createElement('p'); p.className = 'side-empty'; bindText(p, '프로젝트를 만들거나 폴더를 가져오세요', 'Create a project or import a folder'); $('#projects').append(p); }
+  const activeProjects = new Set([...sessions.values()].filter(session => session.active).map(session => sessionProjectKey(session, importedProjects)));
   const tabs = $('#project-tabs'); const focused = tabs.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.projectKey : undefined; tabs.replaceChildren();
   [{ key: '', name: '', cwd: null, count: sessions.size, favorite: false }, ...projects].forEach(({ key, cwd, name, count, favorite }, index) => {
     const tab = document.createElement('button'); const chosen = key === selectedProject;
     tab.id = `project-tab-${index}`; tab.className = `project-tab${chosen ? ' active' : ''}`; tab.dataset.projectCwd = cwd ?? ''; tab.dataset.projectKey = key; tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(chosen)); tab.setAttribute('aria-controls', 'grid-area'); tab.tabIndex = chosen ? 0 : -1;
     if (cwd) tab.title = cwd; else bindAttribute(tab, 'title', key ? '논리적 세션 묶음 · 실행 폴더와 별개' : '모든 프로젝트의 세션', key ? 'Session group independent of working folders' : 'Sessions from all projects');
     const label = document.createElement('span'); if (key === 'unassigned') bindText(label, '미분류', 'Unassigned'); else if (key) label.textContent = name; else bindText(label, '전체', 'All');
-    const total = document.createElement('small'); total.textContent = String(count); if (favorite) tab.append(document.createTextNode('★ ')); tab.append(label, document.createTextNode(' '), total); tab.onclick = () => { selectProject(key); $('#project-tabs [aria-selected="true"]').focus(); }; tabs.append(tab);
+    const hasActiveSession = key ? activeProjects.has(key) : activeProjects.size > 0;
+    const light = document.createElement('span'); light.className = `project-activity${hasActiveSession ? ' is-active' : ''}`; light.setAttribute('role', 'img'); bindAttribute(light, 'aria-label', hasActiveSession ? '활성 세션 있음' : '활성 세션 없음', hasActiveSession ? 'Active sessions' : 'No active sessions'); bindAttribute(light, 'title', hasActiveSession ? '활성 세션 있음' : '활성 세션 없음', hasActiveSession ? 'Active sessions' : 'No active sessions');
+    const total = document.createElement('small'); total.textContent = String(count); if (favorite) tab.append(document.createTextNode('★ ')); tab.append(label, document.createTextNode(' '), total, light); tab.onclick = () => { selectProject(key); $('#project-tabs [aria-selected="true"]').focus(); }; tabs.append(tab);
     if (chosen) $('#grid-area').setAttribute('aria-labelledby', tab.id);
   });
   if (focused !== undefined) [...tabs.querySelectorAll<HTMLElement>('[role="tab"]')].find(tab => tab.dataset.projectKey === focused)?.focus();
@@ -616,7 +758,20 @@ function renderGrid() {
   bindText($('#empty p'), selectedProject ? '새 세션을 만들거나 세션 불러오기에서 기존 대화를 이어가세요. 다른 프로젝트의 세션은 계속 실행됩니다.' : '프로젝트 경로를 선택해 첫 세션을 시작하세요. 각 세션은 독립된 터미널에서 실행됩니다.', selectedProject ? 'Create a session or load an existing conversation. Sessions in other projects keep running.' : 'Choose a project path to start your first session. Each session runs in its own terminal.');
   for (const button of document.querySelectorAll<HTMLElement>('[data-columns]')) { button.classList.toggle('active', Number(button.dataset.columns) === columns); button.setAttribute('aria-pressed', String(Number(button.dataset.columns) === columns)); }
   renderHandles(count, rows);
+  updateConversationVisibility();
 }
+
+function updateConversationVisibility() {
+  for (const [id, controller] of contextControls) {
+    const view = terminals.get(id); const session = sessions.get(id);
+    controller.setVisible(native && !!session?.active && !!view && !view.card.hidden && !document.hidden && nativeWindowVisible);
+  }
+  for (const [id, controller] of conversations) {
+    const view = terminals.get(id);
+    void controller.setForeground(!!view && !view.card.hidden && !document.hidden && nativeWindowVisible).catch(error => notify('대화 화면을 갱신하지 못했습니다. 해당 세션을 다시 선택하세요.', true, 'Could not refresh the conversation view. Select the session again.'));
+  }
+}
+document.addEventListener('visibilitychange', updateConversationVisibility);
 
 function renderHandles(count: number, rows: number) {
   const layer = $('#grid-handles'); layer.replaceChildren();
@@ -642,8 +797,13 @@ function renderHandles(count: number, rows: number) {
 }
 
 function renderAll() {
+  cronManager.updateSessions([...sessions.values()]);
+  subagentManager.updateSessions([...sessions.values()]);
   for (const [id, session] of sessions) {
     const card = terminals.get(id)!.card;
+    card.querySelector<HTMLButtonElement>('.session-id-copy')!.disabled = demo || !session.threadId;
+    card.querySelector<HTMLButtonElement>('.cron-open')!.disabled = !session.active || exitInProgress;
+    card.querySelector<HTMLButtonElement>('.subagents-open')!.disabled = !native || !session.active || !session.threadId || exitInProgress;
     card.querySelector('.terminal-title')!.textContent = session.title;
     card.querySelector('.terminal-path')!.textContent = `▱  ${session.cwd}`;
     const state = card.querySelector('.session-state')!;
@@ -675,6 +835,8 @@ const sessionBrowser = createSessionBrowser({
   newSession: openCreate,
   notify,
 });
+const cronManager = createCronManager({ call, notify });
+const subagentManager = createSubagentManager({ call, notify });
 const projectManager = createProjectManager({
   call, projects: () => importedProjects,
   async changed(project, deletedId) {
@@ -704,14 +866,24 @@ $('#project-tabs').addEventListener('keydown', event => {
 });
 const extensionsManager = createExtensionsManager({ call, notify });
 const mobileControl = createMobileControl({ call, notify, openExecutableSettings: () => void executableSettings.open() });
-const weeklyUsage = createWeeklyUsage({ call });
-$('.sidebar-bottom').before(weeklyUsage.element);
+const weeklyUsage = createWeeklyUsage({ call, initiallyVisible: !native });
+const questionCenter = createQuestionCenter({ call, button: $<HTMLButtonElement>('#notifications'), openSession: focusSession });
+document.body.append(questionCenter.element);
+$('.sidebar').append(weeklyUsage.element);
 bindText($('#extensions-open-label'), '플러그인·스킬', 'Plugins & skills');
 $('#extensions-open').onclick = () => extensionsManager.open(selectedProjectCwd());
 const executableSettings = createExecutableSettings(async <T>(command: string, args?: Record<string, unknown>) => {
-  const result = await call<T>(command, args);
-  if (result && ['choose_codex_executable', 'set_codex_executable'].includes(command)) weeklyUsage.refresh();
-  return result;
+  if (!['choose_codex_executable', 'set_codex_executable'].includes(command)) return call<T>(command, args);
+  runtimeGeneration++; runtimePreparation = undefined; runtimeReady = false;
+  weeklyUsage.setVisible(false); weeklyUsage.refresh();
+  const mutation = call<T>(command, args); executableMutation = mutation;
+  try { return await mutation; }
+  finally {
+    if (executableMutation === mutation) {
+      executableMutation = undefined;
+      if (workspaceReady && !exitInProgress) void prepareRuntime().then(() => resumeWorkspace()).catch(error => notifyError('공유서버 준비 실패', 'Could not prepare the shared server', error));
+    }
+  }
 });
 $('#codex-settings-open').onclick = () => void executableSettings.open();
 $('#settings-open').onclick = () => $<HTMLDialogElement>('#settings-dialog').showModal();
@@ -734,6 +906,8 @@ async function start(request: SavedSession, focus = true) {
   // Register the shared promise before its first ownership query can start.
   const operation = Promise.resolve().then(async () => {
     try {
+      await prepareRuntime();
+      if (exitInProgress) throw new UiError('앱 종료 중에는 세션을 시작할 수 없습니다.', 'Cannot start a session while the app is exiting.');
       const existing = request.threadId && [...sessions.values()].find(item => item.threadId === request.threadId && item.active);
       if (existing) {
         let latest: SessionInfo[];
@@ -751,6 +925,8 @@ async function start(request: SavedSession, focus = true) {
       if (sessions.size + saved.length - pendingRestoreOwnerIds().size + pendingStarts - Number(saved.includes(request)) >= MAX_SAVED_WORKSPACE_SESSIONS) throw new UiError('저장 메타데이터는 최대 512개입니다. 저장 목록에서 불필요한 항목을 제거한 뒤 다시 시도하세요.', 'Workspace metadata is limited to 512 entries. Remove unused saved entries and retry.');
       pendingStarts++; reserved = true;
       try {
+        // Ownership refreshes above may have yielded while the executable changed.
+        await prepareRuntime();
         if (exitInProgress) throw new UiError('앱 종료 중에는 세션을 시작할 수 없습니다.', 'Cannot start a session while the app is exiting.');
         const info = await call<SessionInfo>('start_session', { request: { title: request.title, cwd: request.cwd, ...(request.threadId ? { threadId: request.threadId } : {}), ...(request.projectAssigned || request.projectId !== undefined ? { projectId: request.projectId ?? null, projectAssigned: true } : {}), cols: 100, rows: 30 } });
         if (!info.active || (sessions.get(info.id)?.generation ?? -1) < info.generation) receiveSession(info);
@@ -806,7 +982,6 @@ async function refreshExternal() {
 }
 $('#external-toggle').onclick = () => { $<HTMLDialogElement>('#external-dialog').showModal(); void refreshExternal(); };
 $('#external-refresh').onclick = () => void refreshExternal();
-$('#notifications').onclick = () => { notificationCount = 0; $('#notification-count').hidden = true; $<HTMLDialogElement>('#notification-dialog').showModal(); };
 const exitDialog = $<HTMLDialogElement>('#exit-dialog');
 const unconfirmedExitButton = $<HTMLButtonElement>('#confirm-unconfirmed-exit');
 function resetExitRecovery() { unconfirmedExitButton.hidden = true; $('#unconfirmed-exit-warning').hidden = true; }
@@ -821,10 +996,14 @@ async function requestExit(allowUnconfirmedRemote = false) {
   const dismissButtons = [...exitDialog.querySelectorAll<HTMLButtonElement>('[data-close]')];
   const dismissStates = dismissButtons.map(control => control.disabled);
   const languageWasDisabled = languageSelect.disabled; const extensionsWasDisabled = extensionsButton.disabled; let completed = false;
+  const runtimeWasReady = runtimeReady;
   button.disabled = true; unconfirmedExitButton.disabled = true; extensionsButton.disabled = true; for (const control of dismissButtons) control.disabled = true; if (native) languageSelect.disabled = true;
   try {
-    bindText(button, '확장 작업 완료를 기다리는 중…', 'Waiting for extension work to finish…');
-    await Promise.all([extensionsManager.beginExit(), mobileControl.beginExit(), weeklyUsage.beginExit(), initialization]);
+    bindText(button, '진행 중 작업 완료를 기다리는 중…', 'Waiting for work to finish…');
+    // Raw preparation owns the native operation even when no restore is pending.
+    // A rejection settles ownership; prepareRuntime retains its distinct failure state.
+    const preparing = runtimeCommand && runtimeCommandGeneration === runtimeGeneration ? runtimePreparation : undefined;
+    await Promise.all([extensionsManager.beginExit(), mobileControl.beginExit(), weeklyUsage.beginExit(), questionCenter.beginExit(), cronManager.beginExit(), subagentManager.beginExit(), initialization, runtimeRestoration?.catch(() => {}), Promise.allSettled([runtimeCommand, preparing])]);
     await Promise.allSettled([...startOperations, ...restoringRequests.values()]);
     if (native && !workspaceReady) throw new UiError('저장된 작업 공간을 확인하지 못해 종료 정보를 덮어쓰지 않았습니다.', 'Could not load the saved workspace; exit metadata was not overwritten.');
     bindText(button, '종료 중…', 'Exiting…');
@@ -833,7 +1012,7 @@ async function requestExit(allowUnconfirmedRemote = false) {
     if (native) await nativeLanguageQueue;
     await call('complete_exit', { confirmed: true, ...(allowUnconfirmedRemote ? { allowUnconfirmedRemote: true } : {}) }); completed = true;
   } catch (error) {
-    extensionsManager.cancelExit(); mobileControl.cancelExit(); weeklyUsage.cancelExit();
+    extensionsManager.cancelExit(); mobileControl.cancelExit(); weeklyUsage.setVisible(false); weeklyUsage.cancelExit(); questionCenter.cancelExit(); cronManager.cancelExit(); subagentManager.cancelExit();
     if (native) {
       try { if (await call<boolean>('unconfirmed_exit_available') === true) { unconfirmedExitButton.hidden = false; $('#unconfirmed-exit-warning').hidden = false; } }
       catch { /* 복구 선택은 숨긴 채 원래 종료 오류를 보존한다. */ }
@@ -842,7 +1021,14 @@ async function requestExit(allowUnconfirmedRemote = false) {
   }
   finally {
     button.disabled = false; unconfirmedExitButton.disabled = false; dismissButtons.forEach((control, index) => { control.disabled = dismissStates[index]; }); bindText(button, '세션 종료 후 앱 닫기', 'Stop sessions and exit');
-    if (!completed) { exitInProgress = false; updateRestoreBanner(); extensionsButton.disabled = extensionsWasDisabled; if (native) languageSelect.disabled = languageWasDisabled; }
+    if (!completed) {
+      exitInProgress = false; updateRestoreBanner(); extensionsButton.disabled = extensionsWasDisabled; if (native) languageSelect.disabled = languageWasDisabled;
+      // Skipped preparation clears its cache; an actual failure retains a rejected promise.
+      const resumePreparation = !runtimeWasReady && workspaceReady && (runtimeReady || !runtimePreparation);
+      if (resumePreparation) weeklyUsage.refresh();
+      weeklyUsage.setVisible(nativeWindowVisible && runtimeReady);
+      if (resumePreparation) void resumeWorkspace().catch(error => notifyError('공유서버 준비 실패', 'Could not prepare the shared server', error));
+    }
   }
 }
 $('#confirm-exit').onclick = () => void requestExit();
@@ -864,17 +1050,17 @@ document.addEventListener('keydown', event => {
 
 async function initialize() {
   if (!native) {
-    bindText($('#connection'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'Design demo' : 'Browser preview'); bindText($('#mode-label'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'DESIGN DEMO' : 'BROWSER PREVIEW'); $('#runtime-banner').hidden = false;
+    bindText($('#mode-label'), demo ? '디자인 데모' : '브라우저 미리보기', demo ? 'DESIGN DEMO' : 'BROWSER PREVIEW'); $('#runtime-banner').hidden = false;
     bindText($('#runtime-banner'), demo ? '디자인 데모 · 아래 터미널은 정적인 예시입니다. 실제 프로세스 실행·입력·전송은 지원하지 않습니다.' : '브라우저 미리보기입니다. 실제 세션 실행은 OpenDIY Desktop 앱에서 사용할 수 있습니다.', demo ? 'Design demo · These terminals are static examples. Process execution, input and sending are unavailable.' : 'Browser preview. Run real sessions in the OpenDIY Desktop app.');
     bindText($('#save-status'), '미리보기 · 저장 안 함', 'Preview · not saved');
-    if (demo) seedDemo(); renderAll(); return;
+    if (demo) seedDemo(); renderAll(); $('#app').setAttribute('aria-busy', 'false'); return;
   }
   try {
     await initializeNativeLanguage();
     unlisteners.push(await listen<Output>('terminal-output', event => receiveOutput(event.payload)));
     unlisteners.push(await listen<SessionInfo>('session-changed', event => receiveSession(event.payload)));
     unlisteners.push(await listen<string>('application-error', event => notify(event.payload, true)));
-    unlisteners.push(await listen<boolean>('application-visibility', event => weeklyUsage.setVisible(event.payload)));
+    unlisteners.push(await listen<boolean>('application-visibility', event => { nativeWindowVisible = event.payload; weeklyUsage.setVisible(event.payload && runtimeReady); questionCenter.setVisible(event.payload); cronManager.setVisible(event.payload); subagentManager.setVisible(event.payload); updateConversationVisibility(); }));
     unlisteners.push(await listen('exit-requested', openExitDialog));
     const [layoutValue, existing] = await Promise.all([call<unknown>('load_layout'), call<SessionInfo[]>('list_sessions')]);
     const wrapper = layoutValue as { layout?: unknown; sessions?: SessionInfo[] } | null;
@@ -889,15 +1075,11 @@ async function initialize() {
       if (owned) bindRestored(request, sessions.get(owned.id) ?? owned);
     }
     updateRestoreBanner();
-    for (const request of [...saved]) {
-      if (exitInProgress || sessions.size + pendingStarts >= MAX_WORKSPACE_SESSIONS) break;
-      if (!saved.includes(request) || request.resumeOnStartup !== true || !request.threadId) continue;
-      try { await restoreSaved(request, false); } catch (error) { notifyError('자동 복원 실패', 'Could not automatically restore session', error); }
-    }
-    restoringWorkspace = false; updateRestoreBanner(); scheduleSave();
-    bindText($('#connection'), '로컬 연결됨', 'Connected locally'); renderAll();
+    renderAll();
     void sessionBrowser.refreshProjects().catch(error => notifyError('프로젝트 목록 조회 실패', 'Could not load projects', error));
-  } catch (error) { bindText($('#connection'), '연결 오류', 'Connection error'); notifyError('초기화 실패', 'Could not initialize', error); }
+    await resumeWorkspace();
+  } catch (error) { notifyError('초기화 실패', 'Could not initialize', error); }
+  finally { $('#app').setAttribute('aria-busy', 'false'); }
 }
 
 function seedDemo() {
@@ -911,5 +1093,7 @@ function seedDemo() {
   setActive('demo-0', false);
 }
 
-window.addEventListener('beforeunload', () => { for (const unlisten of unlisteners) unlisten(); for (const view of terminals.values()) { clearTimeout(view.resizeTimer); view.input.dispose(); view.resize.dispose(); view.observer.disconnect(); view.terminal.dispose(); } });
+window.addEventListener('beforeunload', () => { exitInProgress = true; for (const unlisten of unlisteners) unlisten(); for (const view of terminals.values()) { clearTimeout(view.resizeTimer); view.input.dispose(); view.resize.dispose(); view.observer.disconnect(); view.terminal.dispose(); } });
 initialization = initialize();
+
+window.addEventListener('beforeunload', () => questionCenter.dispose());

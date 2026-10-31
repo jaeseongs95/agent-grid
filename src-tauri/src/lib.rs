@@ -1,10 +1,12 @@
 mod codex;
 mod codex_settings;
+mod conversation_attachments;
 mod executable_picker;
 mod flow;
 mod launch_gate;
 mod project;
 pub mod process_job;
+mod owned_tui_control;
 mod session;
 pub mod self_test;
 mod storage;
@@ -53,6 +55,12 @@ fn workspace_directory(default: std::path::PathBuf, override_path: Option<std::f
             Ok(path)
         }
     }
+}
+
+#[tauri::command]
+async fn prepare_runtime(engine: State<'_, Engine>) -> Result<(), String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.prepare_runtime()).await.map_err(|error| format!("공유 서버 준비 작업자: {error}"))?
 }
 
 #[tauri::command]
@@ -194,9 +202,59 @@ async fn mobile_control(engine: State<'_, Engine>, id: String, generation: u64, 
     tauri::async_runtime::spawn_blocking(move || engine.mobile_control(&id, generation, action)).await.map_err(|e| format!("Mobile control worker: {e}"))?
 }
 #[tauri::command]
-async fn weekly_usage(engine: State<'_, Engine>) -> Result<codex::WeeklyUsageSnapshot, String> {
+async fn subagents_request(engine: State<'_, Engine>, id: String, generation: u64, request: codex::SubagentRequest) -> Result<serde_json::Value, String> {
     let engine = engine.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || engine.weekly_usage()).await.map_err(|e| format!("Weekly usage worker: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || engine.subagents_request(&id, generation, request)).await.map_err(|e| format!("하위 에이전트 요청 작업자: {e}"))?
+}
+#[tauri::command]
+async fn cron_request(engine: State<'_, Engine>, id: String, generation: u64, request: codex::CronRequest) -> Result<serde_json::Value,String> {
+    let engine=engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move||engine.cron_request(&id,generation,request)).await.map_err(|e|format!("예약 요청 작업자: {e}"))?
+}
+#[tauri::command]
+async fn conversation_request(engine: State<'_, Engine>, id: String, generation: u64, request: codex::ConversationRequest) -> Result<serde_json::Value, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.conversation_request(&id, generation, request)).await.map_err(|e| format!("대화 요청 작업자: {e}"))?
+}
+#[tauri::command]
+async fn list_pending_questions(engine: State<'_, Engine>) -> Result<serde_json::Value,String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.list_pending_questions()).await.map_err(|e|format!("질문함 조회 작업자: {e}"))?
+}
+#[tauri::command]
+async fn respond_pending_question(engine: State<'_, Engine>, session_id: String, generation: u64, request_id: String, answers: Option<serde_json::Value>, decision: Option<String>) -> Result<serde_json::Value,String> {
+    let result = match (answers,decision) {
+        (Some(answers),None) => serde_json::json!({"answers":answers}),
+        (None,Some(decision)) => serde_json::json!({"decision":decision}),
+        _ => return Err("질문 답변 또는 승인 결정 중 하나만 지정하세요.".into()),
+    };
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.conversation_request(&session_id,generation,codex::ConversationRequest::Respond{request_id,result})).await.map_err(|e|format!("질문함 응답 작업자: {e}"))?
+}
+#[tauri::command]
+async fn choose_conversation_attachments(app: tauri::AppHandle, engine: State<'_, Engine>, ui: State<'_, UiSettings>) -> Result<Vec<conversation_attachments::ConversationAttachment>,String> {
+    let attachments = engine.conversation_attachments();
+    let language = if ui.english.load(Ordering::Acquire) {ui_language::UiLanguage::En} else {ui_language::UiLanguage::Ko};
+    #[cfg(windows)]
+    let owner = app.get_webview_window("main").ok_or("메인 창을 찾을 수 없습니다.")?.hwnd().map_err(|e|format!("첨부 선택창 부모 확인: {e}"))?.0 as isize;
+    #[cfg(not(windows))]
+    let owner = {let _=app;0};
+    tauri::async_runtime::spawn_blocking(move || attachments.choose(owner,language)).await.map_err(|e|format!("첨부 선택 작업자: {e}"))?
+}
+#[tauri::command]
+async fn stage_conversation_image(engine: State<'_, Engine>, id: String, generation: u64, data_url: String) -> Result<conversation_attachments::ConversationAttachment,String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.stage_conversation_image(&id,generation,&data_url)).await.map_err(|e|format!("첨부 이미지 준비 작업자: {e}"))?
+}
+#[tauri::command]
+async fn cleanup_conversation_attachment(engine: State<'_, Engine>, id: String, generation: u64, path: String) -> Result<(),String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.cleanup_conversation_attachment(&id,generation,&path)).await.map_err(|e|format!("첨부 초안 정리 작업자: {e}"))?
+}
+#[tauri::command]
+async fn weekly_usage(engine: State<'_, Engine>, manual: Option<bool>) -> Result<codex::WeeklyUsageSnapshot, String> {
+    let engine = engine.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || engine.weekly_usage(manual.unwrap_or(false))).await.map_err(|e| format!("Weekly usage worker: {e}"))?
 }
 #[tauri::command]
 async fn choose_skill_folder(app: tauri::AppHandle, picker: State<'_, project::FolderPicker>, ui: State<'_, UiSettings>) -> Result<Option<String>, String> {
@@ -242,6 +300,9 @@ pub fn run() {
         std::process::exit(1);
     }
     let result = tauri::Builder::default()
+        // Claim the app before setup opens storage or restores any CLI sessions.
+        // A repeated launch only reveals the existing window, including from the tray.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .manage(ExitState::default())
         .manage(project::FolderPicker::default())
         .manage(executable_picker::ExecutablePicker::default())
@@ -274,7 +335,7 @@ pub fn run() {
             tray.build(app)?;
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, create_project, rename_project, set_project_favorite, delete_project, move_session_to_project, choose_project_folder, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, extensions_list, extensions_mutate, choose_skill_folder, mobile_control, weekly_usage, unconfirmed_exit_available, complete_exit])
+        .invoke_handler(tauri::generate_handler![get_ui_language, set_ui_language, prepare_runtime, start_session, list_sessions, session_write, session_resize, session_stop, session_output_ack, load_layout, save_layout, list_external, list_projects, import_project, create_project, rename_project, set_project_favorite, delete_project, move_session_to_project, choose_project_folder, choose_project, catalog_list, catalog_preview, get_codex_settings, set_codex_executable, choose_codex_executable, extensions_list, extensions_mutate, choose_skill_folder, mobile_control, cron_request, subagents_request, conversation_request, list_pending_questions, respond_pending_question, choose_conversation_attachments, stage_conversation_image, cleanup_conversation_attachment, weekly_usage, unconfirmed_exit_available, complete_exit])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if !window.state::<ExitState>().0.load(Ordering::Acquire) {

@@ -106,6 +106,9 @@ using System.Threading;
 class Fixture {
  static int Main(string[] args) {
   string root = AppDomain.CurrentDomain.BaseDirectory;
+  if (args.Length == 1 && args[0] == "--help") {
+   Console.Write("Usage: fixture [OPTIONS]\n\nOptions:\n  -h, --help\n          Print help\n"); return 0;
+  }
   if (args.Length == 2 && args[0] == "app-server" && args[1] == "--help") {
    Console.Write("Usage: fixture app-server [OPTIONS] [COMMAND]\n\nCommands:\n  daemon  Manage daemon\n  proxy  Relay\n\nOptions:\n  -h, --help\n          Print help\n"); return 0;
   }
@@ -118,7 +121,8 @@ class Fixture {
    }
   }
   if (args.Length > 0 && args[0] == "resume") {
-   File.WriteAllText(Path.Combine(root,"tui.pid"),System.Diagnostics.Process.GetCurrentProcess().Id.ToString());
+   File.WriteAllText(Path.Combine(root,"tui.pid.pending"),System.Diagnostics.Process.GetCurrentProcess().Id.ToString());
+   File.Move(Path.Combine(root,"tui.pid.pending"),Path.Combine(root,"tui.pid"));
    DateTime deadline=DateTime.UtcNow.AddSeconds(15);
    while (!File.Exists(Path.Combine(root,"tui.exit")) && DateTime.UtcNow < deadline) Thread.Sleep(10);
    return 0;
@@ -152,8 +156,11 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
         listener.set_nonblocking(true).unwrap();
         let server_cwd = cwd.clone();
         let server = thread::spawn(move || {
+            let mut connections = Vec::new();
+            // 시작 전 준비가 짧은 초기화 연결을 닫은 뒤 실제 세션 관측자가 별도로 연결한다.
+            for preparation in [true, false] {
             let mut accepted = None;
-            until("proxy 연결", || match listener.accept() { Ok(pair) => {accepted=Some(pair);true}, Err(e) if e.kind()==std::io::ErrorKind::WouldBlock => false, Err(e) => panic!("{e}") });
+            until(if preparation {"준비 proxy 연결"} else {"관측 proxy 연결"}, || match listener.accept() { Ok(pair) => {accepted=Some(pair);true}, Err(e) if e.kind()==std::io::ErrorKind::WouldBlock => false, Err(e) => panic!("{e}") });
             let (stream, _) = accepted.unwrap();
             stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
@@ -168,13 +175,22 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
                 let result = match method.as_str() {
                     "initialize" => json!({}),
                     "initialized" => continue,
+                    _ if preparation => panic!("사전 준비 연결이 대화 변경 또는 관측을 요청했다: {method}"),
                     "thread/start" => json!({"thread":{"id":id,"cwd":server_cwd,"status":{"type":"idle"}}}),
+                    "thread/subscribePassive" => {
+                        assert_eq!(methods.iter().filter(|method|method.as_str()=="thread/subscribePassive").count(),1,"수동 관측 구독은 한 번만 허용한다");
+                        assert_eq!(request["params"],json!({"threadId":id}),"원래 대화의 수동 구독 외 변경은 허용하지 않는다");
+                        json!({"thread":{"id":id,"cwd":server_cwd,"turns":[],"status":{"type":"active"}}})
+                    },
                     "thread/read" => json!({"thread":{"id":id,"cwd":server_cwd,"status":{"type":"active"}}}),
                     _ => panic!("예상하지 않은 변경 요청: {method}"),
                 };
                 ws.send(Message::Text(json!({"id":request["id"],"result":result}).to_string().into())).unwrap();
             }
-            methods
+            if preparation { assert_eq!(methods, ["initialize", "initialized"], "사전 준비는 초기화만 하고 연결을 닫아야 한다"); }
+            connections.push(methods);
+            }
+            connections
         });
         let (entered, entry) = mpsc::channel();
         let (release, released) = mpsc::channel();
@@ -214,6 +230,9 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
             }
             root.join("tui.pid").exists()
         });
+        // WriteAllText의 생성과 내용 기록 사이를 준비 완료로 오인하지 않는다.
+        // 닫힌 임시 파일의 rename 게시 뒤에만 원래 TUI PID를 읽는다.
+        assert!(!root.join("tui.pid.pending").exists(), "PID 원문이 완전히 기록된 뒤 게시되어야 한다");
         let pid: u32 = fs::read_to_string(root.join("tui.pid")).unwrap().parse().unwrap();
         let handle = unsafe { OpenProcess(0x00100000, 0, pid) };
         assert!(!handle.is_null());
@@ -242,7 +261,7 @@ fn shared_reaper_handoff_during_observer_join_reports_unknown_for_stop_and_shutd
         assert!(engine.shutdown().is_err());
         assert!(!engine.inner.exiting.load(Ordering::Acquire));
         stage("재시도 반환");
-        assert_eq!(server.join().unwrap(), ["initialize", "initialized", "thread/start", "thread/read"]);
+        assert_eq!(server.join().unwrap(), [vec!["initialize", "initialized"], vec!["initialize", "initialized", "thread/start", "thread/read", "thread/subscribePassive"]]);
         stage("server 회수");
         no_more_connections.set_nonblocking(true).unwrap();
         assert!(matches!(no_more_connections.accept(), Err(e) if e.kind()==std::io::ErrorKind::WouldBlock), "불명 요청을 다시 연결·전송하면 안 된다");

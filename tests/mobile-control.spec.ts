@@ -32,7 +32,7 @@ async function workspace(page: Page) {
     };
   });
   await page.goto('/');
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   if (await page.locator('#settings-open').count()) await page.locator('#settings-open').click();
   await page.locator('#mobile-control-open').click();
   await expect(page.locator('#mobile-control-session option')).toHaveCount(1);

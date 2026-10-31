@@ -61,7 +61,13 @@ mod platform {
         let args: Vec<_> = std::env::args_os().collect();
         let mode = args.get(1)?.to_str()?;
         if !matches!(mode, "--pty-child" | "--owned-child") { return None; }
-        let run = || -> Result<i32, String> {
+        // 전용 도우미의 동기 main이며 아직 다른 스레드를 만들지 않았다.
+        // 자격은 실제 TUI를 한 번 생성할 때만 넘기고, 도우미 환경에 남기지 않는다.
+        let control_keys=["CODEX_DESKTOP_CRON_BOOTSTRAP","CODEX_DESKTOP_CRON_TOKEN"];
+        let mut control_env: Vec<_>=control_keys.iter().filter_map(|key| std::env::var_os(key).map(|value|(*key,value))).collect();
+        for key in control_keys {std::env::remove_var(key);}
+        if mode!="--pty-child" || !args.get(5..).is_some_and(|arguments|arguments.iter().any(|arg|arg=="--desktop-cron-control=pipe-v1")) {control_env.clear();}
+        let mut run = || -> Result<i32, String> {
             let name = args.get(2).ok_or("owned child has no launch gate")?;
             if !name.to_string_lossy().starts_with("Local\\AgentGridLaunch_") || !args.get(3).is_some_and(|arg| arg == "--") || args.len() < 5 { return Err("invalid owned launch arguments".into()); }
             // SYNCHRONIZE only: the helper cannot signal its own release.
@@ -72,6 +78,9 @@ mod platform {
             if result != 0 { return Err("owned launch gate was not released within 15 seconds".into()); }
             let mut command = Command::new(&args[4]);
             command.args(&args[5..]);
+            if mode=="--pty-child" && args[5..].iter().any(|arg|arg=="--desktop-cron-control=pipe-v1") {
+                command.envs(control_env.drain(..));
+            }
             if mode == "--pty-child" {
                 // The dedicated helper uses the console subsystem in debug and
                 // release, so ConPTY attaches this exact console. Open its
@@ -84,9 +93,12 @@ mod platform {
                 use std::os::windows::process::CommandExt;
                 command.creation_flags(0x08000000); // CREATE_NO_WINDOW for protocol pipes.
             }
-            // The helper is already assigned to the session Job; every child
-            // inherits it at creation. A helper termination kills descendants.
+            // Every child inherits the assigned Job. Only the daemon launcher
+            // Job permits the shared server's explicit breakaway from that Job.
             let mut child = command.spawn().map_err(|e| format!("launch owned child: {e}"))?;
+            // Command가 보유한 자격 복사본도 실행 직후 해제한다.
+            for key in control_keys {command.env_remove(key);}
+            drop(command);
             match child.wait() {
                 Ok(status) => Ok(status.code().unwrap_or(1)),
                 Err(error) => { let _ = child.kill(); let _ = child.wait(); Err(format!("reap owned child: {error}")) }

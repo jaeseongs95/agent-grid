@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding=$OutputEncoding=[Text.UTF8Encoding]::new($false)
 $expectedPath = [IO.Path]::GetFullPath($ExpectedExecutable)
 if (-not [IO.Path]::IsPathRooted($ExpectedExecutable) -or -not (Test-Path -LiteralPath $expectedPath -PathType Leaf)) {
     throw 'Expected executable must be an existing absolute file'
@@ -14,14 +15,32 @@ $appProcess.Refresh()
 $startTicks = $appProcess.StartTime.ToUniversalTime().Ticks
 $currentSession = (Get-Process -Id $PID).SessionId
 if ($appProcess.StartTime.ToUniversalTime() -lt [DateTime]::UtcNow.AddMinutes(-20)) { throw 'Refusing a process older than 20 minutes; launch a fresh isolated app' }
-$windowHandle = $appProcess.MainWindowHandle
-if ($windowHandle -eq [IntPtr]::Zero) { throw 'Target has no visible main window handle' }
-if ($appProcess.MainWindowTitle -ne 'OpenDIY Desktop') { throw 'Unexpected main window title' }
+# 프로세스의 대표 창 대신 PID·제목·소유 관계가 일치하는 실제 주 창을 선택한다.
 
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Collections.Generic;
+using System.Text;
 public static class AgentGridWindowProbe {
+    private delegate bool EnumWindowProc(IntPtr hwnd, IntPtr data);
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowProc callback, IntPtr data);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassNameW(IntPtr hwnd, StringBuilder value, int length);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowTextW(IntPtr hwnd, StringBuilder value, int length);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+    private static string WindowClass(IntPtr hwnd) { var text=new StringBuilder(256); GetClassNameW(hwnd,text,text.Capacity); return text.ToString(); }
+    public static bool OwnedBy(IntPtr hwnd, uint pid) { uint observed; GetWindowThreadProcessId(hwnd,out observed); return observed==pid; }
+    public static IntPtr[] FindMainWindows(uint pid) {
+        var matches=new List<IntPtr>();
+        EnumWindows(delegate(IntPtr hwnd,IntPtr unused) {
+            if(!OwnedBy(hwnd,pid) || !IsWindowVisible(hwnd) || GetWindow(hwnd,4)!=IntPtr.Zero || WindowClass(hwnd)=="#32770") return true;
+            var text=new StringBuilder(256); GetWindowTextW(hwnd,text,text.Capacity);
+            if(text.ToString()=="OpenDIY Desktop") matches.Add(hwnd);
+            return true;
+        },IntPtr.Zero);
+        return matches.ToArray();
+    }
+
     [DllImport("user32.dll", EntryPoint="PostMessageW", ExactSpelling=true, SetLastError=true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool PostMessageW(IntPtr hwnd, uint message, UIntPtr wParam, IntPtr lParam);
@@ -50,6 +69,10 @@ public static class AgentGridWindowProbe {
     public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
 }
 '@
+
+$mainWindows = [AgentGridWindowProbe]::FindMainWindows($AppProcessId)
+if ($mainWindows.Length -ne 1) { throw 'Expected one owned OpenDIY Desktop main window; refusing ambiguous action' }
+$windowHandle = $mainWindows[0]
 
 function Assert-TargetIdentity {
     $observedProcess = Get-Process -Id $AppProcessId -ErrorAction Stop

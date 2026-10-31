@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { test, expect, type Page } from '@playwright/test';
 
 const projects = [
@@ -47,6 +48,10 @@ async function workspace(page: Page, options: { capacity?: boolean } = {}) {
         state.tabsFixture.calls.push({ command, args });
         if (command === 'plugin:event|listen') { listeners.set(args.event, callbacks.get(args.handler)!); return callback; }
         if (command.startsWith('plugin:event|')) return callback;
+        if (command === 'conversation_request' && args.request.type === 'contextStatus') {
+          if (state.tabsFixture.contextFailure) throw new Error('PRIVATE_CONTEXT_ERROR');
+          return state.tabsFixture.contextSnapshots?.[args.id] ?? { revision: 0, connected: true, guiConnected: false, tokenUsageFresh: false, compacting: false, active: false, canCompact: false };
+        }
         if (command === 'get_ui_language') return 'ko';
         if (command === 'set_ui_language') return { show: args.language === 'en' ? 'Open OpenDIY Desktop' : 'OpenDIY Desktop 열기', exit: args.language === 'en' ? 'Exit…' : '종료…' };
         if (command === 'load_layout') return { version: 1, columns: 2, sessions: options.capacity ? [{ title: 'Pending slot 32', cwd: projects[0].cwd, threadId: 'pending-slot32' }] : [] };
@@ -94,7 +99,7 @@ async function workspace(page: Page, options: { capacity?: boolean } = {}) {
   const response = await page.goto('/');
   expect(response?.ok(), '작업 공간 문서 응답').toBe(true);
   try {
-    await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+    await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   } finally {
     await test.info().attach('workspace-load.json', { body: JSON.stringify({ url: page.url(), failures }, null, 2), contentType: 'application/json' });
   }
@@ -374,7 +379,7 @@ test('moving a running session preserves its terminal, generation and actual cwd
   expect(calls.filter((item: any) => ['session_stop', 'start_session', 'session_write'].includes(item.command))).toEqual([]);
   await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.savedLayout?.sessions.find((item: any) => item.threadId === 'thread-a1'))).toMatchObject({ projectId: null, projectAssigned: true, cwd: owned[0].cwd });
   await page.reload();
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await tab(page, 'Alpha').click();
   await expect.poll(() => visibleIds(page)).toEqual(['a2']);
 });
@@ -477,4 +482,153 @@ for (const scenario of ['return', 'hidden-output', 'move', 'same-project'] as co
   await expect(rows).toContainText(latest);
   expect(await page.evaluate(() => (window as any).tabsFixture.latestNode === document.querySelector('.terminal-card[data-id="a1"] .xterm'))).toBe(true);
   expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => ['start_session', 'session_stop', 'session_write', 'catalog_preview'].includes(call.command)))).toEqual([]);
+});
+
+
+test('project activity lights follow live ownership independently of the selected tab and stale events', async ({ page }) => {
+  await workspace(page);
+  const light = (name: string) => tab(page, name).locator('.project-activity');
+  await expect(light('Alpha')).toHaveClass(/is-active/);
+  await expect(light('Beta')).toHaveClass(/is-active/);
+  await expect(light('Empty')).not.toHaveClass(/is-active/);
+  await expect(light('Alpha')).toHaveAttribute('aria-label', '활성 세션 있음');
+  await tab(page, 'Empty').click();
+  await expect(tab(page, 'Empty')).toHaveAttribute('aria-selected', 'true');
+  await expect(light('Empty')).not.toHaveClass(/is-active/);
+  await expect(light('Alpha')).toHaveClass(/is-active/);
+  const change = async (index: number, active: boolean, generation = 7) => page.evaluate(({ session, active, generation }) => (window as any).tabsFixture.emit('session-changed', { ...session, active, generation, state: active ? 'idle' : 'exited' }), { session: owned[index], active, generation });
+  await change(0, false);
+  await expect(light('Alpha')).toHaveClass(/is-active/);
+  await change(2, false);
+  await expect(light('Alpha')).not.toHaveClass(/is-active/);
+  await expect(light('Alpha')).toHaveAttribute('aria-label', '활성 세션 없음');
+  await change(2, true);
+  await expect(light('Alpha')).not.toHaveClass(/is-active/);
+  await change(2, true, 8);
+  await expect(light('Alpha')).toHaveClass(/is-active/);
+  for (let index = 0; index < owned.length; index++) await change(index, false, index === 2 ? 8 : 7);
+  await expect(page.locator('#project-tabs .project-activity.is-active')).toHaveCount(0);
+  await page.locator('#settings-open').click();
+  await page.locator('#language-select').selectOption('en');
+  await expect(light('Alpha')).toHaveAttribute('aria-label', 'No active sessions');
+});
+
+test('moving active sessions updates project activity lights without restarting their processes', async ({ page }) => {
+  await workspace(page);
+  await tab(page, 'Alpha').click();
+  for (const id of ['a1', 'a2']) {
+    if (id === 'a2') await tab(page, 'Alpha').click();
+    await card(page, id).getByLabel('프로젝트로 이동', { exact: true }).click();
+    await page.locator('#project-move-target').selectOption('empty');
+    await page.locator('#project-move-confirm').click();
+  }
+  await expect(tab(page, 'Alpha').locator('.project-activity')).not.toHaveClass(/is-active/);
+  await expect(tab(page, 'Empty').locator('.project-activity')).toHaveClass(/is-active/);
+  await expect(page.locator('#project-tabs [role=tab]').first().locator('.project-activity')).toHaveClass(/is-active/);
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => ['start_session', 'session_stop', 'session_write'].includes(call.command)))).toEqual([]);
+});
+
+
+test('session ID copy uses the latest full thread ID with availability and clipboard failure feedback', async ({ page, context }, testInfo) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await workspace(page);
+  const copy = (id: string) => card(page, id).locator('.session-id-copy');
+  await expect(copy('a1')).toHaveAccessibleName('세션 ID 복사');
+  await copy('a1').click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('thread-a1');
+  await expect(page.locator('#toast-area')).toContainText('세션 ID를 복사했습니다.');
+  await copy('b1').click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe('thread-b1');
+  await page.evaluate(session => (window as any).tabsFixture.emit('session-changed', { ...session, threadId: undefined }), owned[0]);
+  await expect(copy('a1')).toBeDisabled();
+  const fullId = '01234567-89ab-7cde-8fab-0123456789ab';
+  await page.evaluate(({ session, fullId }) => (window as any).tabsFixture.emit('session-changed', { ...session, generation: 8, threadId: fullId }), { session: owned[0], fullId });
+  await expect(copy('a1')).toBeEnabled();
+  await page.locator('#settings-open').click();
+  await page.locator('#language-select').selectOption('en');
+  await page.locator('#settings-close').click();
+  await expect(copy('a1')).toHaveAccessibleName('Copy session ID');
+  await copy('a1').click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(fullId);
+  await expect(page.locator('#toast-area')).toContainText('Session ID copied.');
+  await page.evaluate(({ session, fullId }) => (window as any).tabsFixture.emit('session-changed', { ...session, generation: 8, threadId: fullId, active: false, state: 'exited' }), { session: owned[0], fullId });
+  await expect(copy('a1')).toBeEnabled();
+  await page.evaluate(() => { navigator.clipboard.writeText = async () => { throw new Error('PRIVATE_CLIPBOARD_FAILURE'); }; });
+  await copy('a1').click();
+  await expect(page.locator('#toast-area')).toContainText('Could not copy the session ID. Try again.');
+  await expect(page.locator('#toast-area')).not.toContainText('PRIVATE_CLIPBOARD_FAILURE');
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(fullId);
+  await page.screenshot({ path: testInfo.outputPath('session-id-copy.png') });
+});
+
+
+test('세션 상단은 확인된 압축 진행 상태만 표시하고 완료·단절·새 세대에서 기존 상태로 돌아온다', async ({ page }, testInfo) => {
+  await workspace(page);
+  const a = card(page, 'a1');
+  const badge = a.locator('.session-compaction');
+  const state = a.locator('.session-state');
+  const refresh = () => a.locator('.context-usage').click();
+  await expect(state).toHaveText('입력 가능');
+  await page.evaluate(() => { (window as any).tabsFixture.contextSnapshots = { a1: { revision: 10, connected: true, guiConnected: true, tokenUsageFresh: false, compacting: true, active: true, canCompact: false } }; });
+  await refresh();
+  await expect(badge).toBeVisible();
+  await expect(badge).toHaveText('압축 중');
+  await expect(badge).toHaveAttribute('role', 'status');
+  await expect(state).toBeHidden();
+  await expect(card(page, 'b1').locator('.session-compaction')).toBeHidden();
+  await expect(card(page, 'b1').locator('.session-state')).toHaveText('입력 가능');
+  await page.evaluate(session => (window as any).tabsFixture.emit('session-changed', { ...session, state: 'waiting' }), owned[0]);
+  await expect(state).toBeHidden();
+  await expect(badge).toHaveText('압축 중');
+  await page.screenshot({ path: testInfo.outputPath('session-compacting.png') });
+  await page.evaluate(async () => { const { setLanguage } = await import('/src/i18n.ts'); setLanguage('en'); });
+  await expect(badge).toHaveText('Compacting');
+  await page.evaluate(() => { const s = (window as any).tabsFixture.contextSnapshots.a1; s.revision++; s.compacting = false; });
+  await refresh();
+  await expect(badge).toBeHidden();
+  await expect(state).toBeVisible();
+  await expect(state).toHaveText('Waiting for response');
+  await page.evaluate(() => { const s = (window as any).tabsFixture.contextSnapshots.a1; s.revision++; s.compacting = true; });
+  await refresh();
+  await expect(badge).toBeVisible();
+  await page.evaluate(() => { (window as any).tabsFixture.contextFailure = true; });
+  await refresh();
+  await expect(badge).toBeHidden();
+  await expect(state).toBeVisible();
+  await page.evaluate(() => { const f = (window as any).tabsFixture; f.contextFailure = false; const s = f.contextSnapshots.a1; s.revision++; s.connected = false; });
+  await refresh();
+  await expect(badge).toBeHidden();
+  await page.evaluate(() => { const s = (window as any).tabsFixture.contextSnapshots.a1; s.revision++; s.connected = true; });
+  await refresh();
+  await expect(badge).toBeVisible();
+  await page.evaluate(session => { const f = (window as any).tabsFixture; delete f.contextSnapshots.a1; f.emit('session-changed', { ...session, generation: 8 }); }, owned[0]);
+  await expect(badge).toBeHidden();
+  await expect(state).toHaveText('Ready');
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((c: any) => c.command === 'conversation_request' && c.args.request.type !== 'contextStatus'))).toEqual([]);
+});
+
+
+test('Windows 창은 내부 드래그를 허용하고 점 손잡이 이동이 프로젝트 범위·저장·터미널을 보존한다', async ({ page }) => {
+  await workspace(page);
+  await tab(page, 'Alpha').click();
+  await page.evaluate(() => { (window as any).tabsFixture.nodes = [...document.querySelectorAll('.terminal-card')].map(node => [node, node.querySelector('.xterm')]); });
+  await card(page, 'a1').locator('.drag-handle').dragTo(card(page, 'a2').locator('.terminal-header'));
+  await expect.poll(() => visibleIds(page)).toEqual(['a2', 'a1']);
+  await expect(page.locator('#session-list .session-link > span:nth-child(2)')).toHaveText(['Alpha second', 'Alpha first']);
+  await expect.poll(() => page.evaluate(() => (window as any).tabsFixture.savedLayout?.sessions.map((item: any) => item.sessionId))).toEqual(['a2', 'b1', 'a1', 'parent', 'child', 'sibling']);
+  expect(await page.evaluate(() => (window as any).tabsFixture.nodes.every(([node, terminal]: HTMLElement[]) => node.isConnected && node.querySelector('.xterm') === terminal))).toBe(true);
+  await card(page, 'a2').locator('.drag-handle').dragTo(card(page, 'a1').locator('.terminal-header'));
+  await expect.poll(() => visibleIds(page)).toEqual(['a1', 'a2']);
+  const source = (await card(page, 'a1').locator('.drag-handle').boundingBox())!;
+  const target = (await card(page, 'a2').locator('.terminal-header').boundingBox())!;
+  await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 8 });
+  await page.keyboard.press('Escape');
+  await page.mouse.up();
+  await expect(page.locator('.terminal-card.dragging')).toHaveCount(0);
+  await expect.poll(() => visibleIds(page)).toEqual(['a1', 'a2']);
+  expect(await page.evaluate(() => (window as any).tabsFixture.calls.filter((call: any) => ['start_session', 'session_stop', 'session_write'].includes(call.command)))).toEqual([]);
+  const config = JSON.parse(await readFile(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+  expect(config.app.windows.find((window: any) => window.label === 'main').dragDropEnabled, 'Windows에서는 기본 파일 드래그 처리가 화면 내부 드래그를 가로채면 안 됩니다.').toBe(false);
 });

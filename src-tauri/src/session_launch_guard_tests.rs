@@ -30,7 +30,9 @@ fn failed_launch_guard_preserves_unknown_shared_stop_and_reaps_owned_pty() {
     assert!(!handle.is_null());
     let original = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
     gate.release().unwrap();
-    let process = Arc::new(ProcessControl {master:Mutex::new(Some(pair.master)),writer:Mutex::new(Some(writer)),killer:Mutex::new(child.child.clone_killer()),job:Mutex::new(Some(job)),adapter:Mutex::new(None),termination:Mutex::new(()),shared_cleanup_failed:AtomicBool::new(true),shared_stop_attempted:AtomicBool::new(true),_gate:gate});
+    let process = Arc::new(ProcessControl {master:Mutex::new(Some(pair.master)),writer:Mutex::new(Some(writer)),killer:Mutex::new(child.child.clone_killer()),job:Mutex::new(Some(job)),adapter:Mutex::new(None),
+        #[cfg(windows)] cron:Mutex::new(None),
+        termination:Mutex::new(()),shared_cleanup_failed:AtomicBool::new(true),shared_stop_attempted:AtomicBool::new(true),_gate:gate});
     // 공유 RPC가 불명 결과를 기록한 인계 플래그만 주입한다. 이후 adapter가 이미
     // 회수되었더라도 추가 owned 정리가 그 불명을 성공으로 바꾸면 안 된다.
     *session.process.lock().unwrap() = Some(process.clone());

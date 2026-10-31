@@ -113,6 +113,26 @@ Saved entries that are not running do not consume a concurrent-terminal slot.
 The existing resource limit of 32 terminals remains; automatic restoration leaves
 additional entries in the saved list when those terminal slots are full.
 
+## Subagent management
+
+Use **Manage subagents** in a running session header to view its direct subagents.
+Search the current page on the left and inspect status, role, model and reasoning
+effort on the right. Send instructions, interrupt the observed turn, close an
+agent or resume it. Closing requires confirmation, also stops its descendants
+and preserves saved conversations.
+
+A compatible CLI advertising `supportsSubagentManagement` is required. Unsupported
+runtimes receive no management requests. Lists use pages of up to 100 metadata
+entries, refresh every five seconds while the popup is visible and never fetch
+conversation bodies. An uncertain mutation is reconciled by its original request
+ID rather than automatically sent again.
+
+The connected shared server must also support this feature, even when the selected
+CLI is newer. Selecting an executable or restarting the desktop app does not update
+that server. A server update can interrupt running work; finish that work before
+following the compatible package update instructions. The app never performs this
+update automatically.
+
 ## Plugins and skills
 
 Open **⚙ Settings** in the upper-right corner, then **Plugins & skills**.
@@ -143,7 +163,12 @@ The selected CLI must support the remote-control app-server APIs and be signed
 in with a ChatGPT account. API key authentication is unsupported. Shared-capable
 CLIs connect the terminal, status observer and mobile controls to the same existing
 daemon through its default proxy. Shared enable, disable and pairing affect all
-conversations on that server. The app never installs, starts or stops the daemon.
+conversations on that server. At startup, the app reuses a running daemon or starts
+the installed daemon, then verifies its connection before restoring sessions. A
+failed start leaves saved sessions available for retry. The app does not install,
+replace or stop the shared daemon.
+Automatic startup requires the CLI's `app-server daemon start --existing-installation`
+option. With older CLIs, start the shared server before opening the app.
 
 For older CLIs without shared commands, the app-owned server remains available.
 Its mobile mutations require `--remote-control-client-name` to avoid replacing
@@ -170,8 +195,10 @@ The lower-left indicator reads the selected CLI account's representative weekly
 rate-limit window: an explicit 10,080-minute window, its used percentage and reset
 time when provided. It is account usage, not a total calculated from this app's
 sessions. Missing weekly data and read failures are shown separately and never
-treated as 0%. Reads are at least five minutes apart, with one request at a time;
-automatic polling pauses while the window is hidden.
+treated as 0%. Automatic reads run 60 seconds after the previous request settles and pause while
+the window is hidden. Refresh reads immediately, with a five-second manual limit and one request
+at a time. A failed refresh keeps the last confirmed value and its timestamp. Technical errors
+are not shown in the usage panel. External session records are available in Settings.
 
 ## Memory and history
 
@@ -194,6 +221,9 @@ These budgets do not limit the entire process, durable history or model context.
 Legacy history still uses the official full-read fallback, so its initial load can
 exceed the display budget. Other selected CLIs retain their own history behavior.
 These bounds and lifecycle tests are not a claim of a completed long-duration leak test.
+Each session retains at most 1,024 answered or resolved server-request IDs. Exceeding this
+limit blocks conversation observation and input handoff, rather than forgetting resolved requests
+that could arrive again in a delayed replay. Original work and conversation data are preserved.
 
 Existing saved settings and projects from Agent Grid are preserved. The longer-term
 product direction is to learn from ChatGPT and Claude desktop workflows; the full
@@ -272,3 +302,59 @@ write project files. Keep the report directory outside that project. Omitting
 normal trust screen. The probe
 requires observed thread IDs and live statuses, and records terminal hashes
 rather than transcripts. Neither mode proves physical IME or GUI behavior.
+
+## Conversation view and question inbox
+
+Use a session card's **Conversation / Terminal** button to switch views of the same thread.
+The terminal grid remains available. Switching views does not create a thread or resend input.
+Conversation view reads structured runtime history in pages and follows recent events; it does
+not parse terminal text. Earlier pages and large originals are fetched on demand.
+
+Conversation view requires a runtime supporting passive subscriptions and atomic idle user input.
+Selecting a newer executable does not automatically upgrade an already running shared server.
+Conversation view checks the connected server; the app never stops or replaces an existing daemon.
+Older servers show a capability limitation; the app does not fall back to operations that can trigger
+queued work or merge a new message into an active turn. Terminal view remains available. Weekly
+usage also reads only through an existing shared server; unavailable reads preserve the last
+confirmed value and observation time.
+
+The composer supports multiline text, Korean composition, pasted images and native file selection.
+Ordinary files are local references, not the ChatGPT document upload service. Model and reasoning
+controls use runtime-reported settings and supported choices; unavailable values remain unknown.
+Unsupported runtime features are reported explicitly. An uncertain send is never retried automatically
+and its draft is preserved.
+An explicit switch to Terminal can hand input back while ordinary unanswered requests remain.
+Responses already in progress, uncertain sends and unverified request ownership block the switch
+and preserve the conversation view and draft. Automatic hiding or cleanup never performs this handoff.
+If live events arrive during a history query, a stale response is discarded with a reload notice.
+Unavailable history is never treated as an empty or idle conversation.
+
+The upper-right **Question inbox** shows the count of confirmed unanswered questions and approvals.
+Opening the inbox does not reset the count; server-confirmed resolution removes an entry. Questions
+collected from terminal sessions are answered in the original session. Terminal
+waiting states whose request details are unavailable are listed separately with a link to the original
+session and are not counted as confirmed questions.
+
+Sent pasted images remain in app-owned storage because resumed history can reference them.
+Unsent temporary files are cleaned up; original user files are never deleted. Exceeding the storage
+budget rejects new attachments rather than automatically deleting earlier attachments.
+
+## Session context controls
+
+Each session header has a context meter and a manual compaction button. The meter uses
+the runtime's latest model response token usage divided by its reported context window,
+not cumulative billing usage or the terminal transcript size. Hover for the token counts;
+click to refresh. Missing or stale measurements display an em dash. Visible cards read one
+bounded local snapshot every two seconds; hidden cards stop these reads.
+
+Manual compaction requires an idle, connected original thread with no pending approvals
+or unknown request result. The app must use an atomic idle-only runtime operation; it
+never falls back to the legacy compaction operation that can replace an active task.
+Unsupported runtimes keep the button unavailable. Acceptance is not completion, and an
+unknown result is never automatically retried. Drafts and original conversations are preserved.
+
+## Session scheduled jobs
+
+The clock icon in a session header opens schedules owned by that session’s CLI. The dialog supports recurring intervals, a one-time local execution time, listing, adding, pausing, resuming, removing, and requesting cancellation of the current occurrence. Schedules end when the owning CLI exits; no separate operating-system schedules are created.
+
+Removing or pausing a schedule does not interrupt an accepted run. Cancelling an occurrence targets only the turn owned by that schedule and preserves recurring schedules. Unknown mutation results are never retried automatically and block further changes until reconciled. Runtimes without structured schedule control show an unsupported state and disable mutations.

@@ -42,6 +42,7 @@ test('browser preview shows a real runtime diagnostic and external sessions stay
   await page.getByRole('button', { name: '세션 시작 →', exact: true }).click();
   await expect(page.getByRole('alert')).toHaveText('데스크톱 앱에서 사용할 수 있는 기능입니다.');
   await page.getByRole('button', { name: '취소', exact: true }).click();
+  await page.locator('#settings-open').click();
   await page.locator('#external-toggle').click();
   await expect(page.locator('#external-dialog')).toBeVisible();
   await expect(page.locator('#external-list')).toContainText('데스크톱 앱에서 사용할 수 있는 기능입니다.');
@@ -54,7 +55,8 @@ for (const width of [1440, 800]) {
     await page.goto('/?demo=1');
     await expect(page.locator('.terminal-card')).toHaveCount(4);
     await expect(page.locator('.workspace-header')).toHaveCount(0);
-    await expect(page.getByRole('heading', { name: 'OpenDIY Desktop', exact: true })).toBeVisible();
+    await expect(page.locator('.workspace-title')).toHaveCount(0);
+    await expect(page.locator('.sidebar .brand')).toBeVisible();
     const topbar = (await page.locator('.topbar').boundingBox())!;
     expect(topbar.y).toBe(0);
     expect(topbar.height).toBeLessThanOrEqual(60);

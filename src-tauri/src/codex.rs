@@ -41,6 +41,26 @@ pub use mobile::{MobileAction, MobileConnection, MobileReply, MobileStatus, Mobi
 #[path = "codex_shared.rs"]
 mod shared;
 
+pub(crate) fn prepare_runtime_with_executable(exe: &OsString, cancelled: &Arc<AtomicBool>) -> Result<(), String> {
+    let cwd = env::current_dir().map_err(|error| format!("공유 서버 준비 폴더를 확인할 수 없습니다: {error}"))?;
+    shared::prepare_runtime(exe, &cwd, cancelled)
+}
+
+#[path = "codex_conversation.rs"]
+mod conversation;
+pub use conversation::{ConversationConnection, ConversationRequest, SubagentRequest};
+
+#[path = "codex_cron.rs"]
+mod cron;
+pub use cron::CronRequest;
+
+#[cfg(windows)]
+#[path = "codex_cron_wire.rs"]
+pub(crate) mod cron_wire;
+#[cfg(windows)]
+#[path = "codex_cron_control.rs"]
+pub(crate) mod cron_control;
+
 #[path = "codex_usage.rs"]
 mod usage;
 pub use usage::{weekly_usage_with_executable, WeeklyUsageSnapshot};
@@ -70,6 +90,7 @@ pub struct CodexSession {
     mobile: Option<MobileConnection>,
     shared: Option<shared::SharedControl>,
     proxy_job: Option<std::sync::Weak<ProcessJob>>,
+    conversation: Option<ConversationConnection>,
 }
 
 impl CodexSession {
@@ -77,11 +98,13 @@ impl CodexSession {
         self.mobile.as_ref().expect("connected sessions have a mobile management handle").clone()
     }
     pub(crate) fn shared_control(&self) -> Option<shared::SharedControl> { self.shared.clone() }
+    pub(crate) fn conversation_connection(&self) -> Option<ConversationConnection> { self.conversation.clone() }
 }
 
 impl Drop for CodexSession {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        if let Some(conversation) = &self.conversation { conversation.cancel(); }
         if let Some(mobile) = &self.mobile { mobile.cancel(); }
         if let Some(socket) = self.socket.take() { let _ = socket.shutdown(Shutdown::Both); }
         if let Some(job) = self.proxy_job.take().and_then(|job| job.upgrade()) { let _ = job.terminate(); }
@@ -374,10 +397,11 @@ fn launch_server_with_cancellation(exe: &OsString, cwd: &Path, thread_id: Option
     let server = process.spawn().map_err(|e| format!("Cannot start Codex app-server: {e}"))?;
     let mut session = CodexSession {
         command: tui_command(exe, cwd, &endpoint, &token, thread_id), server:Some(server), job:None, _launch_gate:Some(launch_gate),
-        stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None, mobile:None, shared:None, proxy_job:None,
+        stopped:Arc::new(AtomicBool::new(false)), socket:None, observer:None, mobile:None, shared:None, proxy_job:None, conversation:None,
     };
     session.job = Some(Arc::new(ProcessJob::assign_std(session.server.as_ref().unwrap())?));
     session.mobile = Some(MobileConnection::new(endpoint.clone(), token.clone(), session.job.as_ref().unwrap(), session.stopped.clone(), namespaced_remote));
+    session.conversation = Some(ConversationConnection::new(conversation::Endpoint::Owned {address:endpoint.clone(),token:token.clone(),job:Arc::downgrade(session.job.as_ref().unwrap())}, session.stopped.clone()));
     session._launch_gate.as_ref().unwrap().release()?;
     let job = session.job.as_ref().ok_or("Codex server has no owned process job")?;
     let mut rpc = connect(&endpoint, &token, session.server.as_mut().unwrap(), job, cancelled)?;
@@ -409,23 +433,29 @@ pub(crate) fn prepare_with_cancellation(exe: &OsString, cwd: &Path, thread_id: O
         on_event(CodexEvent::Status(status(&existing["thread"]["status"])));
     }
     // Fresh TUI owns thread/start; an empty pre-created thread may not have a resumable rollout.
-    // The observer uses only read RPCs and never claims the TUI's writer/approval ownership.
+    // The observer subscribes to the existing thread; it never sends input or approval responses.
     session.socket = Some(rpc.ws.get_ref().try_clone().map_err(|e| e.to_string())?);
     let stopped = session.stopped.clone();
     let selected = thread_id.map(str::to_owned);
+    let conversation = session.conversation.clone();
     session.observer = Some(thread::spawn(move || {
-        observe(&mut rpc, selected, &cwd, &stopped, on_event.as_ref());
+        observe(&mut rpc, selected, &cwd, &stopped, on_event.as_ref(),conversation.as_ref());
     }));
     Ok(session)
 }
 
-fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd: &Path, stopped: &AtomicBool, on_event: &dyn Fn(CodexEvent)) {
+fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd: &Path, stopped: &AtomicBool, on_event: &dyn Fn(CodexEvent), conversation: Option<&ConversationConnection>) {
         let mut next_poll = Instant::now();
         let mut last_state: Option<String> = None;
         let mut failures = 0;
+        let mut subscribed = false;
+        let mut subscription_attempts = 0;
+        let mut subscription_stopped = false;
         while !stopped.load(Ordering::Acquire) {
             if Instant::now() >= next_poll {
-                let snapshot = read_state(rpc, selected.as_deref(), cwd);
+                let snapshot = if let (Some(id),Some(conversation)) = (selected.as_deref(),conversation) {
+                    conversation.observer_call(rpc,id,"thread/read",json!({"threadId":id,"includeTurns":false})).and_then(|result| {verified_thread(&result["thread"],id,cwd)?;Ok(Some(result["thread"].clone()))})
+                } else {read_state(rpc, selected.as_deref(), cwd)};
                 if stopped.load(Ordering::Acquire) { break; }
                 match snapshot {
                     Ok(Some(thread)) => {
@@ -438,13 +468,28 @@ fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd:
                             selected = Some(id.to_owned());
                             on_event(CodexEvent::ThreadId(id.to_owned()));
                         }
+                        if thread["status"]["type"]=="notLoaded" {
+                            subscribed=false;
+                            if let Some(conversation)=conversation {conversation.observer_disconnected();}
+                        } else if !subscribed && !subscription_stopped && subscription_attempts<3 && matches!(thread["status"]["type"].as_str(),Some("idle" | "active" | "systemError")) {
+                            if let (Some(id),Some(conversation))=(selected.as_deref(),conversation) {
+                                // 같은 연결에서 최대 세 번, 다음 1초 상태 조회 뒤에만
+                                // 재시도한다. 정확한 구조화 준비 오류 외에는 재시도하지 않는다.
+                                subscription_attempts+=1;
+                                match conversation.observer_subscribe(rpc,id,cwd) {
+                                    Ok(success)=>subscribed=success,
+                                    Err(_)=>subscription_stopped=true,
+                                }
+                                if !subscribed {conversation.observer_disconnected();}
+                            }
+                        }
                         publish_status(&mut last_state, status(&thread["status"]), on_event);
                     }
                     Ok(None) => { failures = 0; }
                     Err(_) => {
                         failures += 1;
                         publish_status(&mut last_state, "unknown".into(), on_event);
-                        // Only bounded read-only retries; never resume/start from the observer.
+                        // Only bounded state-read retries; never repeat the initial subscription.
                         if failures >= 3 { break; }
                     }
                 }
@@ -455,6 +500,7 @@ fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd:
             match incoming {
                 Ok(Some(message)) => if let Some(id) = selected.as_deref() {
                     if let Some(state) = event_status(&message, id) { publish_status(&mut last_state, state, on_event); }
+                    if let Some(conversation) = conversation {if conversation.observer_message(id,message).is_err() {publish_status(&mut last_state,"unknown".into(),on_event);break;}}
                 },
                 Ok(None) => {},
                 Err(_) => {
@@ -463,6 +509,7 @@ fn observe<S: Read + Write>(rpc: &mut Rpc<S>, mut selected: Option<String>, cwd:
                 }
             }
         }
+        if let Some(conversation) = conversation {conversation.observer_disconnected();}
 }
 
 /// `app-server proxy` relays raw bytes, including the control socket's WebSocket handshake.
@@ -504,6 +551,7 @@ struct Proxy {
     rpc: Option<Rpc<ProxyStream>>,
     reader: Option<JoinHandle<()>>,
     expiry: Option<ProxyExpiry>,
+    finished: bool,
 }
 // 전체 기한은 읽기뿐 아니라 포화된 stdin 쓰기도 해제해야 한다. 외부 daemon이
 // 아닌 이 연결의 proxy Job만 종료하며, 정상 Drop은 감시자를 즉시 깨워 회수한다.
@@ -535,6 +583,7 @@ impl Drop for ProxyExpiry {
 }
 impl Drop for Proxy {
     fn drop(&mut self) {
+        if self.finished { return; }
         self.rpc.take(); // Drop stdin/receiver, unblocking a reader waiting to send.
         self.expiry.take();
         if let Some(job) = self.job.take() { let _ = job.terminate(); }
@@ -544,6 +593,48 @@ impl Drop for Proxy {
     }
 }
 impl Proxy {
+    /// Consumes only this proxy and confirms its own job/child/reader teardown.
+    /// It never sends a daemon stop request or uses global process counts.
+    fn finish(mut self) -> Result<(),String> {
+        self.finished=true;
+        let deadline=Instant::now()+Duration::from_secs(3);
+        let mut errors=Vec::new();
+        self.rpc.take(); // stdin/receiver must close before joining the bounded pipe reader.
+        let job=self.job.take();
+        if let Some(job)=job.as_ref() {if let Err(error)=job.terminate(){errors.push(format!("공유 proxy Job 종료 실패: {error}"));}}
+        else {errors.push("공유 proxy의 소유 Job 종료를 확인할 수 없습니다.".into());}
+        match self.child.try_wait() {
+            Ok(Some(_))=>{},
+            Ok(None)=>if let Err(error)=self.child.kill(){if !matches!(self.child.try_wait(),Ok(Some(_))) {errors.push(format!("공유 proxy 직접 자식 종료 실패: {error}"));}},
+            Err(error)=>errors.push(format!("공유 proxy 직접 자식 상태 확인 실패: {error}")),
+        }
+        let mut child_done=false;
+        #[cfg(windows)] let mut job_empty=false;
+        loop {
+            if !child_done {match self.child.try_wait(){Ok(Some(_))=>child_done=true,Ok(None)=>{},Err(error)=>{errors.push(format!("공유 proxy 직접 자식 정산 실패: {error}"));break;}}}
+            #[cfg(windows)] if !job_empty {match job.as_ref().map(|job|job.active_processes()).transpose(){Ok(Some(0))=>job_empty=true,Ok(_)=>{},Err(error)=>{errors.push(error);break;}}}
+            #[cfg(windows)] let complete=child_done&&job_empty;
+            #[cfg(not(windows))] let complete=child_done;
+            if complete || Instant::now()>=deadline {break;}
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !child_done {errors.push("공유 proxy 직접 자식의 3초 내 정산을 확인하지 못했습니다.".into());}
+        #[cfg(windows)] if !job_empty {errors.push("공유 proxy의 자기 Job ActiveProcesses=0을 3초 내 확인하지 못했습니다.".into());}
+        if let Some(reader)=self.reader.take() {
+            while !reader.is_finished()&&Instant::now()<deadline {thread::sleep(Duration::from_millis(10));}
+            if reader.is_finished() {if reader.join().is_err(){errors.push("공유 proxy pipe reader가 비정상 종료했습니다.".into());}}
+            else {errors.push("공유 proxy pipe reader의 기한 내 종료를 확인하지 못했습니다.".into());}
+        }
+        if let Some(mut expiry)=self.expiry.take() {
+            let _=expiry.cancel.send(());
+            if let Some(worker)=expiry.worker.take() {
+                while !worker.is_finished()&&Instant::now()<deadline {thread::sleep(Duration::from_millis(10));}
+                if worker.is_finished() {if worker.join().is_err(){errors.push("공유 proxy 기한 감시자가 비정상 종료했습니다.".into());}}
+                else {errors.push("공유 proxy 기한 감시자의 종료를 확인하지 못했습니다.".into());}
+            }
+        }
+        if errors.is_empty(){Ok(())}else{Err(errors.join("; "))}
+    }
     fn open(exe: &OsString) -> Result<Self, String> {
         Self::open_until(exe, None, None)
     }
@@ -555,7 +646,8 @@ impl Proxy {
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
         hidden(&mut command);
         let child = command.spawn().map_err(|e| format!("Cannot open existing Codex daemon proxy: {e}"))?;
-        let mut proxy = Self {child,job:None,_launch_gate:launch_gate,rpc:None,reader:None,expiry:None};
+        let mut proxy = Self {child,job:None,_launch_gate:launch_gate,rpc:None,reader:None,expiry:None,finished:false};
+        let result=(|| {
         proxy.job = Some(Arc::new(ProcessJob::assign_std(&proxy.child)?));
         if overall.is_some() || cancelled.is_some() { proxy.expiry = Some(ProxyExpiry::new(proxy.job.as_ref().unwrap(), overall, cancelled.clone())?); }
         proxy._launch_gate.release()?;
@@ -586,7 +678,7 @@ impl Proxy {
             Ok((mut ws, _)) => {
                 ws.get_mut().timeout = Duration::from_millis(500);
                 proxy.rpc = Some(Rpc {ws,next_id:0,cancelled,deadline:overall});
-                return Ok(proxy);
+                return Ok(());
             }
             Err(tungstenite::HandshakeError::Interrupted(pending)) => {
                 check_cancelled(cancelled.as_ref())?;
@@ -599,6 +691,8 @@ impl Proxy {
                 return Err("Existing Codex daemon WebSocket handshake failed; no daemon was started".into());
             }
         }}
+        })();
+        match result {Ok(())=>Ok(proxy),Err(error)=>match proxy.finish(){Ok(())=>Err(error),Err(cleanup)=>Err(format!("{error}; 소유 proxy 정리 실패: {cleanup}"))}}
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.rpc.as_mut().unwrap().call(method, params)

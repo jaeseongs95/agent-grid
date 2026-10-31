@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding=$OutputEncoding=[Text.UTF8Encoding]::new($false)
 if (-not [IO.Path]::IsPathRooted($ExpectedExecutable)) { throw 'Expected executable must be absolute' }
 $expectedExecutablePath = [IO.Path]::GetFullPath($ExpectedExecutable)
 if (-not (Test-Path -LiteralPath $expectedExecutablePath -PathType Leaf) -or [IO.Path]::GetFileName($expectedExecutablePath) -ne 'opendiy-desktop.exe') { throw 'Expected executable must be an existing opendiy-desktop.exe' }
@@ -22,8 +23,7 @@ $currentSession = (Get-Process -Id $PID).SessionId
 if ($appProcess.StartTime.ToUniversalTime() -lt [DateTime]::UtcNow.AddMinutes(-20)) { throw 'Refusing a process older than twenty minutes' }
 if ($appProcess.SessionId -ne $currentSession) { throw 'Target is in another Windows session' }
 if (-not [string]::Equals([IO.Path]::GetFullPath($appProcess.Path), $expectedExecutablePath, [StringComparison]::OrdinalIgnoreCase)) { throw 'Target executable path does not match' }
-$mainWindow = $appProcess.MainWindowHandle
-if ($mainWindow -eq [IntPtr]::Zero -or $appProcess.MainWindowTitle -ne 'OpenDIY Desktop') { throw 'Target does not have the expected OpenDIY Desktop main window' }
+# 활성 파일 선택창도 MainWindowHandle로 반환될 수 있으므로 소유한 주 창을 별도로 찾는다.
 
 Add-Type -TypeDefinition @'
 using System;
@@ -53,6 +53,16 @@ public static class AgentGridExecutablePickerProbe {
     public static bool IsExpectedDialog(IntPtr hwnd, uint pid, IntPtr owner, string title) {
         if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || !OwnedBy(hwnd,pid) || WindowClass(hwnd)!="#32770" || GetWindow(hwnd,4)!=owner) return false;
         var text=new StringBuilder(256); GetWindowTextW(hwnd,text,text.Capacity); return text.ToString()==title;
+    }
+    public static IntPtr[] FindMainWindows(uint pid) {
+        var matches=new List<IntPtr>();
+        EnumWindows(delegate(IntPtr hwnd,IntPtr unused) {
+            if(!OwnedBy(hwnd,pid) || !IsWindowVisible(hwnd) || GetWindow(hwnd,4)!=IntPtr.Zero || WindowClass(hwnd)=="#32770") return true;
+            var text=new StringBuilder(256); GetWindowTextW(hwnd,text,text.Capacity);
+            if(text.ToString()=="OpenDIY Desktop") matches.Add(hwnd);
+            return true;
+        },IntPtr.Zero);
+        return matches.ToArray();
     }
     public static IntPtr[] FindDialogs(uint pid, IntPtr owner, string title) {
         var matches=new List<IntPtr>();
@@ -90,6 +100,10 @@ public static class AgentGridExecutablePickerProbe {
     }
 }
 '@
+
+$mainWindows = [AgentGridExecutablePickerProbe]::FindMainWindows($AppProcessId)
+if ($mainWindows.Length -ne 1) { throw 'Expected one owned OpenDIY Desktop main window; refusing ambiguous action' }
+$mainWindow = $mainWindows[0]
 
 function Assert-ProcessIdentity {
     $observed = Get-Process -Id $AppProcessId -ErrorAction Stop
@@ -160,7 +174,7 @@ if ($primaryFailure) {
 }
 Assert-ProcessIdentity
 [ordered]@{
-    schema = 'agent-grid-executable-picker-probe-v1'
+    schema = 'agent-grid-executable-picker-probe-v2'
     mode = $Mode
     processId = $AppProcessId
     processStartedAt = $appProcess.StartTime.ToUniversalTime().ToString('o')

@@ -211,7 +211,8 @@ try {
         else { report.errors.push({ name: 'UnexpectedDialog', message: 'Unexpected browser dialog dismissed; no approval granted' }); await dialog.dismiss(); }
       } catch (error) { report.errors.push(shortError(error)); }
     });
-    await until(() => page.locator('#connection').textContent(), text => text === '로컬 연결됨', 'native IPC connected');
+    await until(() => page.locator('#app').getAttribute('aria-busy'), value => value === 'false', '앱 초기화 완료');
+    assert.equal(await page.locator('.toast.error').count(), 0, '앱 초기화 오류가 없어야 합니다');
     assert.equal(await page.locator('#runtime-banner').isVisible(), false, 'Demo/browser preview is not native evidence');
     assert.equal(await page.locator('.terminal-card').count(), 0, 'Existing owned tiles present; refusing to touch them');
     assert.equal(await page.locator('.broadcast-panel, [id^=broadcast-], #clear-selection, #selected-count').count(), 0, '선택 전송 패널이 제거되어야 합니다');
@@ -296,7 +297,7 @@ try {
       await page.locator('#language-select').selectOption('en');
       await until(() => page.locator('html').getAttribute('lang'), value => value === 'en', 'English language applied');
       assert.match((await page.locator('#new-session').textContent()) ?? '', /new session/i);
-      assert.match((await page.locator('#connection').textContent()) ?? '', /connected/i);
+      assert.equal(await page.locator('#language-select').inputValue(), 'en');
       assert.equal(await page.evaluate(() => localStorage.getItem('agent-grid-language')), 'en');
       const menu = await nativeCall('set_ui_language', { language: 'en' });
       assert.deepEqual(menu, { show: 'Open OpenDIY Desktop', exit: 'Exit…' }, 'Native menu readback did not match English');
@@ -341,7 +342,7 @@ try {
       await closePopups();
       await openSettings();
       await page.locator('#language-select').selectOption('ko');
-      await until(() => page.locator('#connection').textContent(), value => value === '로컬 연결됨', 'Korean restored for existing smoke checks');
+      await until(() => page.locator('html').getAttribute('lang'), value => value === 'ko', '한국어 복원 완료');
       assert.deepEqual(await nativeCall('set_ui_language', { language: 'ko' }), { show: 'OpenDIY Desktop 열기', exit: '종료…' });
       await page.locator('#settings-close').click();
       for (const previous of retained) await previous.screen?.dispose();
@@ -602,15 +603,15 @@ try {
     await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + 60); await page.mouse.down();
     await page.mouse.move(bounds.x + bounds.width / 2 + 65, bounds.y + 60, { steps: 6 }); await page.mouse.up();
     const width = await until(async () => (await first.boundingBox())?.width ?? 0, value => value > before.width + 30, 'native tile resize');
-    await first.locator('.move-right').click();
-    assert.equal((await tileTitles())[0], secondTitle, 'Tile reorder failed');
+    await first.locator('.drag-handle').dragTo(tile(secondTitle).locator('.terminal-header'));
+    await until(async () => (await tileTitles())[0], value => value === secondTitle, '점 손잡이로 실제 세션 순서 변경');
     await page.keyboard.press('Alt+1');
     assert((await tile(secondTitle).getAttribute('class')).includes('focused'), 'Keyboard focus did not move to first tile');
     await tile(secondTitle).locator('.maximize').click();
     assert.equal(await first.isVisible(), false, 'Maximize did not hide other tile');
     await page.keyboard.press('Escape');
     assert.equal(await first.isVisible(), true, 'Escape did not restore grid');
-    return { beforeWidth: before.width, afterWidth: width, orderChanged: true, keyboardFocus: true, maximizeRestored: true };
+    return { beforeWidth: before.width, afterWidth: width, orderChanged: true, reorderInput: '실제 점 손잡이 드래그', keyboardFocus: true, maximizeRestored: true };
   });
   await check('terminal search UI', async () => {
     await page.locator('#search-toggle').click();
@@ -647,12 +648,17 @@ try {
     assert(events.every(event => event.trusted === false));
     const dispatchedAt = Date.now();
     const echoed = await until(() => rows.innerText(), text => text.includes(marker), 'actual Korean marker echo after composition end', 15_000);
-    for (const title of [...ownedTitles].slice(1)) {
-      assert(!(await tile(title).locator('.xterm-rows').innerText()).includes(marker), '직접 입력이 다른 터미널에 전달되면 안 됩니다');
+    // 정리용 ownedTitles에는 이미 닫은 실패 재개 카드도 남아 있다.
+    // 실제 생성한 다른 실행 세션의 고정 ID로 입력 격리를 검사한다.
+    for (const session of report.sessions.slice(1)) {
+      const peer = page.locator(`.terminal-card[data-id="${session.id}"]`);
+      assert.equal(await peer.count(), 1, '입력 격리를 검사할 다른 실행 세션이 있어야 합니다');
+      assert(!(await peer.locator('.xterm-rows').innerText()).includes(marker), '직접 입력이 다른 터미널에 전달되면 안 됩니다');
     }
     return { events, marker, markerInitiallyAbsent: true, echoObservedIn: 'VT-rendered xterm rows (composition overlay excluded)', echoWaitMs: Date.now() - dispatchedAt, beforeOutputLength: before.length, afterOutputLength: echoed.length, beforeOutputSha256: hash(before), afterOutputSha256: hash(echoed), enterSent: false, physicalImeVerified: false, koreanPtyRoundTripVerified: true, unsubmittedTextCleared: false, disposition: 'Left unsubmitted until the owned session is stopped; no Ctrl+U sent to a potentially waiting session.' };
   });
   await check('external observations stay read only and report unavailable daemon explicitly', async () => {
+    await openSettings();
     await page.locator('#external-toggle').click();
     const dialog = page.locator('#external-dialog'); await dialog.waitFor({ state: 'visible' });
     await until(() => page.locator('#external-list').textContent(), text => !!text && !text.includes('불러오는 중'), 'external read-only query');
@@ -663,6 +669,7 @@ try {
     const observedRows = await dialog.locator('.external-item').count();
     if (observedRows) assert((await dialog.locator('.external-item small').allTextContents()).some(text => text.includes('현재 상태 미확인')), 'Unknown external state must be explicit');
     await dialog.getByRole('button', { name: '닫기', exact: true }).click();
+    await page.locator('#settings-close').click();
     return { observedRows, readOnly: true, available: !unavailable, ...(unavailable ? { unavailableReasonSha256: hash(list), explicitUnavailableDisplayed: true } : {}), externalProcessesTouched: false };
   });
   if (process.env.AGENT_GRID_NATIVE_PID || process.env.AGENT_GRID_NATIVE_EXE) {

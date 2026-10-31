@@ -127,7 +127,7 @@ test('복원 도중 종료는 추가 시작을 막고 중단 이벤트 이후에
 
 test('이미 실행 중인 대화는 재사용하고 구형 저장 항목은 자동 시작하지 않는다', async ({ page }) => {
   await workspace(page, { live: true, sessions: [a, { title: '이전 버전', cwd: a.cwd, threadId: 'legacy' }] });
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect(page.locator('.terminal-title')).toHaveText([a.title]);
   expect(await calls(page, 'start_session')).toEqual([]);
   await page.locator('#restore-open').click();
@@ -177,14 +177,14 @@ test('사용자가 개별 종료하고 닫은 세션은 다음 실행에서 부�
 
 test('미실행 저장 64개는 새 실행을 막지 않으며 복원은 실제 카드32개에서 조용히 멈춘다', async ({ page }) => {
   await workspace(page, { sessions: Array.from({ length: 64 }, (_, index) => ({ title: `저장 ${index}`, cwd: a.cwd, threadId: `saved-${index}`, resumeOnStartup: false })) });
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await page.locator('#new-session').click();
   await page.locator('#session-title').fill('새 세션'); await page.locator('#session-cwd').fill(a.cwd);
   await page.locator('#create-submit').click();
   await expect.poll(async () => (await calls(page, 'start_session')).length).toBe(1);
   await expect.poll(async () => (await saved(page))?.sessions.length).toBe(65);
   await page.evaluate(() => { const layout = JSON.parse(localStorage.getItem('restore-test-layout')!); for (const item of layout.sessions) item.resumeOnStartup = !!item.threadId; localStorage.setItem('restore-test-layout', JSON.stringify(layout)); });
-  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await page.reload(); await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect(page.locator('.terminal-card')).toHaveCount(32);
   expect((await calls(page, 'start_session')).length).toBe(32);
   expect(await page.locator('.toast.error').count()).toBe(0);
@@ -194,13 +194,13 @@ test('미실행 저장 64개는 새 실행을 막지 않으며 복원은 실제 
 
 test('메타데이터512개 한도와 잘못된 초과 입력은 실제 실행32개와 구분해 원본을 보존한다', async ({ page }) => {
   await workspace(page, { sessions: Array.from({ length: 512 }, (_, index) => ({ title: `저장 ${index}`, cwd: a.cwd, threadId: `saved-${index}` })) });
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect.poll(async () => (await saved(page))?.sessions.length).toBe(512);
   await page.locator('#new-session').click(); await page.locator('#session-title').fill('넘침'); await page.locator('#session-cwd').fill(a.cwd);
   await page.locator('#create-submit').click(); await expect(page.locator('#create-error')).toContainText('메타데이터는 최대 512개');
   expect(await calls(page, 'start_session')).toEqual([]);
   await page.evaluate(() => { const layout = JSON.parse(localStorage.getItem('restore-test-layout')!); layout.sessions.push({ title: '초과 원본', cwd: 'D:\\work' }); localStorage.setItem('restore-test-layout', JSON.stringify(layout)); });
-  await page.reload(); await expect(page.locator('#connection')).toHaveText('연결 오류');
+  await page.reload(); await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect(page.locator('.toast.error')).toContainText('원본 저장을 덮어쓰지 않았습니다');
   await page.waitForTimeout(600);
   expect(await calls(page, 'save_layout')).toEqual([]);
@@ -209,7 +209,7 @@ test('메타데이터512개 한도와 잘못된 초과 입력은 실제 실행32
 
 test('실패한 시작의 소유권이 남으면 재시도가 중복 실행하지 않고 회수 뒤 원래 대화를 다시 연결한다', async ({ page }) => {
   await workspace(page, { failFirst: true, failActive: true });
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect.poll(async () => (await saved(page))?.sessions.length).toBe(2);
   await page.locator('#restore-open').click();
   await expect(page.locator('#restore-list .restore-item strong')).toHaveText([a.title]);
@@ -226,14 +226,14 @@ test('실패한 시작의 소유권이 남으면 재시도가 중복 실행하�
 
 for (const active of [true, false]) test(`실패한 복원 카드를 ${active ? '소유 중 종료' : '회수 뒤 닫기'}하면 대기 복원 항목도 제거하여 다시 부활하지 않는다`, async ({ page }) => {
   await workspace(page, { failFirst: true, failActive: true });
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   page.on('dialog', dialog => dialog.accept());
   if (!active) await page.evaluate(() => { const f = (window as any).restoreFixture; const info = f.live.find((item: any) => item.id === 'new-1'); Object.assign(info, { active: false }); f.emit(info); });
   await page.locator('.terminal-card').filter({ has: page.locator('.terminal-title', { hasText: a.title }) }).locator('.stop').click();
   await expect(page.locator('.terminal-title')).toHaveText([b.title]);
   await expect(page.locator('#restore-banner')).toBeHidden();
   await expect.poll(async () => (await saved(page))?.sessions.map((item: any) => item.threadId)).toEqual(['thread-b']);
-  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await page.reload(); await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   expect((await calls(page, 'start_session')).map((item: any) => item.args.request.threadId)).toEqual(['thread-b']);
 });
 
@@ -249,13 +249,13 @@ for (const lateSuccess of [false, true]) test(`시작 중 명시 종료는 ${lat
   await expect.poll(async () => (await calls(page, 'complete_exit')).length).toBe(1);
   expect((await saved(page)).sessions.filter((item: any) => item.threadId === a.threadId && item.resumeOnStartup === true)).toEqual([]);
   if (lateSuccess) await page.evaluate(() => (window as any).restoreFixture.releaseStop());
-  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await page.reload(); await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   expect(await calls(page, 'start_session')).toEqual([]);
 });
 
 test('수동 복원 중 프로젝트 삭제는 같은 대기 항목을 갱신하고 완료와 닫기 뒤 중복 복원을 남기지 않는다', async ({ page }) => {
   await workspace(page, { sessions: [{ ...a, projectId: 'p', projectAssigned: true }], project: true, failFirst: true, holdSecond: true });
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await page.locator('#restore-open').click(); await page.locator('#restore-list').getByRole('button', { name: '이 대화 재개 →' }).click();
   await expect.poll(async () => (await calls(page, 'start_session')).length).toBe(2);
   await page.locator('#restore-dialog [data-close]').click();
@@ -269,18 +269,18 @@ test('수동 복원 중 프로젝트 삭제는 같은 대기 항목을 갱신하
   await page.locator('.terminal-card .stop').click(); await expect(page.locator('.session-state')).toHaveText('종료됨');
   await page.locator('.terminal-card .stop').click();
   await expect.poll(async () => (await saved(page))?.sessions.length).toBe(0);
-  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨'); expect(await calls(page, 'start_session')).toEqual([]);
+  await page.reload(); await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false'); expect(await calls(page, 'start_session')).toEqual([]);
 });
 
 for (const projectRevision of [0, 7]) test(`실패 소유권 카드의 프로젝트 이동은 이전 실행revision${projectRevision}과 구분하여 최신 소속을 저장한다`, async ({ page }) => {
   await workspace(page, { sessions: [{ ...a, projectId: 'p', projectAssigned: true, projectRevision }], project: true, failFirst: true, failActive: true });
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await page.locator('.terminal-card .project-move').click(); await page.locator('#project-move-target').selectOption('q'); await page.locator('#project-move-confirm').click();
   await expect(page.locator('#project-move-dialog')).toBeHidden();
   await expect.poll(async () => (await saved(page))?.sessions[0]?.projectId).toBe('q');
   expect((await saved(page)).sessions).toHaveLength(1);
   expect((await saved(page)).sessions[0]).toMatchObject({ projectAssigned: true, projectRevision: 1 });
-  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await page.reload(); await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   expect((await calls(page, 'start_session'))[0].args.request.projectId).toBe('q');
 });
 
@@ -291,9 +291,9 @@ for (const reconcile of [false, true]) test(`비활성 오류 카드의 명시 �
   await page.locator('.terminal-card .stop').click();
   await expect(page.locator('.terminal-card')).toHaveCount(0);
   await page.evaluate(reconcile => { const fixture = (window as any).restoreFixture; if (reconcile) fixture.releaseReconcile(); else fixture.releaseError(); }, reconcile);
-  await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   await expect.poll(async () => (await saved(page))?.sessions.length).toBe(0);
   await expect(page.locator('#restore-banner')).toBeHidden();
-  await page.reload(); await expect(page.locator('#connection')).toHaveText('로컬 연결됨');
+  await page.reload(); await expect(page.locator('#app')).toHaveAttribute('aria-busy', 'false');
   expect(await calls(page, 'start_session')).toEqual([]);
 });

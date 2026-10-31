@@ -132,10 +132,21 @@ class StartupFixture {
     exited("server.pid");
     // peer가 stdin을 더 읽지 않아 write가 막혀도 proxy Job 기한이 해제해야 한다.
     fs::write(root.join("mode"), "proxy-write-blocked").unwrap();
+    // 사용량의 consuming finish는 자기 Job의 모든 자식과 pipe/기한 감시자 회수를 확인한다.
+    let proxy=Proxy::open_until(&exe,None,Some(Instant::now()+Duration::from_secs(20))).unwrap();
+    let own_job=proxy.job.as_ref().unwrap().clone();
+    proxy.finish().unwrap();
+    assert_eq!(own_job.active_processes().unwrap(),0);exited("server.pid");drop(own_job);
+    // reader 실패는 성공으로 삼키지 않으며 나머지 자기 프로세스 정리는 계속한다.
+    let mut proxy=Proxy::open_until(&exe,None,Some(Instant::now()+Duration::from_secs(20))).unwrap();
+    let own_job=proxy.job.as_ref().unwrap().clone();let original_reader=proxy.reader.take().unwrap();
+    proxy.reader=Some(thread::spawn(||panic!("소유 reader 정리 실패 fixture")));
+    let error=proxy.finish().unwrap_err();assert!(error.contains("pipe reader"));
+    assert_eq!(own_job.active_processes().unwrap(),0);original_reader.join().unwrap();exited("server.pid");drop(own_job);
     let started = Instant::now();
     let mut proxy = Proxy::open_until(&exe, None, Some(started + Duration::from_secs(1))).unwrap();
     assert!(proxy.rpc.as_mut().unwrap().send(json!({"fixture":"x".repeat(2*1024*1024)})).is_err());
-    drop(proxy);
+    let own_job=proxy.job.as_ref().unwrap().clone();proxy.finish().unwrap();assert_eq!(own_job.active_processes().unwrap(),0);drop(own_job);
     assert!(started.elapsed() < Duration::from_secs(3), "포화된 pipe 쓰기도 전체 기한 안에 해제해야 한다");
     exited("server.pid");
     // 모바일/시작 취소도 같은 Job 감시를 사용해 20초 기한을 기다리지 않고 쓰기를 깨운다.
